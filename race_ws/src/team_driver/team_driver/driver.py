@@ -125,26 +125,71 @@ class Driver(Node):
     # THIS IS THE PART YOU WRITE.
     # ==================================================================
     def plan(self, ranges, angles):
-        """Decide what the car should do, given the latest scan.
+    	# 1. Restrict view to forward field of view [-100 deg, +100 deg] (~ -1.75 to +1.75 rad)
+        fov_mask = (angles >= -1.75) & (angles <= 1.75)
+        fov_ranges = ranges[fov_mask]
+        fov_angles = angles[fov_mask]
 
-        Returns `(steering, speed)`: a steering angle in radians, and a speed
-        in m/s. Unlike Track 2, the speed is a genuine request - the simulator
-        runs the controller that achieves it - so you can think in the units
-        your algorithm naturally produces.
+        if len(fov_ranges) == 0:
+            return 0.0, self.crawl_speed
 
-        Right now it returns "straight ahead, slowly", which is not driving:
-        it ignores `ranges` entirely, so the car will hold its heading off the
-        grid and put itself into the first wall it meets. Replace the whole
-        method.
+        # 2. Locate nearest obstacle point inside FOV
+        min_idx = np.argmin(fov_ranges)
+        min_dist = fov_ranges[min_idx]
 
-        You have more to work with than the scan. `self.position`, `self.yaw`
-        and `self.speed` are ground truth from /ego_racecar/odom and are yours
-        to use, the occupancy grid is published on /map, and nothing stops you
-        subscribing to more topics, loading a line you computed offline, or
-        running a policy you trained. See docs/04-algorithms.md for the
-        approaches and what each one needs.
-        """
-        return 0.0, self.crawl_speed
+        # 3. Create a safety bubble around nearest obstacle (radius ~0.35m)
+        car_radius = 0.35
+        bubble_rad = math.atan2(car_radius, max(min_dist, 0.1))
+        
+        proc_ranges = fov_ranges.copy()
+        bubble_mask = np.abs(fov_angles - fov_angles[min_idx]) <= bubble_rad
+        proc_ranges[bubble_mask] = 0.0
+
+        # 4. Find the largest continuous gap beyond threshold distance
+        gap_threshold = 1.5  # meters
+        free_space = proc_ranges > gap_threshold
+
+        if not np.any(free_space):
+            # Fallback: steer towards furthest visible point if no clear gap
+            best_idx = np.argmax(proc_ranges)
+            target_angle = fov_angles[best_idx]
+        else:
+            # Detect contiguous gap ranges
+            bounded = np.pad(free_space.astype(int), (1, 1), 'constant')
+            diffs = np.diff(bounded)
+            starts = np.where(diffs == 1)[0]
+            ends = np.where(diffs == -1)[0]
+
+            # Choose the widest gap
+            gap_lengths = ends - starts
+            max_gap_idx = np.argmax(gap_lengths)
+
+            start_i = starts[max_gap_idx]
+            end_i = ends[max_gap_idx]
+
+            # Target the center of the largest gap
+            gap_angles = fov_angles[start_i:end_i]
+            target_angle = (gap_angles[0] + gap_angles[-1]) / 2.0
+
+        # 5. Compute steering angle with gain & clipping
+        steering = 0.85 * target_angle
+        steering = float(np.clip(steering, -0.4, 0.4))
+
+        # 6. Dynamic speed scaling based on steering angle & clearance ahead
+        front_mask = (angles >= -0.2) & (angles <= 0.2)
+        front_dist = np.mean(ranges[front_mask]) if np.any(front_mask) else 1.0
+
+        if abs(steering) > 0.25 or front_dist < 2.0:
+            # Slow down for sharp corners or tight walls
+            speed = 2.0
+        elif front_dist > 5.0 and abs(steering) < 0.1:
+            # Full throttle on open straights
+            speed = 4.5
+        else:
+            # Cruising speed
+            speed = 3.0
+
+        return steering, speed
 
     # ------------------------------------------------------------------
     # Output
