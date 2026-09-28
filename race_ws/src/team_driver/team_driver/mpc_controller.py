@@ -1,0 +1,674 @@
+#!/usr/bin/env python3
+"""Model Predictive Controller for F1TENTH autonomous racing.
+
+Implements a basic MPC that optimizes steering and acceleration over a prediction horizon
+using a kinematic bicycle model.
+"""
+
+import numpy as np
+import math
+from typing import Tuple, Optional
+from scipy.optimize import minimize
+import time
+import os
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+try:
+    from .vehicle_model import VehicleModel   # ROS / package import
+except ImportError:
+    from vehicle_model import VehicleModel    # standalone `python3 mpc_controller.py`
+
+
+class MPCController:
+    """Model Predictive Controller for vehicle path following."""
+
+    def __init__(self,
+                 vehicle_model: VehicleModel = None,
+                 prediction_horizon: int = 10,
+                 control_horizon: int = None,
+                 dt: float = 0.025,
+                 q_pos: float = 2.0,
+                 q_yaw: float = 2.0,
+                 q_vel: float = 0.5,
+                 r_steer: float = 0.08,
+                 r_accel: float = 0.01,
+                 r_delta_steer: float = 0.8,
+                 r_delta_accel: float = 0.005):
+        """Initialize MPC controller.
+
+        Args:
+            vehicle_model: Vehicle model for predictions
+            prediction_horizon: Number of steps to predict ahead
+            control_horizon: Number of steps to optimize controls (None = same as prediction)
+            dt: Time step for discrete dynamics (seconds)
+            q_pos: Weight on position tracking error
+            q_y: Weight on lateral error (inf = hard constraint)
+            q_yaw: Weight on heading error
+            q_vel: Weight on velocity tracking error
+            r_steer: Weight on steering control effort
+            r_accel: Weight on acceleration control effort
+            r_delta_steer: Weight on steering rate of change
+            r_delta_accel: Weight on acceleration rate of change
+        """
+        self.vehicle_model = vehicle_model if vehicle_model is not None else VehicleModel()
+        self.prediction_horizon = prediction_horizon
+        self.control_horizon = control_horizon if control_horizon is not None else prediction_horizon
+        self.dt = dt
+
+        # Cost function weights
+        self.Q = np.diag([q_pos, q_pos, q_yaw, q_vel, 0.0])  # [x, y, yaw, v, beta] - don't penalize beta
+        self.R = np.diag([r_steer, r_accel])           # [steering, acceleration]
+        self.R_delta = np.diag([r_delta_steer, r_delta_accel])  # Control change weights
+
+        # Diagonal forms, for the vectorized cost. q_yaw is handled separately
+        # (angle wrapping) so it is zeroed here and re-added wrapped.
+        self.Q_diag_masked = np.array([q_pos, q_pos, 0.0, q_vel, 0.0])
+        self.q_yaw_wrap = q_yaw
+        self.R_diag = np.array([r_steer, r_accel])
+        self.R_delta_diag = np.array([r_delta_steer, r_delta_accel])
+
+        # State and control dimensions
+        self.state_dim = 5  # [x, y, yaw, v, beta]
+        self.control_dim = 2  # [steering_angle, acceleration]
+
+        # Get bounds from vehicle model
+        _, self.state_max = self.vehicle_model.get_state_bounds()
+        self.state_min, _ = self.vehicle_model.get_state_bounds()
+        # Adjust bounds for simplified state (remove sideslip for now)
+        self.state_min = self.state_min[:self.state_dim]
+        self.state_max = self.state_max[:self.state_dim]
+
+        self.control_min, self.control_max = self.vehicle_model.get_control_bounds()
+
+        # Previous control for rate limiting
+        self.prev_control = np.zeros(self.control_dim)
+
+        # Reference path (will be set externally)
+        self.reference_path = None
+        self.reference_speeds = None
+        self._mean_waypoint_spacing = 0.2  # overwritten by set_reference_path
+        self._last_path_index = None
+        self._last_heading = 0.0
+
+        # Continuous arc position of the reference, in [0, _path_len). The
+        # path array holds exactly one lap, so a *continuously increasing* arc
+        # coordinate would walk off the end partway round. Carrying the anchor
+        # wrapped into [0, _path_len) is what lets a lap close on itself.
+        self._s_ref = None
+        self._path_len = 0.0
+
+        # Reused across solves so the cost function stays allocation-light:
+        # SLSQP calls the objective a few hundred times per solve.
+        self._states = np.zeros((prediction_horizon + 1, 5))
+        self._scratch = np.zeros((prediction_horizon + 1, 5))
+        self._du = np.zeros((self.control_horizon, 2))
+        self._ref_cache = np.zeros((prediction_horizon + 1, 5))
+
+        print(f"MPC Controller initialized:")
+        print(f"  Prediction horizon: {self.prediction_horizon}")
+        print(f"  Control horizon: {self.control_horizon}")
+        print(f"  DT: {self.dt}s ({1/dt:.1f} Hz)")
+        print(f"  State dim: {self.state_dim}, Control dim: {self.control_dim}")
+
+    def set_reference_path(self, path: np.ndarray, speeds: np.ndarray = None):
+        """Set reference path for tracking.
+
+        Args:
+            path: Array of shape (N, 2) with [x, y] waypoints
+            speeds: Optional array of shape (N,) with target speeds
+        """
+        self.reference_path = path
+        self.reference_speeds = speeds
+
+        # If no speeds provided, compute based on curvature or use constant
+        if speeds is None and path is not None:
+            self.reference_speeds = np.full(len(path), 3.0)  # Default 3 m/s
+
+        # Cache spacing so the reference can advance by distance per step
+        # instead of one index per step (the centerline is 0.2 m sampled but
+        # the car only covers v*dt, so indexing by step overshoots).
+        if path is not None and len(path) > 1:
+            path = np.asarray(path, dtype=np.float64)
+            seg = np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1)
+            self._mean_waypoint_spacing = float(np.mean(seg)) or 0.2
+            self._path_arc = np.concatenate([[0.0], np.cumsum(seg)])
+            self._kappa_smooth = self._curvature(path[:, :2])
+            # The CSV omits the closing segment back to waypoint 0, so the
+            # drivable lap is arc[n-1] + that last gap, not arc[n-1].
+            self._path_len = float(self._path_arc[-1]
+                                   + np.linalg.norm(path[0, :2] - path[-1, :2]))
+        else:
+            self._mean_waypoint_spacing = 0.2
+            self._path_arc = None
+            self._kappa_smooth = None
+            self._path_len = 0.0
+
+        # A new path invalidates the local search window.
+        self._last_path_index = None
+        self._s_ref = None
+        self._last_heading = 0.0
+
+    @staticmethod
+    def _curvature(p: np.ndarray, smooth: int = 9) -> np.ndarray:
+        """Smoothed path curvature from three-point circumscribed circles.
+
+        k = 4*Area / (|ab| |bc| |ac|). At 0.2 m spacing the raw estimate is
+        noisy enough to make the speed profile jitter, so smooth it with a
+        centred moving average.
+        """
+        n = len(p)
+        if n < 3:
+            return np.zeros(n)
+        a, b, c = p[:-2], p[1:-1], p[2:]
+        ab, bc, ac = b - a, c - b, c - a
+        cross = np.abs(ab[:, 0] * bc[:, 1] - ab[:, 1] * bc[:, 0])
+        denom = (np.linalg.norm(ab, axis=1)
+                 * np.linalg.norm(bc, axis=1)
+                 * np.linalg.norm(ac, axis=1))
+        kappa = np.zeros(n)
+        kappa[1:-1] = np.where(denom > 1e-9, 2.0 * cross / np.maximum(denom, 1e-9), 0.0)
+        kern = np.ones(smooth) / smooth
+        return np.convolve(kappa, kern, mode='same')
+
+    def speed_profile(self, v_max: float = 3.0, lat_accel: float = 0.8,
+                      a_brake: float = 0.8, path: np.ndarray = None) -> np.ndarray:
+        """Curvature-limited speed profile with a backward braking pass.
+
+        v = sqrt(a_lat / kappa) is the textbook cornering limit, but on its own
+        it is not drivable: the reference demands an instant jump to corner
+        speed, and the cost function's v-tracking term fights that, so the car
+        brakes late and runs wide into the wall. Sweeping backwards from the
+        end of the path and lowering any speed the car cannot shed in time
+        (sqrt(v_next^2 + 2*a_brake*ds)) makes the profile achievable.
+
+        Args:
+            path: Optional path to profile. Defaults to the configured one.
+                Pass the path explicitly when calling before set_reference_path.
+        Returns:
+            Speed per waypoint, shape (N,).
+        """
+        if path is None:
+            path = self.reference_path
+            kappa = self._kappa_smooth
+            ds = self._mean_waypoint_spacing
+        else:
+            path = np.asarray(path, dtype=np.float64)
+            if len(path) < 3:
+                return np.zeros(len(path))
+            kappa = self._curvature(path[:, :2])
+            ds = float(np.mean(np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1))) or 0.2
+
+        if path is None or kappa is None:
+            return np.zeros(0 if path is None else len(path))
+
+        kappa = np.maximum(kappa, 1e-6)
+        v = np.minimum(np.sqrt(lat_accel / kappa), v_max)
+
+        for i in range(len(v) - 2, -1, -1):
+            v[i] = min(v[i], np.sqrt(v[i + 1] ** 2 + 2.0 * a_brake * ds))
+
+        return v
+
+    @property
+    def search_window(self) -> int:
+        """How many waypoints either side of the last index to search."""
+        return max(10, int(round(2.0 / max(self._mean_waypoint_spacing, 1e-3))))
+
+    @property
+    def ref_speed(self) -> float:
+        """Default pace for the reference window when the car's speed is unknown.
+
+        Callers that know the car's speed pass it to `_reference_window`
+        directly; this is the fallback for the ones that do not. It is the mean
+        of the profile, unchanged in spirit from the original scalar.
+        """
+        if self.reference_speeds is None or len(self.reference_speeds) == 0:
+            return 3.0
+        return float(np.mean(self.reference_speeds))
+
+    @property
+    def _ref_speed_floor(self) -> float:
+        """Minimum speed the reference window may advance at, m/s.
+
+        Guards one degenerate case only: a car that is stopped, or rolling
+        backwards, would otherwise collapse the entire window onto one point --
+        the stall the arc-length anchor exists to prevent. It is a small
+        fraction of the profile mean, so it only ever binds when the car is
+        barely moving and never overrides the car's real speed otherwise.
+        """
+        if self.reference_speeds is None or len(self.reference_speeds) == 0:
+            return 0.25
+        return float(np.mean(self.reference_speeds)) / 8.0
+
+    def _get_reference_at_s(self, s: float, vehicle_position: np.ndarray = None) -> Tuple[np.ndarray, float]:
+        """Get reference state and speed at path position s.
+
+        Args:
+            s: Path position (arc length) - not used in this simplified version
+            vehicle_position: Current vehicle position [x, y] for finding closest point
+
+        Returns:
+            (reference_state, reference_speed)
+        """
+        if self.reference_path is None or len(self.reference_path) == 0:
+            return np.zeros(self.state_dim), 0.0
+
+        # For now, simple closest point approach to vehicle position
+        # In production, would use proper Frenet frame projection
+        if vehicle_position is not None and len(vehicle_position) >= 2:
+            # Find closest point to vehicle's current position
+            distances = np.sum((self.reference_path[:, :2] - vehicle_position[:2])**2, axis=1)
+        else:
+            # Fallback to origin if no vehicle position provided
+            distances = np.sum((self.reference_path[:, :2] - [0, 0])**2, axis=1)
+        closest_idx = np.argmin(distances)
+
+        # Get reference position
+        ref_pos = self.reference_path[closest_idx]
+
+        # Estimate heading from path direction
+        if closest_idx < len(self.reference_path) - 1:
+            path_dir = self.reference_path[closest_idx + 1] - self.reference_path[closest_idx]
+            ref_yaw = math.atan2(path_dir[1], path_dir[0])
+        else:
+            ref_yaw = 0.0
+
+        # Get reference speed
+        if self.reference_speeds is not None:
+            ref_speed = self.reference_speeds[min(closest_idx, len(self.reference_speeds)-1)]
+        else:
+            ref_speed = 3.0
+
+        # Return state [x, y, yaw, v, beta] - beta (sideslip) is 0 for reference
+        return np.array([ref_pos[0], ref_pos[1], ref_yaw, ref_speed, 0.0]), ref_speed
+
+    def _nearest_path_index(self, position: np.ndarray, hint: int = None) -> int:
+        """Index of the path waypoint nearest a point.
+
+        When the caller passes the previous index as a hint we only search a
+        window around it. Pure nearest-neighbour search over the whole path is
+        wrong on a closed track: the loop doubles back on itself, so a point on
+        the far side of the lap is closer in straight-line distance and the
+        reference index jumps to the wrong part of the track.
+
+        The window **wraps**, because the path is a closed lap: a plain slice
+        `path[lo:hi]` cannot reach across the finish line, so a car that runs
+        off the end of the array would keep matching the final waypoint no
+        matter how far it travelled -- the same failure as an unwrapped
+        reference window, one stage earlier in the pipeline.
+        """
+        path = self.reference_path
+        n = len(path)
+        if hint is not None and 0 <= hint < n:
+            w = self.search_window
+            idx = (np.arange(hint - w, hint + w + 1) % n)
+            d = np.sum((path[idx] - position) ** 2, axis=1)
+            return int(idx[int(np.argmin(d))])
+        return int(np.argmin(np.sum((path - position) ** 2, axis=1)))
+
+    def _project_arc(self, position: np.ndarray, idx: int) -> float:
+        """Arc position of `position` projected onto the path near `idx`.
+
+        The nearest *waypoint* is up to half a spacing away from where the car
+        actually sits on the line, so using the waypoint's own arc position as
+        the resync target would drag the anchor by up to half a spacing every
+        step. Projecting onto the segment instead makes the residual zero for a
+        car that is on the line, and a whole waypoint only when it is not.
+
+        The nearest waypoint is not always the right segment to project onto:
+        a car that has fallen half a spacing behind waypoint `idx` still finds
+        `idx` as its nearest, and a projection clamped to the segment *after*
+        `idx` would snap it forward onto that waypoint. So the preceding
+        segment is included, and the closer of the two is used.
+        """
+        n = len(self.reference_path)
+        candidates = []
+        for j in (idx - 1, idx, idx + 1) if n > 2 else (idx,):
+            j %= n
+            a = self.reference_path[j, :2]
+            b = self.reference_path[(j + 1) % n, :2]
+            ab = b - a
+            denom = float(ab @ ab)
+            f = 0.0 if denom < 1e-12 else float((position - a) @ ab / denom)
+            f = min(max(f, 0.0), 1.0)
+            # Closing segment: last waypoint -> waypoint 0, which the array
+            # has no entry for.
+            span = (self._path_len - float(self._path_arc[-1]) if j == n - 1
+                    else float(self._path_arc[j + 1] - self._path_arc[j]))
+            px = a + f * ab
+            candidates.append((float((position - px) @ (position - px)),
+                               float(self._path_arc[j]) + f * max(span, 1e-9)))
+        candidates.sort()
+        return candidates[0][1]
+
+    def _reference_window(self, s_start: float, count: int,
+                          car_speed: float = None) -> np.ndarray:
+        """Resample `count` reference states marching forward along the path.
+
+        The k-th state must be roughly where the car will be in k*dt seconds.
+        The centerline is sampled at 0.2 m intervals, so stepping one index
+        per control step advances the reference 0.2 m while the car only moves
+        v*dt (about 0.075 m at 3 m/s) -- the reference would run away from the
+        car roughly 2.5x too fast. We advance by distance instead.
+
+        That distance is the *car's*, floored at `ref_speed`. Spacing by the
+        profile mean instead (the old behaviour) put the horizon at a distance
+        set by the track rather than by the car: on the fast half it ran ahead
+        of anything the car could reach, and at a slow corner it reached
+        forward into the straight beyond, asking the car to straighten before
+        the corner. The floor keeps a stopped car from collapsing the window.
+
+        `s_start` is an arc position in [0, self._path_len) and the window is
+        **wrapped** at the end of the lap. Wrapping is not optional: the path
+        array holds exactly one lap, so a window that runs past its end would
+        clip every horizon state onto the final waypoint -- a single repeated
+        point behind the car, whose position cost is minimised by sitting still.
+        That is what stalled the car on the real track, where the spawn sits at
+        waypoint 377 of 392 and the reference hits the end within seconds.
+        """
+        path = self.reference_path
+        n = len(path)
+        out = self._ref_cache
+        out = out[:count]
+
+        # Cumulative arc length is cached in set_reference_path; recomputing it
+        # here would cost more than the resample itself.
+        arc = self._path_arc
+        L = self._path_len
+        if car_speed is None:
+            pace = self.ref_speed
+        else:
+            pace = max(float(car_speed), self._ref_speed_floor)
+        s = (s_start % L) + np.arange(count) * self.dt * pace
+
+        # The path array stores a single lap and no closing waypoint, so
+        # sampling is only an interpolation while s stays inside the array.
+        # Past that -- the last spacing, and anything the horizon spills over
+        # the finish line -- walk the closing segment explicitly, so the window
+        # still advances instead of collapsing onto the last waypoint.
+        span = float(arc[-1])
+        ref_pos = np.empty((count, 2), dtype=np.float64)
+        speed = np.empty(count, dtype=np.float64)
+        heading = np.empty(count, dtype=np.float64)
+        speeds = self.reference_speeds
+        have_speeds = speeds is not None and len(speeds) == n
+
+        def _lerp(a, b, f):
+            return (path[a, 0] + f * (path[b, 0] - path[a, 0]),
+                    path[a, 1] + f * (path[b, 1] - path[a, 1]))
+
+        for k in range(count):
+            sk = s[k]
+            if sk >= span:
+                # Closing segment: last waypoint -> waypoint 0.
+                f = (sk - span) / max(L - span, 1e-9)
+                x, y = _lerp(n - 1, 0, f)
+                # Tangent of the closing segment, in the direction of travel.
+                d = path[0, :2] - path[-1, :2]
+                heading[k] = math.atan2(d[1], d[0])
+                speed[k] = (speeds[0] if have_speeds else 3.0) * (1.0 - f) + \
+                           (speeds[-1] if have_speeds else 3.0) * f
+            else:
+                j = int(np.searchsorted(arc, sk, side='right')) - 1
+                j = min(max(j, 0), n - 2)
+                d = arc[j + 1] - arc[j]
+                f = (sk - arc[j]) / d if d > 1e-9 else 0.0
+                x, y = _lerp(j, j + 1, f)
+                seg = path[j + 1, :2] - path[j, :2]
+                heading[k] = math.atan2(seg[1], seg[0])
+                speed[k] = ((speeds[j] * (1.0 - f) + speeds[j + 1] * f)
+                            if have_speeds else 3.0)
+            ref_pos[k] = (x, y)
+
+        # Only overwrite the fallback heading if the window actually advanced;
+        # a degenerate window should not drag the carry-over with it.
+        if np.any(np.hypot(ref_pos[-1, 0] - ref_pos[0, 0],
+                           ref_pos[-1, 1] - ref_pos[0, 1]) > 1e-6):
+            self._last_heading = float(heading[-1])
+
+        out[:, 0] = ref_pos[:, 0]
+        out[:, 1] = ref_pos[:, 1]
+        out[:, 2] = heading
+        out[:, 3] = speed
+        out[:, 4] = 0.0
+        return out
+
+    def _predict_trajectory(self,
+                           initial_state: np.ndarray,
+                           control_sequence: np.ndarray) -> np.ndarray:
+        """Predict trajectory over horizon given control sequence.
+
+        Args:
+            initial_state: Starting state [x, y, yaw, v, beta]
+            control_sequence: Flattened array of controls [u0, u1, ..., u_{N-1}]
+
+        Returns:
+            Predicted states of shape (N+1, state_dim)
+        """
+        # Reshape control sequence
+        control_sequence = control_sequence.reshape((self.control_horizon, self.control_dim))
+
+        # Initialize state trajectory
+        states = self._states
+        states[0] = initial_state
+
+        # Propagate dynamics
+        for k in range(self.prediction_horizon):
+            # Use last control if beyond control horizon
+            if k < self.control_horizon:
+                control = control_sequence[k]
+            else:
+                control = control_sequence[-1]  # Hold last control
+
+            # Predict next state
+            states[k+1] = self.vehicle_model.dynamics_discrete(
+                states[k], control, self.dt)
+
+        return states
+
+    def _cost_function(self,
+                      control_sequence: np.ndarray,
+                      initial_state: np.ndarray,
+                      reference_states: np.ndarray,
+                      reference_speeds: np.ndarray) -> float:
+        """Compute MPC cost function.
+
+        Args:
+            control_sequence: Flattened control sequence to optimize
+            initial_state: Current vehicle state
+            reference_states: Reference states over horizon (N+1, state_dim)
+            reference_speeds: Reference speeds over horizon (N+1,)
+
+        Returns:
+            Total cost
+        """
+        # Predict trajectory
+        states = self._predict_trajectory(initial_state, control_sequence)
+
+        u = control_sequence.reshape((self.control_horizon, self.control_dim))
+
+        # State tracking cost: err^T Q err summed over the horizon. Q is a
+        # fixed diagonal, so this collapses to a weighted sum of squares
+        # instead of a Python loop of N matmuls.
+        err = self._scratch
+        np.subtract(states, reference_states, out=err)
+        cost = float(np.sum(err * (self.Q_diag_masked * err)))
+
+        # yaw is an angle, not a coordinate: compare it wrapped to +/-pi so the
+        # cost does not spike when the reference heading crosses the branch cut.
+        yaw_err = np.arctan2(np.sin(err[:, 2]), np.cos(err[:, 2]))
+        cost += float(self.q_yaw_wrap * np.sum(yaw_err * yaw_err))
+
+        # Control effort cost
+        cost += float(np.sum(u * (self.R_diag * u)))
+
+        # Control rate cost (smoothness), including the jump from the last
+        # command actually applied.
+        d = self._du
+        d[0] = u[0] - self.prev_control
+        if self.control_horizon > 1:
+            np.subtract(u[1:], u[:-1], out=d[1:])
+        cost += float(np.sum(d * (self.R_delta_diag * d)))
+
+        return cost
+
+    def solve(self,
+              current_state: np.ndarray,
+              current_control: np.ndarray = None) -> Tuple[np.ndarray, float]:
+        """Solve MPC optimization problem.
+
+        Args:
+            current_state: Current vehicle state [x, y, yaw, v] or [x, y, yaw, v, beta]
+            current_control: Current control input [steering, acceleration]
+
+        Returns:
+            (optimal_control, solve_time)
+        """
+        start_time = time.time()
+
+        if current_control is not None:
+            self.prev_control = current_control.copy()
+
+        # Ensure state has correct dimension (5 elements: [x, y, yaw, v, beta])
+        if len(current_state) == 4:
+            # Assume beta = 0 if not provided
+            current_state = np.append(current_state, 0.0)
+        elif len(current_state) != self.state_dim:
+            raise ValueError(f"Expected state of length 4 or {self.state_dim}, got {len(current_state)}")
+
+        # Generate reference trajectory over prediction horizon
+        reference_states = []
+        reference_speeds = []
+
+        # Improved approach: look ahead along the path from current vehicle position
+        if self.reference_path is not None and len(self.reference_path) > 1:
+            current_pos = current_state[0:2]
+
+            # Search near last time to stay on the correct part of a closed loop.
+            closest_idx = self._nearest_path_index(current_pos, self._last_path_index)
+            self._last_path_index = closest_idx
+
+            # Anchor the reference in continuous arc length, not in waypoint
+            # index. The car moves v*dt per step (about 0.04 m at 1.6 m/s) but a
+            # waypoint is 0.2 m apart, so a snapped index can only either sit on
+            # the car or jump a whole waypoint -- noise of up to half a spacing
+            # against 0.04 m of real travel, which the optimiser then chases.
+            # Advance by the distance actually covered and resynchronise on the
+            # car's projection onto the path, so the window starts where the
+            # car is.
+            s_proj = self._project_arc(current_pos, closest_idx)
+            v = max(float(current_state[3]), 0.0)
+            step = v * self.dt
+            L = self._path_len
+            if self._s_ref is None:
+                self._s_ref = s_proj
+            else:
+                # Resynchronise: |s_proj - s_ref| is how far off the tracked
+                # arc position has drifted, and the modulo puts it in
+                # [-L/2, L/2] -- the shortest way round a closed lap.
+                s_ref = self._s_ref + step
+                s_ref += (s_proj - s_ref + L / 2.0) % L - L / 2.0
+                self._s_ref = s_ref
+
+            reference_states = self._reference_window(
+                self._s_ref, self.prediction_horizon + 1, car_speed=v)
+            reference_speeds = (reference_states[:, 3] if self.reference_speeds is not None
+                                else np.full(self.prediction_horizon + 1, 3.0))
+        else:
+            # Zero reference if no path set
+            for k in range(self.prediction_horizon + 1):
+                reference_states.append(np.zeros(self.state_dim))
+                reference_speeds.append(0.0)
+
+            reference_states = np.array(reference_states)
+            reference_speeds = np.array(reference_speeds)
+
+        # Initial guess: hold current control
+        if current_control is not None:
+            initial_guess = np.tile(current_control, self.control_horizon)
+        else:
+            initial_guess = np.zeros(self.control_horizon * self.control_dim)
+
+        # Bounds for optimization
+        bounds = []
+        for _ in range(self.control_horizon):
+            bounds.extend(list(zip(self.control_min, self.control_max)))
+
+        # Optimize
+        try:
+            result = minimize(
+                self._cost_function,
+                initial_guess,
+                args=(current_state, reference_states, reference_speeds),
+                method='SLSQP',
+                bounds=bounds,
+                options={'maxiter': 100, 'ftol': 1e-6}
+            )
+
+            if result.success:
+                optimal_control = result.x.reshape((self.control_horizon, self.control_dim))[0]
+                solve_time = time.time() - start_time
+                return optimal_control, solve_time
+            else:
+                # Optimization failed - return current control or zero
+                print(f"MPC optimization failed: {result.message}")
+                solve_time = time.time() - start_time
+                return self.prev_control, solve_time
+
+        except Exception as e:
+            print(f"MPC optimization error: {e}")
+            solve_time = time.time() - start_time
+            return self.prev_control, solve_time
+
+    def get_control(self,
+                   current_state: np.ndarray,
+                   current_control: np.ndarray = None) -> Tuple[np.ndarray, dict]:
+        """Get MPC control command.
+
+        Args:
+            current_state: Current vehicle state [x, y, yaw, v]
+            current_control: Current control input [steering, acceleration]
+
+        Returns:
+            (control_command, diagnostics)
+        """
+        control, solve_time = self.solve(current_state, current_control)
+
+        diagnostics = {
+            'solve_time_ms': solve_time * 1000,
+            'control_steering': control[0],
+            'control_acceleration': control[1],
+            'feasible': True  # Simplified
+        }
+
+        return control, diagnostics
+
+
+def test_mpc_controller():
+    """Simple test of MPC controller."""
+    print("Testing MPC Controller...")
+
+    # Create controller
+    mpc = MPCController(prediction_horizon=5, dt=0.1)
+
+    # Set simple reference path (straight line)
+    path = np.array([[0, 0], [10, 0], [20, 0]])  # Straight line along x-axis
+    mpc.set_reference_path(path)
+
+    # Test initial state at origin, zero velocity
+    initial_state = np.array([0.0, 0.0, 0.0, 0.0, 0.0])  # [x, y, yaw, v, beta]
+    current_control = np.array([0.0, 0.0])  # [steering, acceleration]
+
+    # Get control command
+    control, diagnostics = mpc.get_control(initial_state, current_control)
+
+    print(f"Initial state: {initial_state}")
+    print(f"Control command: steering={control[0]:.3f}, accel={control[1]:.3f}")
+    print(f"Solve time: {diagnostics['solve_time_ms']:.1f} ms")
+    print(f"Diagnostics: {diagnostics}")
+
+
+if __name__ == "__main__":
+    test_mpc_controller()

@@ -18,3 +18,6 @@
 #   ./install/<your-os>/setup.sh --no-cache
 #
 # Also list what you added, and why, in SUBMISSION.md.
+
+numpy==2.5.3
+scipy==1.18.1

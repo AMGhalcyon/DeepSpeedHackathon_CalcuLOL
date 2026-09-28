@@ -17,3 +17,35 @@ driver:
   ros__parameters:
     crawl_speed: 1.0          # [m/s]; you ask for a speed and the sim holds it
     max_range: 8.0            # [m] clip the scan here
+
+# MPC Controller Parameters
+#
+# NOTE: horizon is capped by solve time, not by taste. The control loop runs
+# once per LiDAR scan at 40 Hz, so a solve has a 25 ms budget. Measured on this
+# machine on the vectorized cost, over a full 700-step lap:
+#     horizon  8 ->  30.3 ms mean, 41.0 ms max   (ALREADY OVER BUDGET)
+#     horizon 12 -> 139 ms      horizon 16 -> 239 ms      horizon 32 -> 589 ms
+# Horizon 8 stays at 8, but not because it fits -- it does not. Raising it is
+# far worse: the scaling is super-linear, so a longer horizon buys lookahead the
+# solve time cannot pay for and just publishes stale steering. Getting back under
+# 25 ms means making the solve cheaper, not shorter.
+#
+# Weights (tuned 2026-09-28 on maps/icra26_centerline.csv, 700-step lap):
+#   The state-tracking to control-rate ratio must exceed 1. A 0.2 m reference snap
+#   has to cost more than the steering reversal it causes, or the optimizer
+#   chatters: at the old weights a snap was ~57x cheaper than the reversal. Swept
+#   q_pos x r_delta_steer; this corner clears both gates (mean |dsteer| < 0.012
+#   rad/step and max lateral error < 0.10 m). Lower r_delta_steer fails the slew
+#   gate; lower q_pos fails the tracking gate.
+mpc:
+  ros__parameters:
+    prediction_horizon: 8             # Steps to predict ahead (see note above on the time budget)
+    control_horizon: 8                # Steps of controls to optimize
+    dt: 0.025                         # Time step [s] (40 Hz)
+    q_pos: 2.0                        # Position tracking weight
+    q_yaw: 2.0                        # Yaw tracking weight
+    q_vel: 0.5                        # Velocity tracking weight
+    r_steer: 0.08                     # Steering control effort weight
+    r_accel: 0.01                     # Acceleration control effort weight
+    r_delta_steer: 0.8                # Steering rate of change weight
+    r_delta_accel: 0.005              # Acceleration rate of change weight
