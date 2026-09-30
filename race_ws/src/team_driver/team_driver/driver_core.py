@@ -80,6 +80,16 @@ class DriveCommand(NamedTuple):
 DT_CLAMP_LOW = 0.5     # x nominal: a burst of scans must not zero the interval
 DT_CLAMP_HIGH = 3.0    # x nominal: a dropped scan must not hand over a 1 s dt
 
+PLANT_STEP_DT = 0.01            # [s] gym_bridge.py sim_timestep; one servo evaluation each
+STEER_CORRECT_MIN_SPEED = 0.8   # [m/s] below this the yaw-rate inversion is ill-conditioned
+STEER_CORRECT_TAU = 0.5         # [s] time constant of the yaw-rate leash (~5 % per 25 ms)
+LATCH_TIME_TOL = 1e-6           # [s] stamps are float sums of 0.01; compare with slack
+# [s] Sim time jumping back further than this is a reset (/initialpose makes
+# the bridge call env.reset(), which zeroes sim_time and re-centres the wheel).
+# Smaller backward steps are an out-of-order stamp and are ignored.
+SIM_RESET_BACKSTEP = 0.1
+RTF_SMOOTHING = 0.05            # EMA weight per control step for the live RTF
+
 
 class DtTracker:
     """The interval the plant advanced between sensor stamps, clamped.
@@ -115,6 +125,150 @@ class DtTracker:
         self._history = []
 
 
+class SteeringEstimator:
+    """Where the judged servo has put the wheel, for the MPC's sixth state.
+
+    Nothing measures the wheel angle, so it is predicted: the plant's own
+    servo -- `pid_steer` then `steering_constraint`, evaluated once per 10 ms
+    physics step with a hard clip, since this simulates the plant rather than
+    being differentiated by anyone -- is replayed over the commands the driver
+    published, each from the plant time it latched. A command does not act at
+    the scan it was planned from: it reaches the plant a solve later. Replaying
+    by latch time is what keeps the estimate on the same instant as the pose it
+    is paired with, however stale that pose is.
+
+    Odometry's yaw rate leashes the prediction against drift. Inverting the
+    kinematic yaw rate gives delta_meas = atan(L * psi_dot / (v cos beta)),
+    well conditioned only at speed, and the estimate is pulled toward it with a
+    ~0.5 s time constant. The predictor is primary; a stronger pull would feed
+    yaw-rate noise and the tyres' ~2 % understeer into the MPC's initial state.
+    """
+
+    def __init__(self, params=None):
+        p = params if params is not None else VehicleModel().params
+        self.s_min = float(p.s_min)
+        self.s_max = float(p.s_max)
+        self.sv_max = float(p.sv_max)
+        # action.py:47-48 -- the bridge passes no steer_kp, so the plant derives it.
+        self.kp = 10.0 * self.sv_max / (self.s_max - self.s_min)
+        self.wheelbase = float(p.lf + p.lr)
+
+        self.delta_hat = 0.0      # [rad] the car starts on the grid, wheel centred
+        self.t = None             # [s] plant time delta_hat refers to
+        self._cmd = 0.0           # command latched at self.t
+        self._pending = []        # (t_latch, cmd) not yet reached, time-ordered
+        self._residuals = []      # |delta_hat - delta_meas| before each correction
+
+    def on_publish(self, delta_cmd, t_latch=None):
+        """A command went on the wire and latches at plant time `t_latch`.
+
+        Clipped to the lock exactly as gym_bridge.py:595 does. A command with
+        no time, or one whose time the estimate has already passed, acts from
+        the estimate's own instant: the past cannot be replayed differently.
+        """
+        cmd = float(np.clip(delta_cmd, self.s_min, self.s_max))
+        if self.t is None or t_latch is None or t_latch <= self.t + LATCH_TIME_TOL:
+            # The newest command wins: anything published earlier is moot.
+            self._pending = []
+            self._cmd = cmd
+            return
+        t_latch = float(t_latch)
+        # A newer command supersedes older ones due at or after it.
+        self._pending = [entry for entry in self._pending if entry[0] < t_latch]
+        self._pending.append((t_latch, cmd))
+
+    def predict_to(self, t):
+        """Advance the estimate to plant time `t`. Returns the interval advanced."""
+        if t is None:
+            return 0.0
+        if self.t is not None and t < self.t - SIM_RESET_BACKSTEP:
+            self._reseed()
+        if self.t is None:
+            self.t = float(t)
+            return 0.0
+        start = self.t
+        while self.t < t - LATCH_TIME_TOL:
+            self._latch_due()
+            h = min(PLANT_STEP_DT, t - self.t)
+            self.delta_hat = self._servo_step(self.delta_hat, self._cmd, h)
+            self.t += h
+        # Resynchronise on the caller's clock so float sums never drift.
+        self.t = max(self.t, float(t))
+        self._latch_due()
+        return self.t - start
+
+    def correct(self, yaw_rate, v, beta, dt):
+        """Pull the estimate toward the wheel angle the yaw rate implies."""
+        if v < STEER_CORRECT_MIN_SPEED or dt <= 0.0:
+            return
+        delta_meas = math.atan(self.wheelbase * yaw_rate / (v * math.cos(beta)))
+        self._residuals.append(abs(self.delta_hat - delta_meas))
+        gain = 1.0 - math.exp(-dt / STEER_CORRECT_TAU)
+        self.delta_hat = float(np.clip(
+            self.delta_hat + gain * (delta_meas - self.delta_hat),
+            self.s_min, self.s_max))
+
+    def residual_p95(self):
+        """p95 of |delta_hat - delta_meas| since the last reset; 0 if none."""
+        if not self._residuals:
+            return 0.0
+        return float(np.percentile(self._residuals, 95))
+
+    def reset_stats(self):
+        self._residuals = []
+
+    def _reseed(self):
+        """The sim was reset: the wheel is centred and old commands are void."""
+        self.delta_hat = 0.0
+        self.t = None
+        self._cmd = 0.0
+        self._pending = []
+
+    def _latch_due(self):
+        while self._pending and self._pending[0][0] <= self.t + LATCH_TIME_TOL:
+            self._cmd = self._pending.pop(0)[1]
+
+    def _servo_step(self, delta, cmd, h):
+        """utils.py pid_steer + steering_constraint, one step of length h."""
+        sv = min(max(self.kp * (cmd - delta), -self.sv_max), self.sv_max)
+        if (delta <= self.s_min and sv <= 0.0) or (delta >= self.s_max and sv >= 0.0):
+            sv = 0.0
+        return delta + sv * h
+
+
+class LatchClock:
+    """Plant time at which a command published now will latch, live.
+
+    The node's sim clock is updated by a /clock callback on the same
+    single-threaded executor as the control timer, so it stands still while
+    the MPC solves -- but the bridge free-runs and keeps stepping. A command
+    therefore latches about `solve_wall * rtf` of plant time after the clock
+    reading the node holds. The real-time factor is learnt from how far sim
+    and wall time move between control steps. Transport lag is not modelled,
+    so this is still a slight lower bound; the live residual log is the check.
+    """
+
+    def __init__(self):
+        self.rtf = None
+        self._last = None
+
+    def update(self, t_sim, t_wall):
+        """Feed one (sim, wall) clock pair per control step."""
+        if self._last is not None:
+            d_sim = t_sim - self._last[0]
+            d_wall = t_wall - self._last[1]
+            if d_sim > 0.0 and d_wall > 0.0:
+                ratio = d_sim / d_wall
+                self.rtf = (ratio if self.rtf is None
+                            else self.rtf + RTF_SMOOTHING * (ratio - self.rtf))
+        self._last = (t_sim, t_wall)
+
+    def latch_time(self, t_sim_now, solve_wall_s):
+        """[s] Plant time a command published after `solve_wall_s` will latch."""
+        rtf = self.rtf if self.rtf is not None else 1.0
+        return t_sim_now + solve_wall_s * rtf
+
+
 class DriverCore:
     """The algorithm: reference path, MPC, and the reactive safety layer."""
 
@@ -139,14 +293,16 @@ class DriverCore:
         self._dt = DtTracker(self.mpc_dt)
         self._planned_scan_t = None
         self._last_planned = DriveCommand(0.0, 0.0, 0.0)
+        vehicle = getattr(self.mpc_controller, 'vehicle_model', None)
+        self.steering = SteeringEstimator(vehicle.params if vehicle is not None else None)
 
         # Latest known pose and speed. Ground truth from the simulator, which
         # the rules allow you to use - so use it.
         self.position = None      # (x, y) in the map frame
         self.yaw = 0.0            # [rad]
         self.speed = 0.0          # [m/s]
-        # Sideslip and yaw rate arrive free on /ego_racecar/odom. Recorded now,
-        # not yet consumed: the MPC still assumes beta = 0.
+        # Sideslip and yaw rate arrive free on /ego_racecar/odom. Both leash the
+        # steering estimate; the MPC itself still assumes beta = 0.
         self.beta = 0.0           # [rad]
         self.yaw_rate = 0.0       # [rad/s]
         self.t_odom = None        # [s] stamp the pose was measured at
@@ -197,6 +353,17 @@ class DriverCore:
         summary = self._dt.summary()
         self._dt.reset_stats()
         return summary
+
+    @property
+    def delta_hat(self):
+        """[rad] Estimated wheel angle at the last planned pose's stamp."""
+        return self.steering.delta_hat
+
+    def steering_residual_summary(self):
+        """p95 of |delta_hat - delta_meas| (yaw-rate inversion); clears the window."""
+        p95 = self.steering.residual_p95()
+        self.steering.reset_stats()
+        return p95
 
     # ------------------------------------------------------------------
     # Reference path loading
@@ -285,15 +452,29 @@ class DriverCore:
             return self._last_planned
         self._planned_scan_t = self.t_scan
 
+        # Bring the wheel estimate to the pose's instant -- odom's stamp, which
+        # can trail the scan by a tick -- so the two describe the same moment
+        # when they reach the MPC together, and the yaw rate it is corrected
+        # with is from that moment too.
+        t_pose = self.t_odom if self.t_odom is not None else self.t_scan
+        advanced = self.steering.predict_to(t_pose)
+        self.steering.correct(self.yaw_rate, self.speed, self.beta, advanced)
+
         ranges, angles = self.preprocess()
         steering, speed = self.plan(ranges, angles)
         self._last_planned = DriveCommand(float(steering), float(speed), 0.0)
         return self._last_planned
 
     def note_published(self, cmd: DriveCommand, t_sim=None):
-        """Record what actually went on the wire."""
+        """Record what actually went on the wire.
+
+        `t_sim` is the plant time the command takes effect -- when it is
+        published, not the stamp of the scan it was planned from. The steering
+        estimate replays the servo from exactly that instant.
+        """
         self._last_cmd = cmd
         self._last_publish_t = t_sim
+        self.steering.on_publish(cmd.steering_angle, t_sim)
 
     def preprocess(self):
         """Turn a raw scan into clean ranges plus the angle of each beam.
@@ -388,14 +569,15 @@ class DriverCore:
         #    origin, so stay reactive in that case.
         if self.position is not None and self.reference_path is not None:
             try:
-                # Current state: [x, y, yaw, velocity, beta_sideslip]
+                # Current state: [x, y, yaw, velocity, beta_sideslip, wheel]
                 # Beta (sideslip) is assumed 0 for simplified model
                 current_state = np.array([
                     self.position[0],  # x
                     self.position[1],  # y
                     self.yaw,          # yaw
                     self.speed,        # velocity
-                    0.0                # beta_sideslip (assumed zero)
+                    0.0,               # beta_sideslip (assumed zero)
+                    self.steering.delta_hat,  # wheel angle, estimated
                 ])
 
                 mpc_control, diagnostics = self.mpc_controller.get_control(

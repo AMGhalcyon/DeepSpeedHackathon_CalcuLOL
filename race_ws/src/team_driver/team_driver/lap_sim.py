@@ -72,6 +72,9 @@ JUDGED_MPC = dict(prediction_horizon=8, control_horizon=3, dt=0.025,
 # compared; the saturation gate is what Step 6 has to reach.
 MAX_MEAN_CMD_SLEW = 0.012       # rad per control step
 MAX_SAT_DUTY = 0.05             # fraction of physics steps rate-saturated
+# Step 6: the wheel estimate handed to the MPC, against the plant's own wheel
+# at the same instant. Past this the actuator state does net harm.
+MAX_DELTA_EST_ERR = 0.02        # rad
 # Step 2's binding gate on the harness itself: today's controller must fail the
 # way it fails when judged (7 collisions / 10 laps in the judged run).
 GATE_MIN_COLLISIONS_PER_10 = 3
@@ -229,6 +232,7 @@ class _Log:
         self.delta = []
         self.track_err = []
         self.speed = []
+        self.delta_est_err = []
         self.distance = 0.0
 
 
@@ -272,6 +276,9 @@ def _summarise(cfg, log, plant, counter, line, wall_s, contact):
         'track_err_p95': float(np.percentile(err, 95)) if err.size else 0.0,
         'reversals': reversals,
         'reversals_per_m': reversals / log.distance if log.distance > 0 else 0.0,
+        'delta_est_err_mean': _stat(np.mean, log.delta_est_err),
+        'delta_est_err_p95': _stat(lambda v: np.percentile(v, 95), log.delta_est_err),
+        'delta_est_err_max': _stat(np.max, log.delta_est_err),
         'solve_ms_mean': _stat(np.mean, log.solve_ms),
         'solve_ms_p95': _stat(lambda v: np.percentile(v, 95), log.solve_ms),
         'solve_ms_max': _stat(np.max, log.solve_ms),
@@ -310,8 +317,9 @@ def run(cfg: HarnessConfig):
         t0 = time.thread_time()
         cmd = core.step(t_sim=t_snap)
         solve_s = time.thread_time() - t0
-        core.note_published(cmd, t_sim=t_snap)
         log.solve_ms.append(solve_s * 1e3)
+        # The estimate refers to the snapshot's instant, like the pose it rides with.
+        log.delta_est_err.append(abs(core.delta_hat - float(state[plant_sim.DELTA])))
 
         held = hold_for(cfg, solve_s)
         log.holds.append(held)
@@ -335,6 +343,8 @@ def run(cfg: HarnessConfig):
             if counter.disqualified or line.laps >= cfg.laps:
                 break
         plant.latch(cmd.steering_angle, cmd.speed)
+        # Published now, a solve after the scan it was planned from.
+        core.note_published(cmd, t_sim=plant.time)
 
         if not cfg.quiet and plant.time >= next_report:
             next_report += 5.0
@@ -356,6 +366,9 @@ def verdict(r):
         reasons.append(f"rate-saturated {r['sat_duty']:.1%} of steps > {MAX_SAT_DUTY:.0%}")
     if r['cmd_slew_mean'] > MAX_MEAN_CMD_SLEW:
         reasons.append(f"cmd slew {r['cmd_slew_mean']:.4f} > {MAX_MEAN_CMD_SLEW}")
+    if r.get('delta_est_err_max', 0.0) >= MAX_DELTA_EST_ERR:
+        reasons.append(f"wheel estimate off by {r['delta_est_err_max']:.4f} rad "
+                       f">= {MAX_DELTA_EST_ERR}")
     return reasons
 
 
@@ -384,6 +397,9 @@ def report(r):
           f"rad/cmd  (old gate < {MAX_MEAN_CMD_SLEW})")
     print(f"  actual slew       mean {r['actual_slew_mean']:.4f} rad/physics step")
     print(f"  |cmd - delta|     mean {r['track_err_mean']:.3f}, p95 {r['track_err_p95']:.3f} rad")
+    print(f"  |delta_hat - delta| mean {r['delta_est_err_mean']:.4f}, "
+          f"p95 {r['delta_est_err_p95']:.4f}, max {r['delta_est_err_max']:.4f} rad "
+          f"(gate < {MAX_DELTA_EST_ERR})")
     print(f"  reversals         {r['reversals']} ({r['reversals_per_m']:.2f} per m)")
     print(f"  solve             mean {r['solve_ms_mean']:.1f}, p95 {r['solve_ms_p95']:.1f}, "
           f"max {r['solve_ms_max']:.1f} ms")

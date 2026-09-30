@@ -20,6 +20,7 @@ What you publish:
 """
 
 import math
+import time
 
 import rclpy
 from ackermann_msgs.msg import AckermannDriveStamped
@@ -30,7 +31,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
 
-from .driver_core import DriverConfig, DriverCore
+from .driver_core import DriverConfig, DriverCore, LatchClock
 from .mpc_controller import MPCController
 from .vehicle_model import VehicleModel
 
@@ -137,6 +138,7 @@ class Driver(Node):
 
         self._marker_divisor = 0
         self._last_dt_report = self.get_clock().now()
+        self._latch_clock = LatchClock()
 
         # A regular hold period is what mpc.dt assumes. With use_sim_time this
         # is 25 ms of plant time; on the wall clock it would drift with RTF.
@@ -174,10 +176,20 @@ class Driver(Node):
                            t_sim=_stamp_s(scan.header.stamp))
 
     def _control_step(self):
+        # With use_sim_time this clock is plant time, but it stands still while
+        # this callback runs; the bridge does not. LatchClock turns the solve's
+        # wall time into the plant time the bridge will latch the command at,
+        # which is where the steering estimate replays the servo from.
+        now = self.get_clock().now()
+        now_s = now.nanoseconds * 1e-9
+        wall0 = time.perf_counter()
+        self._latch_clock.update(now_s, wall0)
+
         t = self.core.t_scan
         cmd = self.core.step(t_sim=t)
-        self.publish(cmd)
-        self.core.note_published(cmd, t_sim=t)
+        self.publish(cmd, now)
+        self.core.note_published(
+            cmd, t_sim=self._latch_clock.latch_time(now_s, time.perf_counter() - wall0))
 
         self._marker_divisor = (self._marker_divisor + 1) % 10
         if self._marker_divisor == 0:
@@ -193,13 +205,20 @@ class Driver(Node):
         self.get_logger().info(
             f'dt_measured mean={mean * 1e3:.1f} p95={p95 * 1e3:.1f} '
             f'max={worst * 1e3:.1f} ms')
+        # How far the servo replay sits from the wheel angle the yaw rate
+        # implies. Small and steady is healthy; growing means drift.
+        rtf = self._latch_clock.rtf
+        self.get_logger().info(
+            f'delta_hat={self.core.delta_hat:.3f} rad, '
+            f'p95|delta_hat - delta_meas|={self.core.steering_residual_summary():.4f} rad, '
+            f'rtf={rtf if rtf is not None else float("nan"):.2f}')
 
     # ------------------------------------------------------------------
     # Output
     # ------------------------------------------------------------------
-    def publish(self, cmd):
+    def publish(self, cmd, now=None):
         msg = AckermannDriveStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.stamp = (now if now is not None else self.get_clock().now()).to_msg()
         msg.drive.steering_angle = float(cmd.steering_angle)
         msg.drive.speed = float(cmd.speed)
         self.drive_pub.publish(msg)

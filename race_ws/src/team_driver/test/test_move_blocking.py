@@ -110,9 +110,10 @@ class PredictionTest(unittest.TestCase):
             applied.append(np.array(control))
             return state
 
-        with mock.patch.object(mpc.vehicle_model, 'dynamics_discrete',
+        # Step 6: the per-step dynamics are the actuated step (wheel as state).
+        with mock.patch.object(mpc.vehicle_model, 'actuated_step',
                                side_effect=record):
-            mpc._predict_trajectory(STATE, blocks)
+            mpc._predict_trajectory(np.append(STATE, 0.0), blocks)
 
         expected = blocks.reshape(BLOCKS, 2)[JUDGED_BLOCK_MAP]
         np.testing.assert_allclose(np.array(applied), expected)

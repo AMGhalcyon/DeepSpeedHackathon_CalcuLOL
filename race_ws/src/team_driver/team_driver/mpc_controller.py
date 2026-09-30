@@ -88,26 +88,28 @@ class MPCController:
         self.budget_exceeded_count = 0
         self.solver_failure_count = 0
 
-        # Cost function weights
-        self.Q = np.diag([q_pos, q_pos, q_yaw, q_vel, 0.0])  # [x, y, yaw, v, beta] - don't penalize beta
+        # Cost function weights. Neither beta nor the wheel angle is tracked:
+        # the wheel is where it is, and the command is costed through R.
+        self.Q = np.diag([q_pos, q_pos, q_yaw, q_vel, 0.0, 0.0])  # [x, y, yaw, v, beta, delta]
         self.R = np.diag([r_steer, r_accel])           # [steering, acceleration]
         self.R_delta = np.diag([r_delta_steer, r_delta_accel])  # Control change weights
 
         # Diagonal forms, for the vectorized cost. q_yaw is handled separately
         # (angle wrapping) so it is zeroed here and re-added wrapped.
-        self.Q_diag_masked = np.array([q_pos, q_pos, 0.0, q_vel, 0.0])
+        self.Q_diag_masked = np.array([q_pos, q_pos, 0.0, q_vel, 0.0, 0.0])
         self.q_yaw_wrap = q_yaw
         self.R_diag = np.array([r_steer, r_accel])
         self.R_delta_diag = np.array([r_delta_steer, r_delta_accel])
 
-        # State and control dimensions
-        self.state_dim = 5  # [x, y, yaw, v, beta]
-        self.control_dim = 2  # [steering_angle, acceleration]
+        # State and control dimensions. The wheel angle is a state because the
+        # judged servo is rate-limited: the car turns with the wheel, and the
+        # command only moves the wheel (VehicleModel.actuated_step).
+        self.state_dim = 6  # [x, y, yaw, v, beta, delta]
+        self.control_dim = 2  # [steering_command, acceleration]
 
         # Get bounds from vehicle model
         _, self.state_max = self.vehicle_model.get_state_bounds()
         self.state_min, _ = self.vehicle_model.get_state_bounds()
-        # Adjust bounds for simplified state (remove sideslip for now)
         self.state_min = self.state_min[:self.state_dim]
         self.state_max = self.state_max[:self.state_dim]
 
@@ -135,10 +137,10 @@ class MPCController:
 
         # Reused across solves so the cost function stays allocation-light:
         # SLSQP calls the objective a few hundred times per solve.
-        self._states = np.zeros((prediction_horizon + 1, 5))
-        self._scratch = np.zeros((prediction_horizon + 1, 5))
+        self._states = np.zeros((prediction_horizon + 1, self.state_dim))
+        self._scratch = np.zeros((prediction_horizon + 1, self.state_dim))
         self._du = np.zeros((self.control_horizon, 2))
-        self._ref_cache = np.zeros((prediction_horizon + 1, 5))
+        self._ref_cache = np.zeros((prediction_horizon + 1, self.state_dim))
 
         print(f"MPC Controller initialized:")
         print(f"  Prediction horizon: {self.prediction_horizon}")
@@ -496,6 +498,7 @@ class MPCController:
         out[:, 2] = heading
         out[:, 3] = speed
         out[:, 4] = 0.0
+        out[:, 5] = 0.0     # wheel angle; untracked (Q weight 0)
         return out
 
     def _predict_trajectory(self,
@@ -504,7 +507,7 @@ class MPCController:
         """Predict trajectory over horizon given control sequence.
 
         Args:
-            initial_state: Starting state [x, y, yaw, v, beta]
+            initial_state: Starting state [x, y, yaw, v, beta, delta]
             control_sequence: Flattened free controls, one per block of
                 `block_map` (control_horizon of them)
 
@@ -519,9 +522,9 @@ class MPCController:
         states = self._states
         states[0] = initial_state
 
-        # Propagate dynamics
+        # Propagate dynamics, with the steering servo in the loop
         for k in range(self.prediction_horizon):
-            states[k+1] = self.vehicle_model.dynamics_discrete(
+            states[k+1] = self.vehicle_model.actuated_step(
                 states[k], per_step[k], self.dt)
 
         return states
@@ -585,7 +588,10 @@ class MPCController:
         controller's own previous output; callers cannot inject either.
 
         Args:
-            current_state: Current vehicle state [x, y, yaw, v] or [x, y, yaw, v, beta]
+            current_state: [x, y, yaw, v, beta, delta]. A caller with no wheel
+                estimate may pass [x, y, yaw, v, beta] or [x, y, yaw, v]:
+                beta then defaults to 0 and the wheel to the last command,
+                i.e. a wheel that has caught up with it.
 
         Returns:
             (optimal_control, solve_time)
@@ -593,12 +599,16 @@ class MPCController:
         start_time = time.perf_counter()
         self.last_fallback = None
 
-        # Ensure state has correct dimension (5 elements: [x, y, yaw, v, beta])
+        current_state = np.asarray(current_state, dtype=np.float64)
+        wheel = self.prev_control[0]
         if len(current_state) == 4:
-            # Assume beta = 0 if not provided
-            current_state = np.append(current_state, 0.0)
+            current_state = np.append(current_state, [0.0, wheel])
+        elif len(current_state) == 5:
+            current_state = np.append(current_state, wheel)
         elif len(current_state) != self.state_dim:
-            raise ValueError(f"Expected state of length 4 or {self.state_dim}, got {len(current_state)}")
+            raise ValueError(
+                f"Expected state of length 4, 5 or {self.state_dim}, "
+                f"got {len(current_state)}")
 
         # Generate reference trajectory over prediction horizon
         reference_states = []

@@ -5,8 +5,64 @@ Provides interface to F1TENTH vehicle dynamics for use in MPC prediction.
 """
 
 import math
+from dataclasses import dataclass
 import numpy as np
 from typing import Tuple
+
+# The judged steering servo over one MPC step, calibrated against GymPlant by
+# least squares (test/test_steering_actuator.py pins it). A 25 ms command on the
+# 10 ms physics grid is held for 2 then 3 steps, so the target is the mean move
+# of those two holds. The continuous-time alpha, 1 - exp(-kp*dt) = 0.615, is
+# wrong here: the plant's servo is a discrete Euler step, which closes more of
+# the error per step than its continuous limit would.
+SERVO_CAL_DT = 0.025      # [s] the step the constants below are fitted for
+SERVO_ALPHA = 0.6903      # fraction of a small error closed per SERVO_CAL_DT
+SERVO_D_MAX = 0.0801      # [rad] wheel travel per SERVO_CAL_DT at the rate limit
+# Knee sharpness of the soft clip. tanh (the plan's first choice) fits no
+# better than 6.7 % of d_max and overstates the small-signal rate by 26 %; this
+# fits within 1.5 % and is exact in the linear regime.
+SERVO_SHARPNESS = 8
+
+
+@dataclass(frozen=True)
+class ServoModel:
+    """The wheel's move over one step toward a held command, smoothly saturated.
+
+    move = d_max * x / (1 + |x|^p)^(1/p),  x = alpha * error / d_max
+
+    Linear with slope alpha for small errors, tending to d_max in saturation,
+    and strictly monotone: the derivative (1 + |x|^p)^-(1 + 1/p) is never zero.
+    That matters because SLSQP differentiates by finite differences over the
+    command; a hard clip reads a gradient of exactly zero the moment the rate
+    limit binds. Here the gradient stays visible to SLSQP's 1.5e-8 step well
+    past the knee (tested at 2.6x it). Past ~0.5 rad of error it does fade to
+    numerically nothing -- honestly: every such command moves the wheel by
+    d_max, and there the effort and rate costs carry the gradient, pulling the
+    command back toward the knee. It never overshoots the command.
+    """
+
+    alpha: float = SERVO_ALPHA
+    d_max_cal: float = SERVO_D_MAX
+    sharpness: int = SERVO_SHARPNESS
+    cal_dt: float = SERVO_CAL_DT
+
+    def alpha_at(self, dt: float) -> float:
+        """Linear fraction closed over dt, compounding the calibrated step."""
+        return 1.0 - (1.0 - self.alpha) ** (dt / self.cal_dt)
+
+    def d_max(self, dt: float) -> float:
+        """[rad] Most the wheel can travel in dt."""
+        return self.d_max_cal * dt / self.cal_dt
+
+    def move(self, error: float, dt: float) -> float:
+        """[rad] How far the wheel moves in dt toward a command `error` away."""
+        if dt <= 0.0:
+            return 0.0
+        d = self.d_max(dt)
+        x = error * self.alpha_at(dt) / d
+        p = self.sharpness
+        return d * x / (1.0 + abs(x) ** p) ** (1.0 / p)
+
 
 # Import vehicle parameters from f1tenth_gym
 try:
@@ -69,15 +125,19 @@ except ImportError:
 class VehicleModel:
     """Vehicle model wrapper for MPC prediction."""
 
-    def __init__(self, params: VehicleParameters = None, model_type: str = 'KS'):
+    def __init__(self, params: VehicleParameters = None, model_type: str = 'KS',
+                 servo: ServoModel = None):
         """Initialize vehicle model.
 
         Args:
             params: Vehicle parameters (defaults to F1TENTH)
             model_type: 'KS' for kinematic single track
+            servo: Steering servo model for `actuated_step` (defaults to the
+                one calibrated against the judged plant)
         """
         self.params = params if params is not None else F1TENTH_VEHICLE_PARAMETERS
         self.model_type = model_type
+        self.servo = servo if servo is not None else ServoModel()
 
         # State dimensions
         if model_type == 'KS':
@@ -115,6 +175,29 @@ class VehicleModel:
         state_dot = self.dynamics_continuous(state, control)
         return state + state_dot * dt
 
+    def actuated_step(self, state: np.ndarray, control: np.ndarray, dt: float) -> np.ndarray:
+        """One step with the steering servo in the loop.
+
+        The wheel angle is the sixth state. The car turns with the wheel as it
+        stands, not with the command: rows 0-4 are the Euler kinematic step
+        driven by state[5], and the command only moves the wheel, through the
+        servo model. So the rate limit is a property of every predicted
+        trajectory, at no cost in decision variables or constraints.
+
+        Args:
+            state: [x, y, yaw, v, beta, delta]
+            control: [delta_cmd, acceleration]
+            dt: Time step
+
+        Returns:
+            Next state [x, y, yaw, v, beta, delta]
+        """
+        delta = state[5]
+        nxt = np.empty(6)
+        nxt[:5] = self.dynamics_discrete(state[:5], (delta, control[1]), dt)
+        nxt[5] = delta + self.servo.move(control[0] - delta, dt)
+        return nxt
+
     def get_initial_state(self, pose: Tuple[float, float, float] = None) -> np.ndarray:
         """Get initial vehicle state.
 
@@ -144,7 +227,8 @@ class VehicleModel:
             -float('inf'),  # y
             -float('inf'),  # yaw
             self.params.v_min,  # velocity
-            -0.5  # sideslip (rough estimate)
+            -0.5,  # sideslip (rough estimate)
+            self.params.s_min,  # wheel angle, for actuated_step's sixth state
         ])
 
         max_bounds = np.array([
@@ -152,7 +236,8 @@ class VehicleModel:
             float('inf'),   # y
             float('inf'),   # yaw
             self.params.v_max,  # velocity
-            0.5   # sideslip
+            0.5,   # sideslip
+            self.params.s_max,  # wheel angle
         ])
 
         return min_bounds, max_bounds
