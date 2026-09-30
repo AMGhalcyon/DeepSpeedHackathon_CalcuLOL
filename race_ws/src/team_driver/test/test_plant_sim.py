@@ -277,6 +277,81 @@ class TestCommandInterface(unittest.TestCase):
         self.assertAlmostEqual(float(plant.state[PSI]), 0.0, places=6)
 
 
+class TestKinematicPlant(unittest.TestCase):
+    """The kinematic ablation: the judge's servo, no tyre slip dynamics."""
+
+    def _steady_turn(self, delta=0.2, v=2.0, steps=300):
+        plant = plant_sim.KinematicPlant()
+        plant.reset_state([0.0, 0.0, delta, v, 0.0, 0.0, 0.0])
+        plant.latch(delta, v)
+        for _ in range(steps):
+            plant.step()
+        return plant
+
+    def test_dynamics_come_from_the_external_tree(self):
+        source = sys.modules[plant_sim.vehicle_dynamics_ks_cog.__module__].__file__
+        self.assertIn(os.path.join('external', 'f1tenth_gym'), source)
+
+    def test_yaw_rate_and_sideslip_are_the_kinematic_ones(self):
+        plant = self._steady_turn()
+        p = plant.params
+        wheelbase = p.lf + p.lr
+        beta = math.atan(math.tan(0.2) * p.lr / wheelbase)
+        expected = 2.0 * math.cos(beta) * math.tan(0.2) / wheelbase
+        self.assertAlmostEqual(float(plant.state[PSI_DOT]), expected, places=4)
+        self.assertAlmostEqual(float(plant.state[BETA]), beta, places=5)
+
+    def test_servo_is_still_rate_limited(self):
+        plant = plant_sim.KinematicPlant()
+        plant.reset((0.0, 0.0, 0.0))
+        plant.latch(0.4, 1.0)
+        plant.step()
+        self.assertTrue(plant.is_rate_saturated)
+        self.assertAlmostEqual(float(plant.state[DELTA]),
+                               float(plant.params.sv_max) * plant.timestep, places=5)
+
+    def test_state_keeps_the_judged_seven_state_float32_layout(self):
+        plant = self._steady_turn(steps=5)
+        self.assertEqual(plant.state.shape, (7,))
+        self.assertEqual(plant.state.dtype, np.float32)
+
+    def test_integrates_in_float32_like_the_judge(self):
+        seen = []
+        real = plant_sim.rk4_integration
+
+        def spy(f, x, u, dt, params):
+            seen.append(np.asarray(x).dtype)
+            return real(f, x, u, dt, params)
+
+        plant = plant_sim.KinematicPlant()
+        plant.reset((0.0, 0.0, 0.0))
+        plant.latch(0.1, 1.0)
+        orig, plant_sim.rk4_integration = plant_sim.rk4_integration, spy
+        try:
+            plant.step()
+        finally:
+            plant_sim.rk4_integration = orig
+        self.assertEqual(seen, [np.float32])
+
+
+class TestOdomHelpers(unittest.TestCase):
+    """The frames a stored snapshot is replayed into."""
+
+    def test_base_link_sits_lr_behind_the_cog_along_the_heading(self):
+        state = np.array([1.0, 2.0, 0.0, 0.0, math.pi / 2, 0.0, 0.0])
+        x, y, yaw = plant_sim.base_link_pose_of(state, 0.2)
+        self.assertAlmostEqual(x, 1.0, places=9)
+        self.assertAlmostEqual(y, 1.8, places=9)
+        self.assertAlmostEqual(yaw, math.pi / 2, places=9)
+
+    def test_twist_splits_speed_by_sideslip_and_carries_yaw_rate(self):
+        state = np.array([0.0, 0.0, 0.0, 2.0, 0.0, 0.7, 0.1])
+        vx, vy, wz = plant_sim.odom_twist_of(state)
+        self.assertAlmostEqual(vx, 2.0 * math.cos(0.1), places=6)
+        self.assertAlmostEqual(vy, 2.0 * math.sin(0.1), places=6)
+        self.assertAlmostEqual(wz, 0.7, places=6)
+
+
 class TestGymImport(unittest.TestCase):
     """The plant must be the judge's code, not a copy of it."""
 

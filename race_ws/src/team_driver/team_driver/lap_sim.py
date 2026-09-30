@@ -1,220 +1,438 @@
 #!/usr/bin/env python3
-"""Closed-loop lap simulator for the MPC driver.
+"""Closed-loop harness: the judged plant, sensors and timing, driving DriverCore.
 
-Runs the controller against the VehicleModel along the real icra26 centerline
-and reports whether a lap is completed and how close the car came to the walls.
+    python3 lap_sim.py                          # 2 laps, judged timing
+    python3 lap_sim.py --laps 10 --json r.json  # a scored-length run
+    python3 lap_sim.py --stale-steps 0          # what Step 3's QoS fix is worth
+    python3 lap_sim.py --plant instant          # ablation: no steering servo
 
-    python3 lap_sim.py                     # defaults
-    python3 lap_sim.py --v-max 2.5 --lat-accel 0.6
-    python3 lap_sim.py --r-delta-steer 0.01   # show a chattering config fail
+WHY THE TIMING MODEL
+    The judged run sets `use_sim_time_bridge`, which zeroes both bridge timers:
+    the bridge steps physics and publishes scan+odom as fast as the CPU allows
+    (RTF ~1.4). The driver solves one scan in ~30-40 ms of wall time, so its
+    depth-10 subscription queues are always full and every scan it takes is ~10
+    physics steps old. While it solves, the sim keeps running -- so each command
+    is also held for `solve_wall * rtf` of sim time. Together that is ~150 ms of
+    dead time, against an MPC that plans 200 ms ahead and a steering servo that
+    needs 290 ms for a full reversal. A harness that applies commands instantly
+    to the current state -- the old `lap_sim.py` -- cannot see any of it.
 
-The simulator deliberately mirrors driver.py's control path (MPC accel ->
-speed command, then clip against the reactive bound) so that what it measures
-is what the judge will see.
+WHAT IS EXACT, WHAT IS NOT
+    Plant, servo, LiDAR, collision detection and the referee's 1 Hz collision
+    debounce are the judge's own code or line-for-line ports (plant_sim,
+    scan_sim). Collision RESPONSE is a restitution-0 approximation, and the
+    queue model is a fixed staleness rather than a simulated DDS executor.
 """
 
 import argparse
+import json
 import math
 import os
 import sys
 import time
+from collections import deque
+from dataclasses import asdict, dataclass
+from typing import Optional
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mpc_controller import MPCController
-from vehicle_model import VehicleModel
+import plant_sim  # noqa: E402
+import scan_sim  # noqa: E402
+from driver_core import DriverConfig, DriverCore  # noqa: E402
+from mpc_controller import MPCController  # noqa: E402
+from vehicle_model import VehicleModel  # noqa: E402
 
-# Half-width of the drivable corridor, m. The f1tenth collision body is
-# 0.31 m wide, so the car centre must stay well inside this to be safe.
-TRACK_HALF_WIDTH = 0.25
+PHYSICS_DT = 0.01               # s, gym_bridge.py sim_timestep
+# Scan and odom are both 9 physics steps old when the driver reads them: the
+# depth-10 queue stays full, and its oldest entry is 9 behind the newest.
+# Measured live with a /clock probe (run 20260930T091032Z, mode 9 of 1536).
+DEFAULT_STALE_STEPS = 9
+DEFAULT_RTF = 1.4               # sim seconds per wall second, measured live
+# Live, consecutive scans the driver used were ~74 ms of sim apart (the hold),
+# against ~32 ms for core.step here: 74 / (32 * 1.4) = 1.65.
+DEFAULT_SOLVE_SCALE = 1.65
+SCAN_CULL_REACH = 9.0           # m; exact below it, and the driver clips at 8 m
 
-# Oscillation gates. `travelled / mean err / off-track` all read "lap completed"
-# for every weight set tried, including the ones chattering between full lock and
-# centre, so on their own they cannot tell a stable lap from a violent one.
-# These two are what make a config pass or fail on smoothness. Budget is
-# ~0.005 rad/step for a smooth 1.5 m/s corner; 0.012 leaves headroom.
-MAX_MEAN_SLEW = 0.012      # rad per control step, mean |steer[k] - steer[k-1]|
-MAX_LATERAL_ERR = 0.10     # m, max deviation from the centerline
+# maps/tracks.yaml: spawn behind the line, and the line itself.
+SPAWN_POSE = (-1.68, -0.01, 0.0)
+FINISH_LINE_X = 1.32
+FINISH_LINE_Y = (-0.76, 0.89)
+
+# The node's declared parameters (driver.py). DriverCore's own fallback builds
+# horizon 10, and driver_params.yaml never loads, so these are what the judge runs.
+JUDGED_MPC = dict(prediction_horizon=8, control_horizon=8, dt=0.025,
+                  q_pos=2.0, q_yaw=2.0, q_vel=0.5, r_steer=0.08, r_accel=0.01,
+                  r_delta_steer=0.8, r_delta_accel=0.005)
+
+# Controller gates. The slew gate is the old harness's, kept so the two can be
+# compared; the saturation gate is what Step 6 has to reach.
+MAX_MEAN_CMD_SLEW = 0.012       # rad per control step
+MAX_SAT_DUTY = 0.05             # fraction of physics steps rate-saturated
+# Step 2's binding gate on the harness itself: today's controller must fail the
+# way it fails when judged (7 collisions / 10 laps in the judged run).
+GATE_MIN_COLLISIONS_PER_10 = 3
+# Rate-saturation duty of the live command stream (run 20260930T091032Z replayed
+# through the judge's servo). A faithful harness lands either side of it, so the
+# gate asks for agreement with it rather than a one-sided threshold.
+LIVE_SAT_DUTY = 0.207
+GATE_SAT_TOLERANCE = 0.03
+JUDGED_BASELINE = 'results/CalcuLOL__20260929T172052Z.json: 10 laps, 7 collisions'
 
 
-def nearest_error(path, position, hint):
-    """Signed lateral offset from the path, searched near `hint`.
+@dataclass(frozen=True)
+class HarnessConfig:
+    laps: int = 2
+    max_time: Optional[float] = None  # sim s; default scales with laps
+    stale_steps: int = DEFAULT_STALE_STEPS
+    rtf: float = DEFAULT_RTF
+    fixed_solve_ms: Optional[float] = None
+    solve_scale: float = DEFAULT_SOLVE_SCALE
+    plant: str = 'st'
+    seed: Optional[int] = None  # plant noise RNG; inert unless noise is on
+    quiet: bool = False
 
-    The search window WRAPS. The reference is a closed loop and the sim runs
-    past the finish line into lap 2, so a window clipped to `[0, len(path))`
-    saturates at the last node the moment the car passes it: `hint` sticks
-    there forever and every later reading is the distance to a stale point.
-    That is not a metric that reads "badly", it is one that reports the car as
-    metres off track while the controller tracks it to within centimetres --
-    which is exactly what it did, and why every weight sweep moved the
-    "failure point" by less than 1%.
-    """
-    n = len(path)
-    idx = (np.arange(hint - 20, hint + 21)) % n
-    seg = path[idx]
-    d = np.sum((seg - position) ** 2, axis=1)
-    i = int(idx[int(np.argmin(d))])
-    nxt = path[(i + 1) % n]
-    prv = path[(i - 1) % n]
-    tangent = nxt - prv
-    tangent = tangent / max(np.linalg.norm(tangent), 1e-9)
-    normal = np.array([-tangent[1], tangent[0]])
-    return float((position - path[i]) @ normal), i
+    @property
+    def time_limit(self):
+        return self.max_time if self.max_time is not None else 30.0 + 90.0 * self.laps
 
 
-def run(path, v_max, lat_accel, a_brake, horizon, max_steps, quiet=False,
-        weights=None):
-    # Weights come from the controller's own defaults unless overridden, so a
-    # tuning change cannot land in the YAML and quietly miss what the sim tests.
-    mpc = MPCController(
-        vehicle_model=VehicleModel(),
-        prediction_horizon=horizon,
-        control_horizon=horizon,
-        dt=0.025,
-        **(weights or {}),
-    )
-    profile = mpc.speed_profile(v_max=v_max, lat_accel=lat_accel,
-                                a_brake=a_brake, path=path)
-    mpc.set_reference_path(path, profile)
+def hold_steps(solve_wall_s, rtf, dt=PHYSICS_DT):
+    """Physics steps the sim advances while the driver solves one command."""
+    return max(1, int(round(solve_wall_s * rtf / dt)))
 
-    # Start on the centerline at the first waypoint, aligned with the track.
-    start, nxt = path[0], path[1]
-    state = np.array([start[0], start[1],
-                      math.atan2(nxt[1] - start[1], nxt[0] - start[0]),
-                      1.0, 0.0])
 
-    model = VehicleModel()
-    lap = float(np.sum(np.linalg.norm(
-        np.diff(np.vstack([path, path[:1]]), axis=0), axis=1)))
+def hold_for(cfg, measured_solve_s):
+    """Hold for one command: the fixed solve time, else the scaled measured one."""
+    if cfg.fixed_solve_ms is not None:
+        return hold_steps(cfg.fixed_solve_ms / 1e3, cfg.rtf)
+    return hold_steps(measured_solve_s * cfg.solve_scale, cfg.rtf)
 
-    travelled = 0.0
-    hint = 0
-    errors = []
-    v_peak = 0.0
-    solve_ms = []
-    steers = []
-    steer = 0.0
 
-    for step in range(max_steps):
-        err, hint = nearest_error(path, state[:2], hint)
-        errors.append(abs(err))
+class SnapshotRing:
+    """The last few published (state, stamp) pairs; the driver reads a stale one."""
 
-        t0 = time.perf_counter()
-        out, diag = mpc.get_control(state, np.array([steer, 0.0]))
-        solve_ms.append((time.perf_counter() - t0) * 1e3)
-        steer = float(out[0])
-        accel = float(out[1])
-        steers.append(steer)
-        speed_cmd = max(min(state[3] + accel * mpc.dt, profile.max()), 0.0)
+    def __init__(self, stale_steps, initial):
+        if stale_steps < 0:
+            raise ValueError(f'stale_steps must be >= 0, got {stale_steps}')
+        self._ring = deque([initial], maxlen=stale_steps + 1)
 
-        # The published command is a speed and the sim closes that loop itself,
-        # so drive the model with the requested speed, not with the accel.
-        applied_accel = (speed_cmd - state[3]) / mpc.dt
-        state = model.dynamics_discrete(state, np.array([steer, applied_accel]), mpc.dt)
-        travelled += float(state[3]) * mpc.dt
-        v_peak = max(v_peak, float(state[3]))
+    def push(self, snapshot):
+        self._ring.append(snapshot)
 
-        if not quiet and step % 200 == 0:
-            print(f'  step {step:4d}  s={travelled:6.1f}m  '
-                  f'err={err:+.3f}m  v={state[3]:.2f}  steer={steer:+.3f}')
+    def stale(self):
+        return self._ring[0]
 
-    errors = np.array(errors)
-    steers = np.array(steers)
-    slew = np.abs(np.diff(steers))
-    # A reversal is a sign flip in the commanded steering. Zero-deltas are
-    # dropped rather than counted: a tie between two identical commands is not
-    # a direction change, but counting it as one inflates the total on the
-    # settled, near-zero steering a converged controller produces.
-    signs = np.sign(np.diff(steers))
+
+class FinishLine:
+    """Counts laps the way f110_env does: the first crossing is the out-lap."""
+
+    def __init__(self, x=FINISH_LINE_X, y_min=FINISH_LINE_Y[0], y_max=FINISH_LINE_Y[1]):
+        self.x = float(x)
+        self.y_min = float(y_min)
+        self.y_max = float(y_max)
+        self.crossings = 0
+        self.lap_times = []
+        self._last_cross_t = None
+        # A backwards crossing must be undone by a forward one before it counts.
+        self._debt = 0
+
+    @property
+    def laps(self):
+        return len(self.lap_times)
+
+    def update(self, prev_xy, xy, t):
+        """Feed one step of base_link motion. Returns True if a lap was scored."""
+        x0, x1 = float(prev_xy[0]), float(xy[0])
+        if not self.y_min <= float(xy[1]) <= self.y_max:
+            return False
+        if x0 >= self.x > x1:
+            self._debt += 1
+            return False
+        if not x0 < self.x <= x1:
+            return False
+        if self._debt:
+            self._debt -= 1
+            return False
+        self.crossings += 1
+        scored = self._last_cross_t is not None
+        if scored:
+            self.lap_times.append(t - self._last_cross_t)
+        self._last_cross_t = t
+        return scored
+
+
+def count_reversals(steers):
+    """Sign flips in the command's direction of change; ties are not flips."""
+    signs = np.sign(np.diff(np.asarray(steers, dtype=float)))
     signs = signs[signs != 0]
-    reversals = int(np.sum(signs[1:] != signs[:-1])) if len(signs) > 1 else 0
+    return int(np.sum(signs[1:] != signs[:-1])) if len(signs) > 1 else 0
 
+
+class InstantSteerPlant(plant_sim.GymPlant):
+    """Ablation: the judged plant with the steering servo removed.
+
+    Steering snaps to the command every step, so `pid_steer` sees zero error.
+    Comparing against the real plant isolates what the servo costs.
+    """
+
+    def step(self):
+        self.state[plant_sim.DELTA] = np.float32(self.steer_cmd)
+        return super().step()
+
+
+PLANTS = {
+    'st': plant_sim.GymPlant,               # the judged plant
+    'kinematic': plant_sim.KinematicPlant,  # same servo, no tyre slip
+    'instant': InstantSteerPlant,           # same tyres, no servo
+}
+
+
+def make_plant(name, seed=None):
+    """Build the plant a `--plant` flag names."""
+    if name not in PLANTS:
+        raise ValueError(f'unknown plant {name!r}; choose from {sorted(PLANTS)}')
+    return PLANTS[name](seed=seed)
+
+
+def _repo_root():
+    node = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(8):
+        node = os.path.dirname(node)
+        if os.path.isfile(os.path.join(node, 'maps', 'icra26.yaml')):
+            return node
+    raise FileNotFoundError('maps/icra26.yaml not found above ' + __file__)
+
+
+def _feed_driver(core, scanner, state, t_sim, lr):
+    """Hand the driver one snapshot, in the frames the bridge publishes."""
+    x, y, yaw = plant_sim.base_link_pose_of(state, lr)
+    vx, vy, wz = plant_sim.odom_twist_of(state)
+    core.set_odom(x, y, yaw, math.hypot(vx, vy), beta=math.atan2(vy, vx),
+                  yaw_rate=wz, t_sim=t_sim)
+    ranges = scanner.scan((float(state[plant_sim.X]), float(state[plant_sim.Y]),
+                           float(state[plant_sim.PSI])))
+    core.set_scan(ranges, scanner.angle_min, scanner.angle_increment, t_sim=t_sim)
+
+
+class _Log:
+    """Per-step and per-command traces, reduced to metrics at the end."""
+
+    def __init__(self):
+        self.cmd_steer = []
+        self.solve_ms = []
+        self.holds = []
+        self.saturated = []
+        self.delta = []
+        self.track_err = []
+        self.speed = []
+        self.distance = 0.0
+
+
+def _stat(fn, values):
+    """A summary statistic, or 0.0 for a run that logged nothing."""
+    return float(fn(values)) if len(values) else 0.0
+
+
+def _summarise(cfg, log, plant, counter, line, wall_s, contact):
+    cmd = np.asarray(log.cmd_steer)
+    delta = np.asarray(log.delta)
+    err = np.asarray(log.track_err)
+    holds = np.asarray(log.holds, dtype=float)
+    reversals = count_reversals(cmd)
     return {
-        'lap_len': lap,
-        'travelled': travelled,
-        'progress': travelled / lap,
-        'completed': travelled >= lap,
-        'max_err': float(errors.max()),
-        'mean_err': float(errors.mean()),
-        'off_track': int(np.sum(errors > TRACK_HALF_WIDTH)),
-        'v_peak': v_peak,
-        'mean_slew': float(slew.mean()) if slew.size else 0.0,
-        'max_slew': float(slew.max()) if slew.size else 0.0,
-        'steer_reversals': reversals,
-        'steer_min': float(steers.min()) if steers.size else 0.0,
-        'steer_max': float(steers.max()) if steers.size else 0.0,
-        'solve_mean_ms': float(np.mean(solve_ms)),
-        'solve_max_ms': float(np.max(solve_ms)),
-        'profile_min': float(profile.min()),
-        'profile_max': float(profile.max()),
+        'plant': cfg.plant,
+        'seed': cfg.seed,
+        'stale_steps': cfg.stale_steps,
+        'rtf': cfg.rtf,
+        'fixed_solve_ms': cfg.fixed_solve_ms,
+        'solve_scale': cfg.solve_scale,
+        'sim_time': plant.time,
+        'wall_time': wall_s,
+        'laps_requested': cfg.laps,
+        'laps': line.laps,
+        'lap_times': list(line.lap_times),
+        'best_lap': min(line.lap_times) if line.lap_times else None,
+        'distance_m': log.distance,
+        'mean_speed': float(np.mean(log.speed)) if log.speed else 0.0,
+        'collisions': counter.events,
+        'contact_steps': counter.steps_in_contact,
+        'penalty_s': counter.penalty,
+        'disqualified': counter.disqualified,
+        'contact_model_approximate': contact.approximate,
+        'sat_duty': float(np.mean(log.saturated)) if log.saturated else 0.0,
+        'cmd_slew_mean': float(np.mean(np.abs(np.diff(cmd)))) if cmd.size > 1 else 0.0,
+        'cmd_slew_max': float(np.max(np.abs(np.diff(cmd)))) if cmd.size > 1 else 0.0,
+        'actual_slew_mean': (float(np.mean(np.abs(np.diff(delta))))
+                             if delta.size > 1 else 0.0),
+        'track_err_mean': float(np.mean(err)) if err.size else 0.0,
+        'track_err_p95': float(np.percentile(err, 95)) if err.size else 0.0,
+        'reversals': reversals,
+        'reversals_per_m': reversals / log.distance if log.distance > 0 else 0.0,
+        'solve_ms_mean': _stat(np.mean, log.solve_ms),
+        'solve_ms_p95': _stat(lambda v: np.percentile(v, 95), log.solve_ms),
+        'solve_ms_max': _stat(np.max, log.solve_ms),
+        'hold_steps_mean': _stat(np.mean, holds),
+        'hold_steps_max': int(holds.max()) if holds.size else 0,
+        'dead_time_ms_mean': (cfg.stale_steps + _stat(np.mean, holds)) * PHYSICS_DT * 1e3,
     }
 
 
+def run(cfg: HarnessConfig):
+    """Drive DriverCore against the judged plant until the laps, a DQ, or the limit."""
+    track = scan_sim.load_map(os.path.join(_repo_root(), 'maps', 'icra26.yaml'))
+    scanner = scan_sim.ScanSimulator(track, cull_reach=SCAN_CULL_REACH)
+    contact = scan_sim.ContactResolver(track)
+    plant = make_plant(cfg.plant, cfg.seed)
+    plant.reset(SPAWN_POSE)
+    lr = float(plant.params.lr)
+    core = DriverCore(cfg=DriverConfig(),
+                      mpc_controller=MPCController(vehicle_model=VehicleModel(), **JUDGED_MPC))
+
+    counter = scan_sim.CollisionCounter()
+    line = FinishLine()
+    ring = SnapshotRing(cfg.stale_steps, (plant.state.copy(), plant.time))
+    log = _Log()
+    prev_xy = plant.base_link_pose[:2]
+    next_report = 5.0
+    wall0 = time.perf_counter()
+
+    while (line.laps < cfg.laps and not counter.disqualified
+           and plant.time < cfg.time_limit):
+        state, t_snap = ring.stale()
+        _feed_driver(core, scanner, state, t_snap, lr)
+        # CPU time of this thread, not wall time: other processes on the host
+        # must not lengthen the hold. The solver is single-threaded (small
+        # SLSQP problem), so thread time is all of its work.
+        t0 = time.thread_time()
+        cmd = core.step(t_sim=t_snap)
+        solve_s = time.thread_time() - t0
+        core.note_published(cmd, t_sim=t_snap)
+        log.solve_ms.append(solve_s * 1e3)
+
+        held = hold_for(cfg, solve_s)
+        log.holds.append(held)
+        log.cmd_steer.append(cmd.steering_angle)
+
+        # The sim keeps running the previous command while this one solves;
+        # it reaches the bridge only when the solve ends.
+        for _ in range(held):
+            plant.step()
+            counter.update(plant.time, contact.resolve(plant.state))
+            log.saturated.append(plant.is_rate_saturated)
+            log.delta.append(float(plant.state[plant_sim.DELTA]))
+            log.track_err.append(abs(plant.steer_cmd - log.delta[-1]))
+            log.speed.append(float(plant.state[plant_sim.V]))
+            xy = plant.base_link_pose[:2]
+            log.distance += math.hypot(xy[0] - prev_xy[0], xy[1] - prev_xy[1])
+            if line.update(prev_xy, xy, plant.time) and not cfg.quiet:
+                print(f'  lap {line.laps}: {line.lap_times[-1]:.2f} s')
+            prev_xy = xy
+            ring.push((plant.state.copy(), plant.time))
+            if counter.disqualified or line.laps >= cfg.laps:
+                break
+        plant.latch(cmd.steering_angle, cmd.speed)
+
+        if not cfg.quiet and plant.time >= next_report:
+            next_report += 5.0
+            print(f'  t={plant.time:6.1f}s  laps={line.laps}  s={log.distance:6.1f}m  '
+                  f'v={log.speed[-1]:.2f}  coll={counter.events}  '
+                  f'sat={np.mean(log.saturated):.1%}')
+
+    return _summarise(cfg, log, plant, counter, line, time.perf_counter() - wall0, contact)
+
+
 def verdict(r):
-    """Overall pass/fail. Smoothness gates are as binding as completing the lap."""
+    """Reasons the controller fails; empty means it passes."""
     reasons = []
-    if not r['completed']:
-        reasons.append('lap not completed')
-    if r['off_track']:
-        reasons.append(f"{r['off_track']} off-track steps")
-    if r['mean_slew'] > MAX_MEAN_SLEW:
-        reasons.append(f"mean slew {r['mean_slew']:.4f} > {MAX_MEAN_SLEW}")
-    if r['max_err'] > MAX_LATERAL_ERR:
-        reasons.append(f"max error {r['max_err']:.3f} > {MAX_LATERAL_ERR} m")
+    if r['laps'] < r['laps_requested']:
+        reasons.append(f"completed {r['laps']}/{r['laps_requested']} laps")
+    if r['collisions']:
+        reasons.append(f"{r['collisions']} collisions")
+    if r['sat_duty'] > MAX_SAT_DUTY:
+        reasons.append(f"rate-saturated {r['sat_duty']:.1%} of steps > {MAX_SAT_DUTY:.0%}")
+    if r['cmd_slew_mean'] > MAX_MEAN_CMD_SLEW:
+        reasons.append(f"cmd slew {r['cmd_slew_mean']:.4f} > {MAX_MEAN_CMD_SLEW}")
     return reasons
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--v-max', type=float, default=3.0)
-    ap.add_argument('--lat-accel', type=float, default=0.8)
-    ap.add_argument('--a-brake', type=float, default=None)
-    ap.add_argument('--horizon', type=int, default=8)
-    ap.add_argument('--max-steps', type=int, default=4000)
-    ap.add_argument('--quiet', action='store_true')
-    ap.add_argument('--r-delta-steer', type=float, default=None,
-                    help='override the steering-rate weight (to test the gate)')
-    ap.add_argument('--q-pos', type=float, default=None,
-                    help='override the position-tracking weight')
-    args = ap.parse_args()
+def collisions_per_10_laps(r):
+    return r['collisions'] * 10.0 / max(r['laps'], 1)
 
-    a_brake = args.a_brake if args.a_brake is not None else args.lat_accel
-    here = os.path.dirname(os.path.abspath(__file__))
-    path = np.loadtxt(os.path.join(here, '..', '..', '..', '..', 'maps',
-                                   'icra26_centerline.csv'),
-                      delimiter=',', comments='#')
-    path = np.atleast_2d(path)[:, :2]
 
-    overrides = {}
-    if args.r_delta_steer is not None:
-        overrides['r_delta_steer'] = args.r_delta_steer
-    if args.q_pos is not None:
-        overrides['q_pos'] = args.q_pos
+def reproduces_judged_failure(r):
+    """Whether a run on today's controller fails the way the judged run did."""
+    return (collisions_per_10_laps(r) >= GATE_MIN_COLLISIONS_PER_10
+            and abs(r['sat_duty'] - LIVE_SAT_DUTY) <= GATE_SAT_TOLERANCE)
 
-    r = run(path, args.v_max, args.lat_accel, a_brake, args.horizon,
-            args.max_steps, args.quiet, weights=overrides)
+
+def report(r):
+    laps = ', '.join(f'{t:.2f}' for t in r['lap_times']) or '-'
+    per10 = collisions_per_10_laps(r)
+    print(f"\nplant={r['plant']}  stale={r['stale_steps']} steps  rtf={r['rtf']}  "
+          f"solve={'measured x' + str(r['solve_scale']) if r['fixed_solve_ms'] is None else str(r['fixed_solve_ms']) + ' ms'}")
+    print(f"  sim / wall        {r['sim_time']:.1f} s / {r['wall_time']:.1f} s")
+    print(f"  laps              {r['laps']}/{r['laps_requested']}  [{laps}] s")
+    print(f"  distance, speed   {r['distance_m']:.1f} m, mean {r['mean_speed']:.2f} m/s")
+    print(f"  collisions        {r['collisions']} ({per10:.1f} per 10 laps; "
+          f"{r['contact_steps']} contact steps){'  DQ' if r['disqualified'] else ''}")
+    print(f"  rate-sat duty     {r['sat_duty']:.1%}  (gate <= {MAX_SAT_DUTY:.0%})")
+    print(f"  cmd slew          mean {r['cmd_slew_mean']:.4f}, max {r['cmd_slew_max']:.4f} "
+          f"rad/cmd  (old gate < {MAX_MEAN_CMD_SLEW})")
+    print(f"  actual slew       mean {r['actual_slew_mean']:.4f} rad/physics step")
+    print(f"  |cmd - delta|     mean {r['track_err_mean']:.3f}, p95 {r['track_err_p95']:.3f} rad")
+    print(f"  reversals         {r['reversals']} ({r['reversals_per_m']:.2f} per m)")
+    print(f"  solve             mean {r['solve_ms_mean']:.1f}, p95 {r['solve_ms_p95']:.1f}, "
+          f"max {r['solve_ms_max']:.1f} ms")
+    print(f"  dead time         {r['dead_time_ms_mean']:.0f} ms mean "
+          f"(hold {r['hold_steps_mean']:.1f} steps, max {r['hold_steps_max']})")
+    print(f"  judged baseline   {JUDGED_BASELINE}")
     fails = verdict(r)
-    if overrides:
-        print(f"\nweight overrides: {overrides}")
-    print(f"\nv_max={args.v_max} lat_accel={args.lat_accel} horizon={args.horizon}")
-    print(f"  lap length      {r['lap_len']:.1f} m")
-    print(f"  travelled       {r['travelled']:.1f} m  ({100 * r['progress']:.0f}% of a lap)")
-    print(f"  lateral error   mean {r['mean_err']:.3f} m, max {r['max_err']:.3f} m")
-    print(f"  off-track steps {r['off_track']} / {args.max_steps}")
-    print(f"  steering slew   mean {r['mean_slew']:.4f}, max {r['max_slew']:.4f} rad/step"
-          f"  (gate < {MAX_MEAN_SLEW})")
-    print(f"  reversals       {r['steer_reversals']}"
-          f"  range {r['steer_min']:+.3f} to {r['steer_max']:+.3f} rad")
-    print(f"  speed profile   {r['profile_min']:.2f}-{r['profile_max']:.2f} m/s, peak {r['v_peak']:.2f}")
-    print(f"  solve time      mean {r['solve_mean_ms']:.1f} ms, max {r['solve_max_ms']:.1f} ms")
-    if fails:
-        print(f"  VERDICT:        FAIL -- {'; '.join(fails)}")
-    else:
-        print(f"  VERDICT:        PASS -- lap completed, "
-              f"{r['off_track']} off-track, "
-              f"slew {r['mean_slew']:.4f} and error {r['max_err']:.3f} m within gates")
+    print(f"  VERDICT           {'FAIL -- ' + '; '.join(fails) if fails else 'PASS'}")
+    print(f"  judged failure    {'REPRODUCED' if reproduces_judged_failure(r) else 'not reproduced'}"
+          f"  (needs >= {GATE_MIN_COLLISIONS_PER_10} collisions/10 laps and "
+          f"sat {LIVE_SAT_DUTY:.1%} +/- {GATE_SAT_TOLERANCE:.0%})")
+
+
+def _parser():
+    ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    ap.add_argument('--laps', type=int, default=2)
+    ap.add_argument('--max-time', type=float, default=None, help='sim seconds')
+    ap.add_argument('--stale-steps', type=int, default=DEFAULT_STALE_STEPS)
+    ap.add_argument('--rtf', type=float, default=DEFAULT_RTF)
+    ap.add_argument('--fixed-solve-ms', type=float, default=None,
+                    help='hold every command for this solve time (deterministic)')
+    ap.add_argument('--solve-scale', type=float, default=DEFAULT_SOLVE_SCALE,
+                    help='multiply measured solve times by this (container vs host)')
+    ap.add_argument('--plant', choices=sorted(PLANTS), default='st')
+    ap.add_argument('--seed', type=int, default=None,
+                    help='plant noise seed; measured-solve runs still vary with host timing')
+    ap.add_argument('--quiet', action='store_true')
+    ap.add_argument('--json', default=None, help='write the result dict here')
+    return ap
+
+
+def _config_from(args):
+    return HarnessConfig(laps=args.laps, max_time=args.max_time,
+                        stale_steps=args.stale_steps, rtf=args.rtf,
+                        fixed_solve_ms=args.fixed_solve_ms, solve_scale=args.solve_scale,
+                        plant=args.plant, seed=args.seed, quiet=args.quiet)
+
+
+def parse_config(argv=None):
+    """Turn command-line flags into a HarnessConfig."""
+    return _config_from(_parser().parse_args(argv))
+
+
+def main():
+    args = _parser().parse_args()
+    cfg = _config_from(args)
+    r = run(cfg)
+    report(r)
+    if args.json:
+        with open(args.json, 'w') as handle:
+            json.dump({'config': asdict(cfg), 'result': r}, handle, indent=2)
 
 
 if __name__ == '__main__':

@@ -129,6 +129,7 @@ _DM, _INTEGRATORS = _load_gym_dynamics()
 
 # The judge's code, not a copy of it.
 vehicle_dynamics_st = _DM.vehicle_dynamics_st
+vehicle_dynamics_ks_cog = _DM.vehicle_dynamics_ks_cog
 pid_steer = _DM.pid_steer
 pid_accl = _DM.pid_accl
 rk4_integration = _INTEGRATORS.rk4_integration
@@ -137,6 +138,21 @@ F1TENTH_VEHICLE_PARAMETERS = _DM.F1TENTH_VEHICLE_PARAMETERS
 
 # State layout of the 7-state single-track model, for readers and for tests.
 X, Y, DELTA, V, PSI, PSI_DOT, BETA = range(7)
+
+
+def base_link_pose_of(state, lr):
+    """`(x, y, yaw)` at the rear axle for a CoG state, as odom publishes it."""
+    psi = float(state[PSI])
+    return (float(state[X]) - lr * math.cos(psi),
+            float(state[Y]) - lr * math.sin(psi),
+            psi)
+
+
+def odom_twist_of(state):
+    """`(linear.x, linear.y, angular.z)` for a state, as the bridge fills them."""
+    v = float(state[V])
+    beta = float(state[BETA])
+    return (v * math.cos(beta), v * math.sin(beta), float(state[PSI_DOT]))
 
 
 class GymPlant:
@@ -290,13 +306,17 @@ class GymPlant:
         self.sv_last = float(sv)
         self.accl_last = float(accl)
 
-        for _ in range(self.substeps):
-            state = rk4_integration(vehicle_dynamics_st, state, control_vector,
-                                    self.integrator_dt, self.params_array)
+        state = self._integrate(state, control_vector)
         state[PSI] = (state[PSI] + np.pi) % (2 * np.pi) - np.pi
         self.state = state.astype(np.float32)
         self.time += self.timestep
         return self.state
+
+    def _integrate(self, state, control_vector):
+        for _ in range(self.substeps):
+            state = rk4_integration(vehicle_dynamics_st, state, control_vector,
+                                    self.integrator_dt, self.params_array)
+        return state
 
     # ------------------------------------------------------------------
     # Outputs, in the frames the driver actually receives
@@ -304,11 +324,7 @@ class GymPlant:
     @property
     def base_link_pose(self):
         """`(x, y, yaw)` at the rear axle, as /ego_racecar/odom publishes it."""
-        lr = float(self.params.lr)
-        psi = float(self.state[PSI])
-        return (float(self.state[X]) - lr * math.cos(psi),
-                float(self.state[Y]) - lr * math.sin(psi),
-                psi)
+        return base_link_pose_of(self.state, float(self.params.lr))
 
     @property
     def odom_twist(self):
@@ -318,11 +334,30 @@ class GymPlant:
         `v*sin(beta)`, so beta is recoverable, and `angular.z` is the measured
         yaw rate. Step 6's steering estimator is built on these.
         """
-        v = float(self.state[V])
-        beta = float(self.state[BETA])
-        return (v * math.cos(beta), v * math.sin(beta), float(self.state[PSI_DOT]))
+        return odom_twist_of(self.state)
 
     @property
     def is_rate_saturated(self):
         """Whether the last step hit the steering-velocity limit."""
         return abs(self.sv_last) >= float(self.params.sv_max) - 1e-9
+
+
+class KinematicPlant(GymPlant):
+    """The kinematic ablation: the judge's servo and timing, no tyre slip.
+
+    Integrates the gym's own `vehicle_dynamics_ks_cog` on the first five
+    states, then fills yaw rate and sideslip with their kinematic values so
+    odometry keeps the single-track layout. Whatever this plant fixes relative
+    to `GymPlant` is down to tyre dynamics, not to the servo or the dead time.
+    """
+
+    def _integrate(self, state, control_vector):
+        # float32 in, as GymPlant feeds the judge's integrator.
+        ks = np.asarray(state[:5], dtype=np.float32)
+        for _ in range(self.substeps):
+            ks = rk4_integration(vehicle_dynamics_ks_cog, ks, control_vector,
+                                 self.integrator_dt, self.params_array)
+        lf, lr = float(self.params.lf), float(self.params.lr)
+        beta = math.atan(math.tan(ks[DELTA]) * lr / (lf + lr))
+        yaw_rate = ks[V] * math.cos(beta) * math.tan(ks[DELTA]) / (lf + lr)
+        return np.array([*ks, yaw_rate, beta], dtype=np.float32)
