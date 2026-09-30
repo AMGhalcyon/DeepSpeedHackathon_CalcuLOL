@@ -25,10 +25,12 @@ driver:
 # machine on the vectorized cost, over a full 700-step lap:
 #     horizon  8 ->  30.3 ms mean, 41.0 ms max   (ALREADY OVER BUDGET)
 #     horizon 12 -> 139 ms      horizon 16 -> 239 ms      horizon 32 -> 589 ms
-# Horizon 8 stays at 8, but not because it fits -- it does not. Raising it is
-# far worse: the scaling is super-linear, so a longer horizon buys lookahead the
-# solve time cannot pay for and just publishes stale steering. Getting back under
-# 25 ms means making the solve cheaper, not shorter.
+# Those figures are for 16 free variables. Move blocking (block_map below) cuts
+# them to 6 while keeping the 200 ms lookahead: measured on the harness, solve
+# is now ~4.7 ms mean / 6.8 ms p95. Do NOT raise the horizon to buy lookahead:
+# the scaling is super-linear. Do NOT go back to 16 variables with the 15 ms
+# solve_budget_ms: a cold solve then never finishes inside the budget, every
+# solve falls back to the (zero) warm start, and the car never moves.
 #
 # Weights (tuned 2026-09-28 on maps/icra26_centerline.csv, 700-step lap):
 #   The state-tracking to control-rate ratio must exceed 1. A 0.2 m reference snap
@@ -40,7 +42,10 @@ driver:
 mpc:
   ros__parameters:
     prediction_horizon: 8             # Steps to predict ahead (see note above on the time budget)
-    control_horizon: 8                # Steps of controls to optimize
+    control_horizon: 3                # Free control moves; must equal max(block_map) + 1
+    block_map: [0, 1, 1, 2, 2, 2, 2, 2]  # Move blocking, one entry per prediction step
+    maxiter: 25                       # SLSQP iteration cap (warm-started, so a continuation)
+    solve_budget_ms: 15.0             # Wall-clock solve budget; past it the plan advances one step
     dt: 0.025                         # Time step [s] (40 Hz)
     q_pos: 2.0                        # Position tracking weight
     q_yaw: 2.0                        # Yaw tracking weight

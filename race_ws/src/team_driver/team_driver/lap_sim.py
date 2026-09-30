@@ -62,9 +62,11 @@ FINISH_LINE_Y = (-0.76, 0.89)
 
 # The node's declared parameters (driver.py). DriverCore's own fallback builds
 # horizon 10, and driver_params.yaml never loads, so these are what the judge runs.
-JUDGED_MPC = dict(prediction_horizon=8, control_horizon=8, dt=0.025,
+JUDGED_MPC = dict(prediction_horizon=8, control_horizon=3, dt=0.025,
                   q_pos=2.0, q_yaw=2.0, q_vel=0.5, r_steer=0.08, r_accel=0.01,
-                  r_delta_steer=0.8, r_delta_accel=0.005)
+                  r_delta_steer=0.8, r_delta_accel=0.005,
+                  block_map=[0, 1, 1, 2, 2, 2, 2, 2], maxiter=25,
+                  solve_budget_ms=15.0)
 
 # Controller gates. The slew gate is the old harness's, kept so the two can be
 # compared; the saturation gate is what Step 6 has to reach.

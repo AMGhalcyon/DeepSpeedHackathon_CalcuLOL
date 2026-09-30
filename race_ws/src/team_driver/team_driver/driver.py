@@ -65,7 +65,11 @@ class Driver(Node):
 
         # Declare MPC parameters
         self.declare_parameter('mpc.prediction_horizon', 8)
-        self.declare_parameter('mpc.control_horizon', 8)
+        self.declare_parameter('mpc.control_horizon', 3)
+        # Move blocking: the 8 prediction steps share 3 free moves (6 variables).
+        self.declare_parameter('mpc.block_map', [0, 1, 1, 2, 2, 2, 2, 2])
+        self.declare_parameter('mpc.maxiter', 25)
+        self.declare_parameter('mpc.solve_budget_ms', 15.0)
         self.declare_parameter('mpc.dt', 0.025)
         self.declare_parameter('mpc.q_pos', 2.0)
         self.declare_parameter('mpc.q_yaw', 2.0)
@@ -113,6 +117,9 @@ class Driver(Node):
             r_accel=self.get_parameter('mpc.r_accel').value,
             r_delta_steer=self.get_parameter('mpc.r_delta_steer').value,
             r_delta_accel=self.get_parameter('mpc.r_delta_accel').value,
+            block_map=list(self.get_parameter('mpc.block_map').value),
+            maxiter=self.get_parameter('mpc.maxiter').value,
+            solve_budget_ms=self.get_parameter('mpc.solve_budget_ms').value,
         )
 
         self.core = DriverCore(

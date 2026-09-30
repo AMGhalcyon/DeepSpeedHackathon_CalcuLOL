@@ -7,7 +7,7 @@ using a kinematic bicycle model.
 
 import numpy as np
 import math
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Sequence
 from scipy.optimize import minimize
 import time
 import os
@@ -19,6 +19,15 @@ try:
     from .vehicle_model import VehicleModel   # ROS / package import
 except ImportError:
     from vehicle_model import VehicleModel    # standalone `python3 mpc_controller.py`
+
+# scipy's SLSQP status for "iteration limit reached". The iterate is still a
+# feasible improvement on the warm start, so a capped solve is applied, not
+# discarded: with a warm start the cap makes the solve a continuation method.
+SLSQP_ITERATION_LIMIT = 9
+
+
+class SolveBudgetExceeded(Exception):
+    """Raised inside the objective once the wall-clock solve budget is spent."""
 
 
 class MPCController:
@@ -35,13 +44,17 @@ class MPCController:
                  r_steer: float = 0.08,
                  r_accel: float = 0.01,
                  r_delta_steer: float = 0.8,
-                 r_delta_accel: float = 0.005):
+                 r_delta_accel: float = 0.005,
+                 block_map: Optional[Sequence[int]] = None,
+                 maxiter: int = 25,
+                 solve_budget_ms: float = 15.0):
         """Initialize MPC controller.
 
         Args:
             vehicle_model: Vehicle model for predictions
             prediction_horizon: Number of steps to predict ahead
-            control_horizon: Number of steps to optimize controls (None = same as prediction)
+            control_horizon: Number of free control moves (None = one per
+                prediction step, or the block count when block_map is given)
             dt: Time step for discrete dynamics (seconds)
             q_pos: Weight on position tracking error
             q_y: Weight on lateral error (inf = hard constraint)
@@ -51,11 +64,29 @@ class MPCController:
             r_accel: Weight on acceleration control effort
             r_delta_steer: Weight on steering rate of change
             r_delta_accel: Weight on acceleration rate of change
+            block_map: Move blocking. Entry k is the index of the free control
+                applied at prediction step k, so len == prediction_horizon and
+                it counts up from 0 one block at a time. [0,1,1,2,2,2,2,2]
+                optimises 3 moves (6 variables) over 8 steps. None holds the
+                last of `control_horizon` moves to the end of the horizon.
+            maxiter: SLSQP iteration cap per solve
+            solve_budget_ms: Wall-clock budget per solve. Once spent, the solve
+                is abandoned and the previous plan, advanced one step, is used.
         """
         self.vehicle_model = vehicle_model if vehicle_model is not None else VehicleModel()
         self.prediction_horizon = prediction_horizon
-        self.control_horizon = control_horizon if control_horizon is not None else prediction_horizon
+        self.block_map = self._resolve_block_map(
+            prediction_horizon, control_horizon, block_map)
+        self.control_horizon = int(self.block_map[-1]) + 1
+        self._block_starts = np.flatnonzero(np.diff(self.block_map, prepend=-1))
+        self._block_counts = np.diff(np.append(self._block_starts, prediction_horizon))
         self.dt = dt
+        self.maxiter = maxiter
+        self.solve_budget_ms = solve_budget_ms
+        self._deadline = math.inf        # only armed while solve() is running
+        self.last_fallback = None        # None, 'budget', 'solver' or 'error'
+        self.budget_exceeded_count = 0
+        self.solver_failure_count = 0
 
         # Cost function weights
         self.Q = np.diag([q_pos, q_pos, q_yaw, q_vel, 0.0])  # [x, y, yaw, v, beta] - don't penalize beta
@@ -111,9 +142,38 @@ class MPCController:
 
         print(f"MPC Controller initialized:")
         print(f"  Prediction horizon: {self.prediction_horizon}")
-        print(f"  Control horizon: {self.control_horizon}")
+        print(f"  Control horizon: {self.control_horizon} (block map {self.block_map.tolist()})")
+        print(f"  SLSQP maxiter: {self.maxiter}, solve budget: {self.solve_budget_ms} ms")
         print(f"  DT: {self.dt}s ({1/dt:.1f} Hz)")
         print(f"  State dim: {self.state_dim}, Control dim: {self.control_dim}")
+
+    @staticmethod
+    def _resolve_block_map(prediction_horizon: int,
+                           control_horizon: Optional[int],
+                           block_map: Optional[Sequence[int]]) -> np.ndarray:
+        """Validate `block_map`, or build the hold-last map from `control_horizon`."""
+        if block_map is None:
+            moves = control_horizon if control_horizon is not None else prediction_horizon
+            if not 1 <= moves <= prediction_horizon:
+                raise ValueError(
+                    f"control_horizon must be in [1, {prediction_horizon}], got {moves}")
+            return np.minimum(np.arange(prediction_horizon), moves - 1)
+
+        blocks = np.asarray(block_map, dtype=int)
+        if blocks.shape != (prediction_horizon,):
+            raise ValueError(
+                f"block_map needs one entry per prediction step "
+                f"({prediction_horizon}), got shape {blocks.shape}")
+        steps = np.diff(blocks)
+        if blocks[0] != 0 or np.any((steps != 0) & (steps != 1)):
+            raise ValueError(
+                f"block_map must start at 0 and count up one block at a time, "
+                f"got {blocks.tolist()}")
+        if control_horizon is not None and control_horizon != blocks[-1] + 1:
+            raise ValueError(
+                f"control_horizon {control_horizon} contradicts block_map, "
+                f"which has {blocks[-1] + 1} blocks")
+        return blocks
 
     def set_reference_path(self, path: np.ndarray, speeds: np.ndarray = None):
         """Set reference path for tracking.
@@ -445,13 +505,15 @@ class MPCController:
 
         Args:
             initial_state: Starting state [x, y, yaw, v, beta]
-            control_sequence: Flattened array of controls [u0, u1, ..., u_{N-1}]
+            control_sequence: Flattened free controls, one per block of
+                `block_map` (control_horizon of them)
 
         Returns:
             Predicted states of shape (N+1, state_dim)
         """
-        # Reshape control sequence
-        control_sequence = control_sequence.reshape((self.control_horizon, self.control_dim))
+        # Expand the free controls to one per prediction step.
+        per_step = control_sequence.reshape(
+            (self.control_horizon, self.control_dim))[self.block_map]
 
         # Initialize state trajectory
         states = self._states
@@ -459,15 +521,8 @@ class MPCController:
 
         # Propagate dynamics
         for k in range(self.prediction_horizon):
-            # Use last control if beyond control horizon
-            if k < self.control_horizon:
-                control = control_sequence[k]
-            else:
-                control = control_sequence[-1]  # Hold last control
-
-            # Predict next state
             states[k+1] = self.vehicle_model.dynamics_discrete(
-                states[k], control, self.dt)
+                states[k], per_step[k], self.dt)
 
         return states
 
@@ -486,7 +541,13 @@ class MPCController:
 
         Returns:
             Total cost
+
+        Raises:
+            SolveBudgetExceeded: once the wall-clock budget armed by solve() is spent
         """
+        if time.perf_counter() >= self._deadline:
+            raise SolveBudgetExceeded
+
         # Predict trajectory
         states = self._predict_trajectory(initial_state, control_sequence)
 
@@ -529,7 +590,8 @@ class MPCController:
         Returns:
             (optimal_control, solve_time)
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
+        self.last_fallback = None
 
         # Ensure state has correct dimension (5 elements: [x, y, yaw, v, beta])
         if len(current_state) == 4:
@@ -585,16 +647,16 @@ class MPCController:
             reference_states = np.array(reference_states)
             reference_speeds = np.array(reference_speeds)
 
-        # Initial guess: last solution shifted one step, repeating its tail.
-        previous = self._u_prev.reshape((self.control_horizon, self.control_dim))
-        initial_guess = np.concatenate([previous[1:], previous[-1:]]).ravel()
+        initial_guess = self._warm_start()
 
         # Bounds for optimization
         bounds = []
         for _ in range(self.control_horizon):
             bounds.extend(list(zip(self.control_min, self.control_max)))
 
-        # Optimize
+        # Optimize. The deadline is only armed around the solver call so a
+        # direct _cost_function call never trips it.
+        self._deadline = start_time + self.solve_budget_ms / 1e3
         try:
             result = minimize(
                 self._cost_function,
@@ -602,26 +664,60 @@ class MPCController:
                 args=(current_state, reference_states, reference_speeds),
                 method='SLSQP',
                 bounds=bounds,
-                options={'maxiter': 100, 'ftol': 1e-6}
+                options={'maxiter': self.maxiter, 'ftol': 1e-6}
             )
-
-            if result.success:
-                self._u_prev = result.x.copy()
-                optimal_control = self._u_prev.reshape(
-                    (self.control_horizon, self.control_dim))[0].copy()
-                self.prev_control = optimal_control.copy()
-                solve_time = time.time() - start_time
-                return optimal_control, solve_time
-            else:
-                # Optimization failed - return current control or zero
-                print(f"MPC optimization failed: {result.message}")
-                solve_time = time.time() - start_time
-                return self.prev_control, solve_time
-
+        except SolveBudgetExceeded:
+            self.budget_exceeded_count += 1
+            return self._fall_back('budget', initial_guess, start_time)
         except Exception as e:
             print(f"MPC optimization error: {e}")
-            solve_time = time.time() - start_time
-            return self.prev_control, solve_time
+            self.solver_failure_count += 1
+            return self._fall_back('error', initial_guess, start_time)
+        finally:
+            self._deadline = math.inf
+
+        usable = np.all(np.isfinite(result.x)) and (
+            result.success or result.status == SLSQP_ITERATION_LIMIT)
+        if not usable:
+            print(f"MPC optimization failed: {result.message}")
+            self.solver_failure_count += 1
+            return self._fall_back('solver', initial_guess, start_time)
+
+        self._u_prev = result.x.copy()
+        optimal_control = self._u_prev.reshape(
+            (self.control_horizon, self.control_dim))[0].copy()
+        self.prev_control = optimal_control.copy()
+        return optimal_control, time.perf_counter() - start_time
+
+    def _warm_start(self) -> np.ndarray:
+        """The last plan advanced one time step, refitted to the blocks.
+
+        With blocking, one slot of `_u_prev` is a block of steps, so shifting by
+        a slot would jump the plan ahead by a whole block. Expand to one control
+        per step, shift by one step, and average each block back down: a
+        least-squares fit of the shifted plan onto the blocked parameterisation.
+        With no blocking every block is one step and this is a plain shift.
+        """
+        per_step = self._u_prev.reshape(
+            (self.control_horizon, self.control_dim))[self.block_map]
+        shifted = np.concatenate([per_step[1:], per_step[-1:]])
+        sums = np.add.reduceat(shifted, self._block_starts, axis=0)
+        return (sums / self._block_counts[:, None]).ravel()
+
+    def _fall_back(self, reason: str, warm_start: np.ndarray,
+                   start_time: float) -> Tuple[np.ndarray, float]:
+        """Continue the previous plan one step on instead of applying a bad solve.
+
+        The command is continuous with the last one (it is the plan's own next
+        move), and the memory advances with it so the next solve warm-starts
+        from where the car now is rather than from a plan one step stale.
+        """
+        self._u_prev = warm_start.copy()
+        control = warm_start.reshape(
+            (self.control_horizon, self.control_dim))[0].copy()
+        self.prev_control = control.copy()
+        self.last_fallback = reason
+        return control, time.perf_counter() - start_time
 
     def get_control(self, current_state: np.ndarray) -> Tuple[np.ndarray, dict]:
         """Get MPC control command.
@@ -638,7 +734,8 @@ class MPCController:
             'solve_time_ms': solve_time * 1000,
             'control_steering': control[0],
             'control_acceleration': control[1],
-            'feasible': True  # Simplified
+            'feasible': True,  # Simplified
+            'fallback': self.last_fallback
         }
 
         return control, diagnostics

@@ -83,18 +83,21 @@ class CommandMemoryTest(unittest.TestCase):
         expected = np.vstack([seq[1:], seq[-1:]]).ravel()
         np.testing.assert_allclose(spy.call_args.args[1], expected)
 
-    def test_failed_solve_keeps_the_last_own_command_and_warm_start(self):
+    def test_failed_solve_falls_back_to_the_shifted_warm_start(self):
+        # Step 5: a failed solve continues the last plan one step on, rather
+        # than repeating the last command.
         mpc = _controller()
         good = np.arange(HORIZON * 2, dtype=float) / 10.0
         with mock.patch.object(
                 mpc_controller, 'minimize', return_value=_fake_result(good)):
-            applied, _ = mpc.get_control(STATE)
-        failed = mock.Mock(success=False, x=np.full(HORIZON * 2, 9.0),
+            mpc.get_control(STATE)
+        failed = mock.Mock(success=False, status=4, x=np.full(HORIZON * 2, 9.0),
                            message='boom')
         with mock.patch.object(mpc_controller, 'minimize', return_value=failed):
             control, _ = mpc.get_control(STATE)
-        np.testing.assert_allclose(control, applied)
-        np.testing.assert_allclose(mpc.prev_control, applied)
+        second_step = good.reshape(HORIZON, 2)[1]
+        np.testing.assert_allclose(control, second_step)
+        np.testing.assert_allclose(mpc.prev_control, second_step)
 
 
 if __name__ == '__main__':
