@@ -25,12 +25,16 @@ import rclpy
 from ackermann_msgs.msg import AckermannDriveStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
 
 from .driver_core import DriverConfig, DriverCore
 from .mpc_controller import MPCController
 from .vehicle_model import VehicleModel
+
+DT_REPORT_PERIOD = 5.0   # [s] how often to log dt_measured statistics
 
 
 def _stamp_s(stamp):
@@ -41,7 +45,10 @@ def _stamp_s(stamp):
 class Driver(Node):
 
     def __init__(self):
-        super().__init__('driver')
+        # The judge runs a bare `ros2 run team_driver driver`, so sim time is
+        # set here rather than trusted to a params file.
+        super().__init__('driver', parameter_overrides=[
+            Parameter('use_sim_time', Parameter.Type.BOOL, True)])
 
         # Declared parameters can be retuned without editing code:
         #   ros2 run team_driver driver --ros-args -p crawl_speed:=2.0
@@ -67,15 +74,32 @@ class Driver(Node):
         self.declare_parameter('mpc.r_accel', 0.01)
         self.declare_parameter('mpc.r_delta_steer', 0.8)
         self.declare_parameter('mpc.r_delta_accel', 0.005)
+        self.declare_parameter('control_period', 0.025)   # [s] must equal mpc.dt
+
+        self.control_period = self.get_parameter('control_period').value
+        if abs(self.control_period - self.get_parameter('mpc.dt').value) > 1e-9:
+            raise ValueError(
+                f'control_period {self.control_period} must equal mpc.dt '
+                f'{self.get_parameter("mpc.dt").value}: the model assumes each '
+                'command is held for exactly one MPC step')
 
         self.drive_pub = self.create_publisher(
             AckermannDriveStamped, self.get_parameter('drive_topic').value, 10)
         self.marker_pub = self.create_publisher(MarkerArray, '/driver/markers', 1)
 
+        # Depth-1 best-effort: the queue never holds a stale scan, so the
+        # callbacks are pure setters and the timer always reads the freshest data.
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE)
         self.create_subscription(
-            LaserScan, self.get_parameter('scan_topic').value, self.scan_callback, 10)
+            LaserScan, self.get_parameter('scan_topic').value, self.scan_callback,
+            sensor_qos)
         self.create_subscription(
-            Odometry, self.get_parameter('odom_topic').value, self.odom_callback, 10)
+            Odometry, self.get_parameter('odom_topic').value, self.odom_callback,
+            sensor_qos)
 
         mpc_controller = MPCController(
             vehicle_model=VehicleModel(),
@@ -105,8 +129,14 @@ class Driver(Node):
         )
 
         self._marker_divisor = 0
+        self._last_dt_report = self.get_clock().now()
+
+        # A regular hold period is what mpc.dt assumes. With use_sim_time this
+        # is 25 ms of plant time; on the wall clock it would drift with RTF.
+        self.create_timer(self.control_period, self._control_step)
         self.get_logger().info(
-            'team_driver is up with MPC controller!')
+            f'team_driver is up with MPC controller! control_period='
+            f'{self.control_period * 1e3:.1f} ms')
 
     # ------------------------------------------------------------------
     # Odometry: where the car is. Free, accurate, and worth building on.
@@ -130,12 +160,14 @@ class Driver(Node):
         )
 
     # ------------------------------------------------------------------
-    # The control loop, once per LiDAR scan (about 40 Hz).
+    # The control loop, on a fixed timer at mpc.dt. Callbacks only store.
     # ------------------------------------------------------------------
     def scan_callback(self, scan):
-        t = _stamp_s(scan.header.stamp)
-        self.core.set_scan(scan.ranges, scan.angle_min, scan.angle_increment, t_sim=t)
+        self.core.set_scan(scan.ranges, scan.angle_min, scan.angle_increment,
+                           t_sim=_stamp_s(scan.header.stamp))
 
+    def _control_step(self):
+        t = self.core.t_scan
         cmd = self.core.step(t_sim=t)
         self.publish(cmd)
         self.core.note_published(cmd, t_sim=t)
@@ -143,6 +175,17 @@ class Driver(Node):
         self._marker_divisor = (self._marker_divisor + 1) % 10
         if self._marker_divisor == 0:
             self.publish_marker(cmd.steering_angle)
+        self._report_dt()
+
+    def _report_dt(self):
+        now = self.get_clock().now()
+        if (now - self._last_dt_report).nanoseconds * 1e-9 < DT_REPORT_PERIOD:
+            return
+        self._last_dt_report = now
+        mean, p95, worst = self.core.dt_summary()
+        self.get_logger().info(
+            f'dt_measured mean={mean * 1e3:.1f} p95={p95 * 1e3:.1f} '
+            f'max={worst * 1e3:.1f} ms')
 
     # ------------------------------------------------------------------
     # Output

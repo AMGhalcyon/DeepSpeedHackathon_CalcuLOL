@@ -77,6 +77,44 @@ class DriveCommand(NamedTuple):
     steering_angle_velocity: float = 0.0
 
 
+DT_CLAMP_LOW = 0.5     # x nominal: a burst of scans must not zero the interval
+DT_CLAMP_HIGH = 3.0    # x nominal: a dropped scan must not hand over a 1 s dt
+
+
+class DtTracker:
+    """The interval the plant advanced between sensor stamps, clamped.
+
+    Stamps come from the bridge's own sim clock, so consecutive deltas are the
+    real hold period regardless of wall-clock load or real-time factor.
+    """
+
+    def __init__(self, nominal):
+        self.nominal = nominal
+        self.dt = nominal
+        self._last_stamp = None
+        self._history = []
+
+    def update(self, stamp):
+        if stamp is None:
+            return
+        if self._last_stamp is not None:
+            self.dt = float(np.clip(stamp - self._last_stamp,
+                                    DT_CLAMP_LOW * self.nominal,
+                                    DT_CLAMP_HIGH * self.nominal))
+            self._history.append(self.dt)
+        self._last_stamp = stamp
+
+    def summary(self):
+        """(mean, p95, max) of the dt seen since the last reset."""
+        if not self._history:
+            return (self.nominal,) * 3
+        h = np.asarray(self._history)
+        return float(h.mean()), float(np.percentile(h, 95)), float(h.max())
+
+    def reset_stats(self):
+        self._history = []
+
+
 class DriverCore:
     """The algorithm: reference path, MPC, and the reactive safety layer."""
 
@@ -98,6 +136,9 @@ class DriverCore:
         self.mpc_controller = (mpc_controller if mpc_controller is not None
                                else MPCController(vehicle_model=VehicleModel()))
         self.mpc_dt = self.mpc_controller.dt
+        self._dt = DtTracker(self.mpc_dt)
+        self._planned_scan_t = None
+        self._last_planned = DriveCommand(0.0, 0.0, 0.0)
 
         # Latest known pose and speed. Ground truth from the simulator, which
         # the rules allow you to use - so use it.
@@ -142,7 +183,20 @@ class DriverCore:
         self._scan_ranges = ranges
         self._scan_angle_min = angle_min
         self._scan_angle_inc = angle_inc
+        if t_sim != self.t_scan:
+            self._dt.update(t_sim)
         self.t_scan = t_sim
+
+    @property
+    def dt_measured(self):
+        """[s] Hold interval between the last two distinct scan stamps."""
+        return self._dt.dt
+
+    def dt_summary(self):
+        """(mean, p95, max) of dt_measured; clears the window."""
+        summary = self._dt.summary()
+        self._dt.reset_stats()
+        return summary
 
     # ------------------------------------------------------------------
     # Reference path loading
@@ -225,9 +279,16 @@ class DriverCore:
             # can beat the first scan.
             return DriveCommand(0.0, self.crawl_speed, 0.0)
 
+        # A fixed-rate caller can beat the next scan; replaying the last command
+        # is better than solving the same scan twice.
+        if self.t_scan is not None and self.t_scan == self._planned_scan_t:
+            return self._last_planned
+        self._planned_scan_t = self.t_scan
+
         ranges, angles = self.preprocess()
         steering, speed = self.plan(ranges, angles)
-        return DriveCommand(float(steering), float(speed), 0.0)
+        self._last_planned = DriveCommand(float(steering), float(speed), 0.0)
+        return self._last_planned
 
     def note_published(self, cmd: DriveCommand, t_sim=None):
         """Record what actually went on the wire."""
@@ -349,7 +410,7 @@ class DriverCore:
                 # /drive takes a SPEED, not an acceleration -- the simulator
                 # closes that loop itself. The MPC plans in acceleration, so
                 # project one step forward.
-                speed = max(self.speed + accel * self.mpc_dt, 0.0)
+                speed = max(self.speed + accel * self.dt_measured, 0.0)
 
                 # Never let the MPC talk the car into a wall: the reactive
                 # clearance heuristic is a genuine safety bound, so take the
