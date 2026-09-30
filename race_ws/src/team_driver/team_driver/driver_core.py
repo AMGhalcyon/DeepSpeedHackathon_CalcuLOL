@@ -367,7 +367,7 @@ class DriverCore:
             target_angle = (gap_angles[0] + gap_angles[-1]) / 2.0
 
         # 4. Reactive steering: steer at the middle of the widest gap. Used as
-        #    the MPC's warm-start guess and as the fallback if the MPC fails.
+        #    the fallback if the MPC fails; the MPC keeps its own command memory.
         reactive_steering = float(np.clip(0.85 * target_angle, -0.4, 0.4))
 
         # 5. Reactive speed: a crude clearance heuristic, kept as an upper
@@ -398,11 +398,8 @@ class DriverCore:
                     0.0                # beta_sideslip (assumed zero)
                 ])
 
-                # Warm-start the optimizer from the reactive command.
-                current_control = np.array([reactive_steering, 0.0])
-
                 mpc_control, diagnostics = self.mpc_controller.get_control(
-                    current_state, current_control)
+                    current_state)
 
                 steering = float(mpc_control[0])
                 accel = float(mpc_control[1])

@@ -84,6 +84,9 @@ class MPCController:
 
         # Previous control for rate limiting
         self.prev_control = np.zeros(self.control_dim)
+        # Last full optimised sequence, flattened; the next solve shifts it one
+        # step to warm-start SLSQP.
+        self._u_prev = np.zeros(self.control_horizon * self.control_dim)
 
         # Reference path (will be set externally)
         self.reference_path = None
@@ -514,22 +517,19 @@ class MPCController:
 
         return cost
 
-    def solve(self,
-              current_state: np.ndarray,
-              current_control: np.ndarray = None) -> Tuple[np.ndarray, float]:
+    def solve(self, current_state: np.ndarray) -> Tuple[np.ndarray, float]:
         """Solve MPC optimization problem.
+
+        The smoothness anchor and the warm start both come from this
+        controller's own previous output; callers cannot inject either.
 
         Args:
             current_state: Current vehicle state [x, y, yaw, v] or [x, y, yaw, v, beta]
-            current_control: Current control input [steering, acceleration]
 
         Returns:
             (optimal_control, solve_time)
         """
         start_time = time.time()
-
-        if current_control is not None:
-            self.prev_control = current_control.copy()
 
         # Ensure state has correct dimension (5 elements: [x, y, yaw, v, beta])
         if len(current_state) == 4:
@@ -585,11 +585,9 @@ class MPCController:
             reference_states = np.array(reference_states)
             reference_speeds = np.array(reference_speeds)
 
-        # Initial guess: hold current control
-        if current_control is not None:
-            initial_guess = np.tile(current_control, self.control_horizon)
-        else:
-            initial_guess = np.zeros(self.control_horizon * self.control_dim)
+        # Initial guess: last solution shifted one step, repeating its tail.
+        previous = self._u_prev.reshape((self.control_horizon, self.control_dim))
+        initial_guess = np.concatenate([previous[1:], previous[-1:]]).ravel()
 
         # Bounds for optimization
         bounds = []
@@ -608,7 +606,10 @@ class MPCController:
             )
 
             if result.success:
-                optimal_control = result.x.reshape((self.control_horizon, self.control_dim))[0]
+                self._u_prev = result.x.copy()
+                optimal_control = self._u_prev.reshape(
+                    (self.control_horizon, self.control_dim))[0].copy()
+                self.prev_control = optimal_control.copy()
                 solve_time = time.time() - start_time
                 return optimal_control, solve_time
             else:
@@ -622,19 +623,16 @@ class MPCController:
             solve_time = time.time() - start_time
             return self.prev_control, solve_time
 
-    def get_control(self,
-                   current_state: np.ndarray,
-                   current_control: np.ndarray = None) -> Tuple[np.ndarray, dict]:
+    def get_control(self, current_state: np.ndarray) -> Tuple[np.ndarray, dict]:
         """Get MPC control command.
 
         Args:
             current_state: Current vehicle state [x, y, yaw, v]
-            current_control: Current control input [steering, acceleration]
 
         Returns:
             (control_command, diagnostics)
         """
-        control, solve_time = self.solve(current_state, current_control)
+        control, solve_time = self.solve(current_state)
 
         diagnostics = {
             'solve_time_ms': solve_time * 1000,
@@ -659,10 +657,9 @@ def test_mpc_controller():
 
     # Test initial state at origin, zero velocity
     initial_state = np.array([0.0, 0.0, 0.0, 0.0, 0.0])  # [x, y, yaw, v, beta]
-    current_control = np.array([0.0, 0.0])  # [steering, acceleration]
 
     # Get control command
-    control, diagnostics = mpc.get_control(initial_state, current_control)
+    control, diagnostics = mpc.get_control(initial_state)
 
     print(f"Initial state: {initial_state}")
     print(f"Control command: steering={control[0]:.3f}, accel={control[1]:.3f}")

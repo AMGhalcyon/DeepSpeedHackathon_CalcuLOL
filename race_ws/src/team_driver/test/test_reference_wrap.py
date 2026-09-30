@@ -146,7 +146,7 @@ class TestSolveAnchorsContinuously(unittest.TestCase):
         previous = None
         steps = []
         for _ in range(400):
-            self.mpc.get_control(state, np.zeros(2))
+            self.mpc.get_control(state)
             anchor = self.mpc._s_ref
             if previous is not None:
                 steps.append(

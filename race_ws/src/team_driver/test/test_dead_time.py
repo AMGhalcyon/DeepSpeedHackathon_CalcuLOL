@@ -22,7 +22,7 @@ class _StubMPC:
     def set_reference_path(self, *_a):
         pass
 
-    def get_control(self, _state, _guess):
+    def get_control(self, _state):
         self.calls += 1
         return np.array([0.0, self.accel]), {'solve_time_ms': 0.0}
 
