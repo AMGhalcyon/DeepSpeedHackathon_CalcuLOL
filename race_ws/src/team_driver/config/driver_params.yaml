@@ -7,50 +7,93 @@
 #       driver_params:=/hackathon/race_ws/src/team_driver/config/driver_params.yaml
 #
 # Keeping the numbers out of the code means you can sweep them without
-# rebuilding, which is the fastest way to find lap time early on. Declare a
-# parameter in driver.py and it can be set here.
+# rebuilding, which is the fastest way to find lap time early on.
 #
-# The two below are all the template needs, because the template does not
-# drive (see driver.py). Expect to replace them entirely.
+# EVERYTHING lives under `driver: ros__parameters:`. ROS reads a top-level key
+# as a NODE name, so a block placed beside `driver:` (the MPC block used to be
+# one) is silently ignored. Nested keys become dotted parameter names:
+# `mpc: q_pos:` is the parameter `mpc.q_pos`.
+#
+# Declaring a parameter happens in ONE place, team_driver/driver_params.py. Every
+# value below equals that table's default, so loading this file changes nothing
+# (test_driver_params.py enforces it). Change a number here to retune; keep the
+# YAML type, since ROS refuses `3` for a parameter declared as `3.0`.
+#
+# Proof the file arrived: the driver logs `params_source = driver_params.yaml`
+# at startup, followed by every resolved value. `CODE_DEFAULTS` there means the
+# file was NOT loaded and the code defaults are running.
+#
+# A bare `ros2 run team_driver driver`, and scripts/evaluate.sh without
+# --driver-params, never read this file: they run the table in driver_params.py.
+# So to change what a SCORED run does, pass --driver-params to the evaluation
+# or change the default in driver_params.py (and keep the two equal).
 
 driver:
   ros__parameters:
+    use_sim_time: true
+    params_source: "driver_params.yaml"   # sentinel; the code default is "CODE_DEFAULTS"
+
+    scan_topic: "/scan"
+    odom_topic: "/ego_racecar/odom"
+    drive_topic: "/drive"
+
     crawl_speed: 1.0          # [m/s]; you ask for a speed and the sim holds it
     max_range: 8.0            # [m] clip the scan here
+    v_max: 3.0                # [m/s] speed cap on the profile
+    lat_accel: 0.8            # [m/s^2] cornering budget
+    a_brake: 0.8              # [m/s^2] braking budget
+    steer_limit: 0.4          # [rad]
 
-# MPC Controller Parameters
-#
-# NOTE: horizon is capped by solve time, not by taste. The control loop runs
-# once per LiDAR scan at 40 Hz, so a solve has a 25 ms budget. Measured on this
-# machine on the vectorized cost, over a full 700-step lap:
-#     horizon  8 ->  30.3 ms mean, 41.0 ms max   (ALREADY OVER BUDGET)
-#     horizon 12 -> 139 ms      horizon 16 -> 239 ms      horizon 32 -> 589 ms
-# Those figures are for 16 free variables. Move blocking (block_map below) cuts
-# them to 6 while keeping the 200 ms lookahead: measured on the harness, solve
-# is now ~4.7 ms mean / 6.8 ms p95. Do NOT raise the horizon to buy lookahead:
-# the scaling is super-linear. Do NOT go back to 16 variables with the 15 ms
-# solve_budget_ms: a cold solve then never finishes inside the budget, every
-# solve falls back to the (zero) warm start, and the car never moves.
-#
-# Weights (tuned 2026-09-28 on maps/icra26_centerline.csv, 700-step lap):
-#   The state-tracking to control-rate ratio must exceed 1. A 0.2 m reference snap
-#   has to cost more than the steering reversal it causes, or the optimizer
-#   chatters: at the old weights a snap was ~57x cheaper than the reversal. Swept
-#   q_pos x r_delta_steer; this corner clears both gates (mean |dsteer| < 0.012
-#   rad/step and max lateral error < 0.10 m). Lower r_delta_steer fails the slew
-#   gate; lower q_pos fails the tracking gate.
-mpc:
-  ros__parameters:
-    prediction_horizon: 8             # Steps to predict ahead (see note above on the time budget)
-    control_horizon: 3                # Free control moves; must equal max(block_map) + 1
-    block_map: [0, 1, 1, 2, 2, 2, 2, 2]  # Move blocking, one entry per prediction step
-    maxiter: 25                       # SLSQP iteration cap (warm-started, so a continuation)
-    solve_budget_ms: 15.0             # Wall-clock solve budget; past it the plan advances one step
-    dt: 0.025                         # Time step [s] (40 Hz)
-    q_pos: 2.0                        # Position tracking weight
-    q_yaw: 2.0                        # Yaw tracking weight
-    q_vel: 0.5                        # Velocity tracking weight
-    r_steer: 0.08                     # Steering control effort weight
-    r_accel: 0.01                     # Acceleration control effort weight
-    r_delta_steer: 0.8                # Steering rate of change weight
-    r_delta_accel: 0.005              # Acceleration rate of change weight
+    # Output conditioning (driver_core._condition / _coast)
+    stop_margin: 0.0          # [m] clearance the braking-distance cap keeps in hand
+    k_steer_derate: 2.0       # speed cap in a turn: v_max / (1 + k |steer|)
+    coast_steer_rate: 1.0     # [rad/s] steering decay toward straight while coasting
+    accel_limit: 4.0          # [m/s^2] fastest the speed setpoint may rise
+
+    # The control timer. Must equal mpc.dt: the model assumes each command is
+    # held for exactly one MPC step, and the node refuses to start otherwise.
+    control_period: 0.025     # [s] (40 Hz)
+
+    # MPC Controller Parameters
+    #
+    # NOTE: horizon is capped by solve time, not by taste. The control loop runs
+    # once per LiDAR scan at 40 Hz, so a solve has a 25 ms budget. Measured on this
+    # machine on the vectorized cost, over a full 700-step lap:
+    #     horizon  8 ->  30.3 ms mean, 41.0 ms max   (ALREADY OVER BUDGET)
+    #     horizon 12 -> 139 ms      horizon 16 -> 239 ms      horizon 32 -> 589 ms
+    # Those figures are for 16 free variables. Move blocking (block_map below) cuts
+    # them to 6 while keeping the 200 ms lookahead: measured on the harness, solve
+    # is now ~4.7 ms mean / 6.8 ms p95. Do NOT raise the horizon to buy lookahead:
+    # the scaling is super-linear. Do NOT go back to 16 variables with the 15 ms
+    # solve_budget_ms: a cold solve then never finishes inside the budget, every
+    # solve falls back to the (zero) warm start, and the car never moves.
+    #
+    # Weights (tuned 2026-09-28 on maps/icra26_centerline.csv, 700-step lap):
+    #   The state-tracking to control-rate ratio must exceed 1. A 0.2 m reference snap
+    #   has to cost more than the steering reversal it causes, or the optimizer
+    #   chatters: at the old weights a snap was ~57x cheaper than the reversal. Swept
+    #   q_pos x r_delta_steer; this corner clears both gates (mean |dsteer| < 0.012
+    #   rad/step and max lateral error < 0.10 m). Lower r_delta_steer fails the slew
+    #   gate; lower q_pos fails the tracking gate.
+    mpc:
+      prediction_horizon: 8             # Steps to predict ahead (see note above on the time budget)
+      control_horizon: 3                # Free control moves; must equal max(block_map) + 1
+      block_map: [0, 1, 1, 2, 2, 2, 2, 2]  # Move blocking, one entry per prediction step
+      maxiter: 25                       # SLSQP iteration cap (warm-started, so a continuation)
+      solve_budget_ms: 15.0             # Wall-clock solve budget; past it the plan advances one step
+      dt: 0.025                         # Time step [s] (40 Hz)
+      q_pos: 2.0                        # Position tracking weight
+      q_yaw: 2.0                        # Yaw tracking weight
+      q_vel: 0.5                        # Velocity tracking weight
+      r_steer: 0.08                     # Steering control effort weight
+      r_accel: 0.01                     # Acceleration control effort weight
+      r_delta_steer: 0.8                # Steering rate of change weight
+      r_delta_accel: 0.005              # Acceleration rate of change weight
+
+    # The MPC's model of the steering servo, calibrated against the judged plant
+    # by least squares (test_steering_actuator.py pins the fit). The plant's own
+    # constants (kp 38.19, sv_max 3.2 rad/s, the 0.4189 rad lock) are fixed by
+    # the simulator and are deliberately not parameters.
+    servo:
+      alpha: 0.6903                     # fraction of a small error closed per 25 ms
+      d_max: 0.0801                     # [rad] wheel travel per 25 ms at the rate limit

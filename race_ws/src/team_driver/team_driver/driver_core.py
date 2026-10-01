@@ -51,10 +51,9 @@ class _NullLogger:
 class DriverConfig:
     """Everything the control path is allowed to be tuned by.
 
-    Defaults mirror `driver.py`'s `declare_parameter` calls exactly. Keeping
-    them equal means a forgotten `--driver-params` flag is a provable no-op
-    rather than a silently different car. The output-conditioning fields at the
-    end are not declared on the node yet, so the node runs these defaults.
+    `driver_params.py` declares one node parameter per field here, with these
+    defaults, so a forgotten `--driver-params` flag is a provable no-op rather
+    than a silently different car.
     """
 
     crawl_speed: float = 1.0        # [m/s]

@@ -64,62 +64,55 @@ class ServoModel:
         return d * x / (1.0 + abs(x) ** p) ** (1.0 / p)
 
 
-# Import vehicle parameters from f1tenth_gym
-try:
-    from external.f1tenth_gym.f1tenth_gym.envs.dynamic_models import (
-        F1TENTH_VEHICLE_PARAMETERS,
-        VehicleParameters,
-        DynamicModel
-    )
-    from external.f1tenth_gym.f1tenth_gym.envs.dynamic_models.kinematic import (
-        vehicle_dynamics_ks_cog
-    )
-except ImportError:
-    # Fallback definitions if import fails
-    from dataclasses import dataclass
-    import math
+# The judged car, transcribed from external/f1tenth_gym's dynamic_models/__init__.py
+# (F1TENTH_VEHICLE_PARAMETERS). It is deliberately NOT imported from there: the
+# gym's `vehicle_dynamics_ks_cog` has state [x, y, delta, v, psi] and control
+# [steer_vel, accl] over a flat numpy params array, so a successful import would
+# swap state indices 2 and 4 and describe a different vehicle without raising.
+# test_driver_params.py reads the upstream file as text and pins these numbers,
+# so an upstream bump is caught without importing anything.
+@dataclass(frozen=True)
+class VehicleParameters:
+    """Typed view over the vehicle parameters used by the dynamics models."""
+    # Core parameters required by the simplified single-track models
+    mu: float = 1.0489
+    C_Sf: float = 4.718
+    C_Sr: float = 5.4562
+    lf: float = 0.15875
+    lr: float = 0.17145
+    h: float = 0.074
+    m: float = 3.74
+    I: float = 0.04712
+    s_min: float = -0.4189
+    s_max: float = 0.4189
+    sv_min: float = -3.2
+    sv_max: float = 3.2
+    v_switch: float = 7.319
+    a_max: float = 9.51
+    v_min: float = -5.0
+    v_max: float = 20.0
+    width: float = 0.31
+    length: float = 0.58
+    collision_body_center_x: float = 0.1651
 
-    @dataclass(frozen=True)
-    class VehicleParameters:
-        """Typed view over the vehicle parameters used by the dynamics models."""
-        # Core parameters required by the simplified single-track models
-        mu: float = 1.0489
-        C_Sf: float = 4.718
-        C_Sr: float = 5.4562
-        lf: float = 0.15875
-        lr: float = 0.17145
-        h: float = 0.074
-        m: float = 3.74
-        I: float = 0.04712
-        s_min: float = -0.4189
-        s_max: float = 0.4189
-        sv_min: float = -3.2
-        sv_max: float = 3.2
-        v_switch: float = 7.319
-        a_max: float = 9.51
-        v_min: float = -5.0
-        v_max: float = 20.0
-        width: float = 0.31
-        length: float = 0.58
-        collision_body_center_x: float = 0.1651
 
-    F1TENTH_VEHICLE_PARAMETERS = VehicleParameters()
-    DynamicModel = type('DynamicModel', (), {'KS': 1})
+F1TENTH_VEHICLE_PARAMETERS = VehicleParameters()
 
-    def vehicle_dynamics_ks_cog(state, u, params):
-        """Simplified kinematic bicycle model."""
-        x, y, psi, v, beta = state
-        delta, a = u  # steering angle, acceleration
 
-        # Kinematic bicycle model
-        x_dot = v * math.cos(psi + beta)
-        y_dot = v * math.sin(psi + beta)
-        psi_dot = v * math.cos(beta) * math.tan(delta) / (params.lf + params.lr)
-        v_dot = a
-        # Simplified sideslip approximation
-        beta_dot = 0.0  # Placeholder
+def vehicle_dynamics_ks_cog(state, u, params):
+    """Simplified kinematic bicycle model, state [x, y, psi, v, beta]."""
+    x, y, psi, v, beta = state
+    delta, a = u  # steering angle, acceleration
 
-        return np.array([x_dot, y_dot, psi_dot, v_dot, beta_dot])
+    # Kinematic bicycle model
+    x_dot = v * math.cos(psi + beta)
+    y_dot = v * math.sin(psi + beta)
+    psi_dot = v * math.cos(beta) * math.tan(delta) / (params.lf + params.lr)
+    v_dot = a
+    # Simplified sideslip approximation
+    beta_dot = 0.0  # Placeholder
+
+    return np.array([x_dot, y_dot, psi_dot, v_dot, beta_dot])
 
 
 class VehicleModel:

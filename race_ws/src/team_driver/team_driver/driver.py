@@ -31,7 +31,8 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
 
-from .driver_core import DriverConfig, DriverCore, LatchClock
+from . import driver_params
+from .driver_core import DriverCore, LatchClock
 from .mpc_controller import MPCController
 from .vehicle_model import VehicleModel
 
@@ -51,45 +52,17 @@ class Driver(Node):
         super().__init__('driver', parameter_overrides=[
             Parameter('use_sim_time', Parameter.Type.BOOL, True)])
 
-        # Declared parameters can be retuned without editing code:
-        #   ros2 run team_driver driver --ros-args -p crawl_speed:=2.0
-        # Add your own as you go; config/driver_params.yaml loads them.
-        self.declare_parameter('scan_topic', '/scan')
-        self.declare_parameter('odom_topic', '/ego_racecar/odom')
-        self.declare_parameter('drive_topic', '/drive')
-        self.declare_parameter('crawl_speed', 1.0)        # [m/s]
-        self.declare_parameter('max_range', 8.0)          # [m] clip the scan here
-        self.declare_parameter('v_max', 3.0)              # [m/s] speed cap on the profile
-        self.declare_parameter('lat_accel', 0.8)         # [m/s^2] cornering budget
-        self.declare_parameter('a_brake', 0.8)            # [m/s^2] braking budget
-        self.declare_parameter('steer_limit', 0.4)       # [rad]
-
-        # Declare MPC parameters
-        self.declare_parameter('mpc.prediction_horizon', 8)
-        self.declare_parameter('mpc.control_horizon', 3)
-        # Move blocking: the 8 prediction steps share 3 free moves (6 variables).
-        self.declare_parameter('mpc.block_map', [0, 1, 1, 2, 2, 2, 2, 2])
-        self.declare_parameter('mpc.maxiter', 25)
-        self.declare_parameter('mpc.solve_budget_ms', 15.0)
-        self.declare_parameter('mpc.dt', 0.025)
-        self.declare_parameter('mpc.q_pos', 2.0)
-        self.declare_parameter('mpc.q_yaw', 2.0)
-        self.declare_parameter('mpc.q_vel', 0.5)
-        self.declare_parameter('mpc.r_steer', 0.08)
-        self.declare_parameter('mpc.r_accel', 0.01)
-        self.declare_parameter('mpc.r_delta_steer', 0.8)
-        self.declare_parameter('mpc.r_delta_accel', 0.005)
-        self.declare_parameter('control_period', 0.025)   # [s] must equal mpc.dt
-
-        self.control_period = self.get_parameter('control_period').value
-        if abs(self.control_period - self.get_parameter('mpc.dt').value) > 1e-9:
-            raise ValueError(
-                f'control_period {self.control_period} must equal mpc.dt '
-                f'{self.get_parameter("mpc.dt").value}: the model assumes each '
-                'command is held for exactly one MPC step')
+        # Every parameter is declared from one table (driver_params.py), so it
+        # can be retuned without editing code:
+        #   ros2 run team_driver driver --ros-args -p mpc.q_pos:=3.0
+        # config/driver_params.yaml loads them, nested under this node's name.
+        driver_params.declare_all(self.declare_parameter)
+        params = driver_params.read_all(self.get_parameter)
+        driver_params.validate(params)
+        self.control_period = params['control_period']
 
         self.drive_pub = self.create_publisher(
-            AckermannDriveStamped, self.get_parameter('drive_topic').value, 10)
+            AckermannDriveStamped, params['drive_topic'], 10)
         self.marker_pub = self.create_publisher(MarkerArray, '/driver/markers', 1)
 
         # Depth-1 best-effort: the queue never holds a stale scan, so the
@@ -100,41 +73,24 @@ class Driver(Node):
             depth=1,
             durability=DurabilityPolicy.VOLATILE)
         self.create_subscription(
-            LaserScan, self.get_parameter('scan_topic').value, self.scan_callback,
-            sensor_qos)
+            LaserScan, params['scan_topic'], self.scan_callback, sensor_qos)
         self.create_subscription(
-            Odometry, self.get_parameter('odom_topic').value, self.odom_callback,
-            sensor_qos)
+            Odometry, params['odom_topic'], self.odom_callback, sensor_qos)
 
         mpc_controller = MPCController(
-            vehicle_model=VehicleModel(),
-            prediction_horizon=self.get_parameter('mpc.prediction_horizon').value,
-            control_horizon=self.get_parameter('mpc.control_horizon').value,
-            dt=self.get_parameter('mpc.dt').value,
-            q_pos=self.get_parameter('mpc.q_pos').value,
-            q_yaw=self.get_parameter('mpc.q_yaw').value,
-            q_vel=self.get_parameter('mpc.q_vel').value,
-            r_steer=self.get_parameter('mpc.r_steer').value,
-            r_accel=self.get_parameter('mpc.r_accel').value,
-            r_delta_steer=self.get_parameter('mpc.r_delta_steer').value,
-            r_delta_accel=self.get_parameter('mpc.r_delta_accel').value,
-            block_map=list(self.get_parameter('mpc.block_map').value),
-            maxiter=self.get_parameter('mpc.maxiter').value,
-            solve_budget_ms=self.get_parameter('mpc.solve_budget_ms').value,
-        )
+            vehicle_model=VehicleModel(servo=driver_params.servo_model(params)),
+            **driver_params.mpc_kwargs(params))
 
         self.core = DriverCore(
-            cfg=DriverConfig(
-                crawl_speed=self.get_parameter('crawl_speed').value,
-                max_range=self.get_parameter('max_range').value,
-                v_max=self.get_parameter('v_max').value,
-                lat_accel=self.get_parameter('lat_accel').value,
-                a_brake=self.get_parameter('a_brake').value,
-                steer_limit=self.get_parameter('steer_limit').value,
-            ),
+            cfg=driver_params.driver_config(params),
             mpc_controller=mpc_controller,
             logger=self.get_logger(),
         )
+
+        # What actually arrived. `params_source = CODE_DEFAULTS` means the
+        # params file was not loaded and the table's defaults are running.
+        for line in driver_params.echo_lines(params):
+            self.get_logger().info(f'param {line}')
 
         self._marker_divisor = 0
         self._last_dt_report = self.get_clock().now()

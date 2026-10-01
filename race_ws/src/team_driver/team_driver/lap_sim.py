@@ -12,10 +12,15 @@ WHY THE TIMING MODEL
     (RTF ~1.4). The driver solves one scan in ~30-40 ms of wall time, so its
     depth-10 subscription queues are always full and every scan it takes is ~10
     physics steps old. While it solves, the sim keeps running -- so each command
-    is also held for `solve_wall * rtf` of sim time. Together that is ~150 ms of
-    dead time, against an MPC that plans 200 ms ahead and a steering servo that
-    needs 290 ms for a full reversal. A harness that applies commands instantly
-    to the current state -- the old `lap_sim.py` -- cannot see any of it.
+    reaches the plant `solve_wall * rtf` of sim time after its tick. Together
+    that is ~150 ms of dead time, against an MPC that plans 200 ms ahead and a
+    steering servo that needs 290 ms for a full reversal. A harness that applies
+    commands instantly to the current state -- the old `lap_sim.py` -- cannot see
+    any of it.
+
+    Since Step 3 the node plans on a fixed timer, so ticks are `--control-period`
+    (25 ms) apart: 3 and 2 physics steps alternately on the 10 ms grid. A solve
+    that outlasts the period stretches it, as a real overrunning timer would.
 
 WHAT IS EXACT, WHAT IS NOT
     Plant, servo, LiDAR, collision detection and the referee's 1 Hz collision
@@ -50,8 +55,13 @@ PHYSICS_DT = 0.01               # s, gym_bridge.py sim_timestep
 # Measured live with a /clock probe (run 20260930T091032Z, mode 9 of 1536).
 DEFAULT_STALE_STEPS = 9
 DEFAULT_RTF = 1.4               # sim seconds per wall second, measured live
-# Live, consecutive scans the driver used were ~74 ms of sim apart (the hold),
-# against ~32 ms for core.step here: 74 / (32 * 1.4) = 1.65.
+# The node plans on a fixed timer (driver.py create_timer, mpc.dt). 0 restores
+# the old free-running loop, where each command is held for its own solve time.
+DEFAULT_CONTROL_PERIOD = 0.025  # s
+# Live, consecutive scans the old scan-callback driver used were ~74 ms of sim
+# apart, against ~32 ms for core.step here: 74 / (32 * 1.4) = 1.65. That fixes
+# how long a solve takes in the container; since Step 3 the tick spacing is the
+# control period, and this only sets the solve wait inside it.
 DEFAULT_SOLVE_SCALE = 1.65
 SCAN_CULL_REACH = 9.0           # m; exact below it, and the driver clips at 8 m
 
@@ -60,8 +70,9 @@ SPAWN_POSE = (-1.68, -0.01, 0.0)
 FINISH_LINE_X = 1.32
 FINISH_LINE_Y = (-0.76, 0.89)
 
-# The node's declared parameters (driver.py). DriverCore's own fallback builds
-# horizon 10, and driver_params.yaml never loads, so these are what the judge runs.
+# The node's declared MPC parameters (driver_params.py; test_driver_params.py
+# holds them equal to this). DriverCore's own fallback builds horizon 10, so
+# these are what the judge runs, with or without driver_params.yaml.
 JUDGED_MPC = dict(prediction_horizon=8, control_horizon=3, dt=0.025,
                   q_pos=2.0, q_yaw=2.0, q_vel=0.5, r_steer=0.08, r_accel=0.01,
                   r_delta_steer=0.8, r_delta_accel=0.005,
@@ -97,6 +108,7 @@ class HarnessConfig:
     max_time: Optional[float] = None  # sim s; default scales with laps
     stale_steps: int = DEFAULT_STALE_STEPS
     rtf: float = DEFAULT_RTF
+    control_period: float = DEFAULT_CONTROL_PERIOD
     fixed_solve_ms: Optional[float] = None
     solve_scale: float = DEFAULT_SOLVE_SCALE
     plant: str = 'st'
@@ -109,7 +121,10 @@ class HarnessConfig:
 
 
 def hold_steps(solve_wall_s, rtf, dt=PHYSICS_DT):
-    """Physics steps the sim advances while the driver solves one command."""
+    """Physics steps the sim advances while the driver solves one command.
+
+    That is the wait before the command latches, whatever the tick spacing.
+    """
     return max(1, int(round(solve_wall_s * rtf / dt)))
 
 
@@ -118,6 +133,29 @@ def hold_for(cfg, measured_solve_s):
     if cfg.fixed_solve_ms is not None:
         return hold_steps(cfg.fixed_solve_ms / 1e3, cfg.rtf)
     return hold_steps(measured_solve_s * cfg.solve_scale, cfg.rtf)
+
+
+def cadence_steps(k, period, dt=PHYSICS_DT):
+    """Physics steps in control period k, so no period's rounding accumulates.
+
+    A 25 ms timer on the 10 ms grid is 3 and 2 steps alternately: tick k sits at
+    round(k * period / dt) steps, and this is the gap to tick k + 1.
+    """
+    def tick(n):
+        return math.floor(n * period / dt + 0.5 + 1e-9)
+    return max(1, tick(k + 1) - tick(k))
+
+
+def period_for(cfg, k, latency):
+    """Physics steps from tick k to tick k + 1.
+
+    The timer sets it. A solve that outlasts the period overruns it: the next
+    tick fires the moment the callback returns, so the period stretches to the
+    solve. With no control period the loop is free-running and the solve is it.
+    """
+    if cfg.control_period <= 0.0:
+        return latency
+    return max(cadence_steps(k, cfg.control_period), latency)
 
 
 class SnapshotRing:
@@ -233,7 +271,8 @@ class _Log:
         self.cmd_steer = []
         self.cmd_speed = []
         self.solve_ms = []
-        self.holds = []
+        self.holds = []        # physics steps from one tick to the next
+        self.latencies = []    # of those, steps before the new command latches
         self.saturated = []
         self.delta = []
         self.track_err = []
@@ -253,6 +292,7 @@ def _summarise(cfg, log, plant, counter, line, wall_s, contact, conditioning):
     delta = np.asarray(log.delta)
     err = np.asarray(log.track_err)
     holds = np.asarray(log.holds, dtype=float)
+    latencies = np.asarray(log.latencies, dtype=float)
     reversals = count_reversals(cmd)
     return {
         'plant': cfg.plant,
@@ -295,8 +335,34 @@ def _summarise(cfg, log, plant, counter, line, wall_s, contact, conditioning):
         'solve_ms_max': _stat(np.max, log.solve_ms),
         'hold_steps_mean': _stat(np.mean, holds),
         'hold_steps_max': int(holds.max()) if holds.size else 0,
-        'dead_time_ms_mean': (cfg.stale_steps + _stat(np.mean, holds)) * PHYSICS_DT * 1e3,
+        'latency_steps_mean': _stat(np.mean, latencies),
+        # Scan age plus the wait for the solve; the period is not dead time.
+        'dead_time_ms_mean': (cfg.stale_steps + _stat(np.mean, latencies)) * PHYSICS_DT * 1e3,
     }
+
+
+def _advance(steps, plant, contact, counter, line, ring, log, prev_xy, cfg):
+    """Run `steps` physics steps under the latched command.
+
+    Returns (finished, base_link xy); finished means the laps are done or the
+    car was disqualified, so the caller stops stepping.
+    """
+    for _ in range(steps):
+        plant.step()
+        counter.update(plant.time, contact.resolve(plant.state))
+        log.saturated.append(plant.is_rate_saturated)
+        log.delta.append(float(plant.state[plant_sim.DELTA]))
+        log.track_err.append(abs(plant.steer_cmd - log.delta[-1]))
+        log.speed.append(float(plant.state[plant_sim.V]))
+        xy = plant.base_link_pose[:2]
+        log.distance += math.hypot(xy[0] - prev_xy[0], xy[1] - prev_xy[1])
+        if line.update(prev_xy, xy, plant.time) and not cfg.quiet:
+            print(f'  lap {line.laps}: {line.lap_times[-1]:.2f} s')
+        prev_xy = xy
+        ring.push((plant.state.copy(), plant.time))
+        if counter.disqualified or line.laps >= cfg.laps:
+            return True, prev_xy
+    return False, prev_xy
 
 
 def run(cfg: HarnessConfig):
@@ -315,6 +381,7 @@ def run(cfg: HarnessConfig):
     ring = SnapshotRing(cfg.stale_steps, (plant.state.copy(), plant.time))
     log = _Log()
     prev_xy = plant.base_link_pose[:2]
+    tick = 0
     next_report = 5.0
     wall0 = time.perf_counter()
 
@@ -332,31 +399,26 @@ def run(cfg: HarnessConfig):
         # The estimate refers to the snapshot's instant, like the pose it rides with.
         log.delta_est_err.append(abs(core.delta_hat - float(state[plant_sim.DELTA])))
 
-        held = hold_for(cfg, solve_s)
-        log.holds.append(held)
+        latency = hold_for(cfg, solve_s)
+        period = period_for(cfg, tick, latency)
+        tick += 1
+        log.holds.append(period)
+        log.latencies.append(latency)
         log.cmd_steer.append(cmd.steering_angle)
         log.cmd_speed.append(cmd.speed)
 
-        # The sim keeps running the previous command while this one solves;
-        # it reaches the bridge only when the solve ends.
-        for _ in range(held):
-            plant.step()
-            counter.update(plant.time, contact.resolve(plant.state))
-            log.saturated.append(plant.is_rate_saturated)
-            log.delta.append(float(plant.state[plant_sim.DELTA]))
-            log.track_err.append(abs(plant.steer_cmd - log.delta[-1]))
-            log.speed.append(float(plant.state[plant_sim.V]))
-            xy = plant.base_link_pose[:2]
-            log.distance += math.hypot(xy[0] - prev_xy[0], xy[1] - prev_xy[1])
-            if line.update(prev_xy, xy, plant.time) and not cfg.quiet:
-                print(f'  lap {line.laps}: {line.lap_times[-1]:.2f} s')
-            prev_xy = xy
-            ring.push((plant.state.copy(), plant.time))
-            if counter.disqualified or line.laps >= cfg.laps:
-                break
+        # The sim keeps running the previous command while this one solves; the
+        # new one reaches the bridge only when the solve ends, and holds until
+        # the next timer tick.
+        finished, prev_xy = _advance(latency, plant, contact, counter, line, ring, log,
+                                     prev_xy, cfg)
         plant.latch(cmd.steering_angle, cmd.speed)
         # Published now, a solve after the scan it was planned from.
         core.note_published(cmd, t_sim=plant.time)
+        if not finished:
+            # Whether this one finishes the run is read by the `while` above.
+            _, prev_xy = _advance(period - latency, plant, contact, counter, line, ring,
+                                  log, prev_xy, cfg)
 
         if not cfg.quiet and plant.time >= next_report:
             next_report += 5.0
@@ -425,7 +487,8 @@ def report(r):
     print(f"  solve             mean {r['solve_ms_mean']:.1f}, p95 {r['solve_ms_p95']:.1f}, "
           f"max {r['solve_ms_max']:.1f} ms")
     print(f"  dead time         {r['dead_time_ms_mean']:.0f} ms mean "
-          f"(hold {r['hold_steps_mean']:.1f} steps, max {r['hold_steps_max']})")
+          f"(solve wait {r['latency_steps_mean']:.1f} steps; period "
+          f"{r['hold_steps_mean']:.1f} steps, max {r['hold_steps_max']})")
     print(f"  judged baseline   {JUDGED_BASELINE}")
     fails = verdict(r)
     print(f"  VERDICT           {'FAIL -- ' + '; '.join(fails) if fails else 'PASS'}")
@@ -440,8 +503,12 @@ def _parser():
     ap.add_argument('--max-time', type=float, default=None, help='sim seconds')
     ap.add_argument('--stale-steps', type=int, default=DEFAULT_STALE_STEPS)
     ap.add_argument('--rtf', type=float, default=DEFAULT_RTF)
+    ap.add_argument('--control-period', type=float, default=DEFAULT_CONTROL_PERIOD,
+                    help='s between control ticks, as the node timer; 0 holds each '
+                         'command for its own solve time (the pre-Step-3 loop)')
     ap.add_argument('--fixed-solve-ms', type=float, default=None,
-                    help='hold every command for this solve time (deterministic)')
+                    help='use this solve time for every command (deterministic): the '
+                         'wait before it latches, and the period when it overruns')
     ap.add_argument('--solve-scale', type=float, default=DEFAULT_SOLVE_SCALE,
                     help='multiply measured solve times by this (container vs host)')
     ap.add_argument('--plant', choices=sorted(PLANTS), default='st')
@@ -455,6 +522,7 @@ def _parser():
 def _config_from(args):
     return HarnessConfig(laps=args.laps, max_time=args.max_time,
                         stale_steps=args.stale_steps, rtf=args.rtf,
+                        control_period=args.control_period,
                         fixed_solve_ms=args.fixed_solve_ms, solve_scale=args.solve_scale,
                         plant=args.plant, seed=args.seed, quiet=args.quiet)
 
