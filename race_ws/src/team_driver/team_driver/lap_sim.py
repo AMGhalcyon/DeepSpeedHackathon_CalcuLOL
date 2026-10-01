@@ -75,9 +75,13 @@ FINISH_LINE_Y = (-0.76, 0.89)
 # these are what the judge runs, with or without driver_params.yaml.
 JUDGED_MPC = dict(prediction_horizon=8, control_horizon=3, dt=0.025,
                   q_pos=2.0, q_yaw=2.0, q_vel=0.5, r_steer=0.08, r_accel=0.01,
-                  r_delta_steer=0.8, r_delta_accel=0.005,
+                  r_delta_steer=3.0, r_delta_accel=0.005,
                   block_map=[0, 1, 1, 2, 2, 2, 2, 2], maxiter=25,
                   solve_budget_ms=15.0)
+# What `--mpc KEY=VALUE` may override for one run (the Step 9 sweep). Horizon,
+# block map, dt and maxiter are structure, held by the node's startup checks.
+TUNABLE_MPC_KEYS = ('q_pos', 'q_yaw', 'q_vel', 'r_steer', 'r_accel',
+                    'r_delta_steer', 'r_delta_accel', 'solve_budget_ms')
 
 # Controller gates. The slew gate is the old harness's, kept so the two can be
 # compared; the saturation gate is what Step 6 has to reach.
@@ -114,10 +118,41 @@ class HarnessConfig:
     plant: str = 'st'
     seed: Optional[int] = None  # plant noise RNG; inert unless noise is on
     quiet: bool = False
+    mpc_overrides: tuple[tuple[str, float], ...] = ()  # over JUDGED_MPC, in order
 
     @property
     def time_limit(self):
         return self.max_time if self.max_time is not None else 30.0 + 90.0 * self.laps
+
+
+def mpc_kwargs(cfg):
+    """JUDGED_MPC with this run's overrides applied; JUDGED_MPC itself untouched."""
+    return {**JUDGED_MPC, **dict(cfg.mpc_overrides)}
+
+
+def parse_mpc_override(text):
+    """`KEY=VALUE` -> (key, float), for a tunable key and a finite value >= 0."""
+    key, sep, raw = text.partition('=')
+    if not sep:
+        raise argparse.ArgumentTypeError(f'expected KEY=VALUE, got {text!r}')
+    if key not in TUNABLE_MPC_KEYS:
+        raise argparse.ArgumentTypeError(
+            f'{key!r} is not tunable here; choose from {", ".join(TUNABLE_MPC_KEYS)}')
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'{key}: {raw!r} is not a number') from None
+    if not math.isfinite(value) or value < 0.0:
+        raise argparse.ArgumentTypeError(f'{key}: {value} must be finite and >= 0')
+    if key == 'solve_budget_ms' and value == 0.0:
+        raise argparse.ArgumentTypeError('solve_budget_ms: 0 aborts every solve; use 1e6 '
+                                         'to lift it')
+    return key, value
+
+
+def json_record(cfg, result):
+    """What `--json` writes: the config, the MPC weights actually used, the result."""
+    return {'config': asdict(cfg), 'mpc': mpc_kwargs(cfg), 'result': result}
 
 
 def hold_steps(solve_wall_s, rtf, dt=PHYSICS_DT):
@@ -374,7 +409,7 @@ def run(cfg: HarnessConfig):
     plant.reset(SPAWN_POSE)
     lr = float(plant.params.lr)
     core = DriverCore(cfg=DriverConfig(),
-                      mpc_controller=MPCController(vehicle_model=VehicleModel(), **JUDGED_MPC))
+                      mpc_controller=MPCController(vehicle_model=VehicleModel(), **mpc_kwargs(cfg)))
 
     counter = scan_sim.CollisionCounter()
     line = FinishLine()
@@ -515,6 +550,10 @@ def _parser():
     ap.add_argument('--seed', type=int, default=None,
                     help='plant noise seed; measured-solve runs still vary with host timing')
     ap.add_argument('--quiet', action='store_true')
+    ap.add_argument('--mpc', type=parse_mpc_override, action='append', default=[],
+                    metavar='KEY=VALUE',
+                    help='override one MPC weight for this run (repeatable): '
+                         + ', '.join(TUNABLE_MPC_KEYS))
     ap.add_argument('--json', default=None, help='write the result dict here')
     return ap
 
@@ -524,7 +563,8 @@ def _config_from(args):
                         stale_steps=args.stale_steps, rtf=args.rtf,
                         control_period=args.control_period,
                         fixed_solve_ms=args.fixed_solve_ms, solve_scale=args.solve_scale,
-                        plant=args.plant, seed=args.seed, quiet=args.quiet)
+                        plant=args.plant, seed=args.seed, quiet=args.quiet,
+                        mpc_overrides=tuple(args.mpc))
 
 
 def parse_config(argv=None):
@@ -539,7 +579,7 @@ def main():
     report(r)
     if args.json:
         with open(args.json, 'w') as handle:
-            json.dump({'config': asdict(cfg), 'result': r}, handle, indent=2)
+            json.dump(json_record(cfg, r), handle, indent=2)
 
 
 if __name__ == '__main__':

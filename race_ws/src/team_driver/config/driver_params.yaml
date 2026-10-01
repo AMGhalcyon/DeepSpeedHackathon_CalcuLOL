@@ -75,6 +75,13 @@ driver:
     #   q_pos x r_delta_steer; this corner clears both gates (mean |dsteer| < 0.012
     #   rad/step and max lateral error < 0.10 m). Lower r_delta_steer fails the slew
     #   gate; lower q_pos fails the tracking gate.
+    #
+    # Step 9 re-sweep (2026-10-01, 25 ms-cadence harness, 10 laps, stale 9, fixed
+    #   7 ms solve): r_delta_steer 0.1/0.3/0.8/1.5/3/5/8 x q_pos 1/2/4, q_yaw
+    #   0.5-8. Even with the servo modelled, lowering r_delta_steer only adds
+    #   chatter (0.1: slew 0.022, +0.7 s/lap). 3.0 is the knee: slew 0.0111 (the
+    #   first to pass 0.012), 0 % rate saturation, 50.12 s vs 50.23 s; it also
+    #   beats 0.8 at stale 14. q_pos is flat; q_yaw 4 is faster but fails slew.
     mpc:
       prediction_horizon: 8             # Steps to predict ahead (see note above on the time budget)
       control_horizon: 3                # Free control moves; must equal max(block_map) + 1
@@ -87,7 +94,7 @@ driver:
       q_vel: 0.5                        # Velocity tracking weight
       r_steer: 0.08                     # Steering control effort weight
       r_accel: 0.01                     # Acceleration control effort weight
-      r_delta_steer: 0.8                # Steering rate of change weight
+      r_delta_steer: 3.0                # Steering rate of change weight (Step 9)
       r_delta_accel: 0.005              # Acceleration rate of change weight
 
     # The MPC's model of the steering servo, calibrated against the judged plant

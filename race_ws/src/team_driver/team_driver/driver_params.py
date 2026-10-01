@@ -70,7 +70,7 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
     ParamSpec('mpc.q_vel', 0.5),
     ParamSpec('mpc.r_steer', 0.08),
     ParamSpec('mpc.r_accel', 0.01),
-    ParamSpec('mpc.r_delta_steer', 0.8),
+    ParamSpec('mpc.r_delta_steer', 3.0),
     ParamSpec('mpc.r_delta_accel', 0.005),
     ParamSpec('servo.alpha', _SERVO.alpha),
     ParamSpec('servo.d_max', _SERVO.d_max_cal),

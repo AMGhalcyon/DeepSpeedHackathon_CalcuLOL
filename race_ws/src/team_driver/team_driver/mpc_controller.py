@@ -62,7 +62,9 @@ class MPCController:
             q_vel: Weight on velocity tracking error
             r_steer: Weight on steering control effort
             r_accel: Weight on acceleration control effort
-            r_delta_steer: Weight on steering rate of change
+            r_delta_steer: Weight on steering rate of change. The tuned
+                value (3.0, Step 9) is in driver_params.py, which the node
+                and lap_sim always pass; these defaults are not the judged car.
             r_delta_accel: Weight on acceleration rate of change
             block_map: Move blocking. Entry k is the index of the free control
                 applied at prediction step k, so len == prediction_horizon and

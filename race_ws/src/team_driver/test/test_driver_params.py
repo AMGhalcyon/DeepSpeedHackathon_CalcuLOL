@@ -154,6 +154,32 @@ class ParamsFileTests(unittest.TestCase):
         driver_params.validate(values)
 
 
+STEP9_TUNED = {'mpc.r_delta_steer': 3.0, 'mpc.q_pos': 2.0, 'mpc.q_yaw': 2.0}
+
+
+class Step9TunedWeightsTests(unittest.TestCase):
+    """The Step 9 sweep on the 25 ms-cadence harness (10 laps, stale 9).
+
+    Lowering r_delta_steer, as the plan proposed, made every metric worse: at
+    0.1 the cmd slew is 0.022 and laps 0.7 s slower. Raising it to 3.0 is the
+    knee: the first setting to pass the 0.012 slew gate (0.0111), 0 % rate
+    saturation, and 0.1 s/lap faster; 5 and 8 only lose lap time. It also beats
+    0.8 at stale 14. q_pos was flat over 1-4; q_yaw 4 is faster but fails the
+    gate, q_yaw 1 is slower.
+    """
+
+    def test_the_code_defaults_carry_the_tuned_weights(self):
+        for name, value in STEP9_TUNED.items():
+            with self.subTest(name=name):
+                self.assertEqual(driver_params.DEFAULTS[name], value)
+
+    def test_the_params_file_carries_the_tuned_weights(self):
+        params = _node_params()
+        for name, value in STEP9_TUNED.items():
+            with self.subTest(name=name):
+                self.assertEqual(params[name], value)
+
+
 class ValidateTests(unittest.TestCase):
 
     def test_the_defaults_pass(self):
