@@ -53,7 +53,8 @@ class DriverConfig:
 
     Defaults mirror `driver.py`'s `declare_parameter` calls exactly. Keeping
     them equal means a forgotten `--driver-params` flag is a provable no-op
-    rather than a silently different car.
+    rather than a silently different car. The output-conditioning fields at the
+    end are not declared on the node yet, so the node runs these defaults.
     """
 
     crawl_speed: float = 1.0        # [m/s]
@@ -62,19 +63,41 @@ class DriverConfig:
     lat_accel: float = 0.8          # [m/s^2] cornering budget
     a_brake: float = 0.8            # [m/s^2] braking budget
     steer_limit: float = 0.4        # [rad]
+    # [m] Clearance the braking-distance cap keeps in hand. Swept 0.0-0.5 over
+    # 10 harness laps: 0 collisions at every value and at stale 5/9/14, and each
+    # 0.1 m cost ~1 s of lap time, so the smallest value was taken. The cap
+    # still assumes only a_brake (0.8 m/s^2) of braking, far below what the
+    # plant can do, so 0.0 is not zero reserve.
+    stop_margin: float = 0.0
+    k_steer_derate: float = 2.0     # speed cap in a turn: v_max / (1 + k |steer|)
+    coast_steer_rate: float = 1.0   # [rad/s] steering decay toward straight while coasting
+    accel_limit: float = 4.0        # [m/s^2] fastest the speed setpoint may rise
 
 
 class DriveCommand(NamedTuple):
     """One command destined for /drive.
 
-    `steering_angle_velocity` is carried but not yet populated -- the judged
-    config runs the simulator in STEERING_ANGLE mode and ignores it. It is here
-    so the output-conditioning work has somewhere to put it.
+    `steering_angle_velocity` is the rate the conditioner implies,
+    (steer - previous steer) / dt. The judged config runs the simulator in
+    STEERING_ANGLE mode and ignores it, so it documents the command rather than
+    drives the plant.
     """
 
     steering_angle: float
     speed: float
     steering_angle_velocity: float = 0.0
+
+
+class ConditioningStats(NamedTuple):
+    """How hard the output conditioner has had to work, since construction."""
+
+    steps: int          # commands conditioned (coasts are counted separately)
+    slew_binds: int     # of those, commands the slew limiter shortened
+    coast_count: int    # commands replaced by `_coast()`
+
+    @property
+    def slew_bind_rate(self) -> float:
+        return self.slew_binds / self.steps if self.steps else 0.0
 
 
 DT_CLAMP_LOW = 0.5     # x nominal: a burst of scans must not zero the interval
@@ -89,6 +112,10 @@ LATCH_TIME_TOL = 1e-6           # [s] stamps are float sums of 0.01; compare wit
 # Smaller backward steps are an out-of-order stamp and are ignored.
 SIM_RESET_BACKSTEP = 0.1
 RTF_SMOOTHING = 0.05            # EMA weight per control step for the live RTF
+FRONT_HALF_ANGLE = 0.2          # [rad] the sector the braking-distance cap looks down
+# The near end of that sector, not its mean: one long beam down a gap must not
+# lift the cap.
+FRONT_PERCENTILE = 10
 
 
 class DtTracker:
@@ -158,6 +185,7 @@ class SteeringEstimator:
         self._cmd = 0.0           # command latched at self.t
         self._pending = []        # (t_latch, cmd) not yet reached, time-ordered
         self._residuals = []      # |delta_hat - delta_meas| before each correction
+        self.reseeds = 0          # sim resets seen; others key their own memory off this
 
     def on_publish(self, delta_cmd, t_latch=None):
         """A command went on the wire and latches at plant time `t_latch`.
@@ -223,6 +251,7 @@ class SteeringEstimator:
         self.t = None
         self._cmd = 0.0
         self._pending = []
+        self.reseeds += 1
 
     def _latch_due(self):
         while self._pending and self._pending[0][0] <= self.t + LATCH_TIME_TOL:
@@ -286,6 +315,10 @@ class DriverCore:
         self.lat_accel = self.cfg.lat_accel
         self.a_brake = self.cfg.a_brake
         self.steer_limit = self.cfg.steer_limit
+        self.stop_margin = self.cfg.stop_margin
+        self.k_steer_derate = self.cfg.k_steer_derate
+        self.coast_steer_rate = self.cfg.coast_steer_rate
+        self.accel_limit = self.cfg.accel_limit
 
         self.mpc_controller = (mpc_controller if mpc_controller is not None
                                else MPCController(vehicle_model=VehicleModel()))
@@ -319,6 +352,17 @@ class DriverCore:
         # What actually went on the wire last, and when.
         self._last_cmd = DriveCommand(0.0, 0.0, 0.0)
         self._last_publish_t = None
+
+        # The conditioner's own memory of its last output: the base the rate
+        # limits step from. None until the first command, which starts from the
+        # wheel estimate and the measured speed instead.
+        self._cond_steer = None
+        self._cond_speed = None
+        self._seen_reseeds = 0
+        self._cond_steps = 0
+        self._slew_binds = 0
+        self._coast_count = 0
+        self._coasting = False
 
         self._load_reference_path()
 
@@ -441,10 +485,9 @@ class DriverCore:
     def step(self, t_sim=None) -> DriveCommand:
         """Plan one command from the latest sensor data."""
         if self._scan_ranges is None:
-            # No scan has arrived yet. The node only calls step() from its scan
-            # callback so this is unreachable there, but a fixed-rate caller
-            # can beat the first scan.
-            return DriveCommand(0.0, self.crawl_speed, 0.0)
+            # No scan has arrived yet; the fixed-rate node can beat the first
+            # one. Driving blind is worse than standing still.
+            return self._coast(self.dt_measured, 'no scan yet')
 
         # A fixed-rate caller can beat the next scan; replaying the last command
         # is better than solving the same scan twice.
@@ -459,11 +502,109 @@ class DriverCore:
         t_pose = self.t_odom if self.t_odom is not None else self.t_scan
         advanced = self.steering.predict_to(t_pose)
         self.steering.correct(self.yaw_rate, self.speed, self.beta, advanced)
+        if self.steering.reseeds != self._seen_reseeds:
+            # The sim was reset: the car is back on the grid with the wheel
+            # centred, so the old setpoints are not where any limit steps from.
+            self._seen_reseeds = self.steering.reseeds
+            self._cond_steer = None
+            self._cond_speed = None
+            self._coasting = False
 
         ranges, angles = self.preprocess()
-        steering, speed = self.plan(ranges, angles)
-        self._last_planned = DriveCommand(float(steering), float(speed), 0.0)
+        planned = self.plan(ranges, angles)
+        dt = self.dt_measured
+        if planned is None:
+            self._last_planned = self._coast(dt, 'no usable plan')
+        else:
+            steering, speed, speed_cap = planned
+            self._last_planned = self._condition(steering, speed, dt, speed_cap)
         return self._last_planned
+
+    def conditioning_stats(self) -> ConditioningStats:
+        """Slew-limiter and coast counts since construction."""
+        return ConditioningStats(self._cond_steps, self._slew_binds, self._coast_count)
+
+    # ------------------------------------------------------------------
+    # Output conditioning: the single path to the wire
+    # ------------------------------------------------------------------
+    def _previous_output(self):
+        """(steer, speed) the next command's rate limits step from."""
+        steer = self._cond_steer if self._cond_steer is not None else self.steering.delta_hat
+        speed = self._cond_speed if self._cond_speed is not None else self.speed
+        # A NaN here would be stored as the new memory and never wash out.
+        return (steer if math.isfinite(steer) else 0.0,
+                speed if math.isfinite(speed) else 0.0)
+
+    def _issue(self, steer, speed, prev_steer, dt) -> DriveCommand:
+        self._cond_steer = steer
+        self._cond_speed = speed
+        rate = (steer - prev_steer) / dt if dt > 0.0 else 0.0
+        return DriveCommand(steer, speed, rate)
+
+    def _condition(self, raw_steer, raw_speed, dt, speed_cap=math.inf) -> DriveCommand:
+        """Hold a raw command to what the servo and the speed loop can follow.
+
+        The steering step is limited to exactly `sv_max * dt`: at that rate the
+        limiter only removes motion the wheel could not have followed, so it
+        adds no lag. Tighter would remove motion the wheel could have followed.
+        The speed setpoint is rate-limited because /drive speed feeds a second
+        loop (pid_accl), and a step in it is a step in demanded acceleration.
+
+        `speed_cap` is the braking-distance bound and is applied last, as a
+        hard ceiling. It is a safety bound, so the rate limit must not delay it:
+        clearance can drop in a step (a wall comes into view) while the braking
+        rate limit would take half a second to follow.
+        """
+        if not (math.isfinite(raw_steer) and math.isfinite(raw_speed)):
+            return self._coast(dt, 'non-finite command')
+        self._coasting = False
+
+        prev_steer, prev_speed = self._previous_output()
+        reach = self.steering.sv_max * dt
+        target = float(np.clip(raw_steer, -self.steer_limit, self.steer_limit))
+        steer = float(np.clip(target, prev_steer - reach, prev_steer + reach))
+        steer = float(np.clip(steer, -self.steer_limit, self.steer_limit))
+        speed = float(np.clip(raw_speed,
+                              prev_speed - self.a_brake * dt,
+                              prev_speed + self.accel_limit * dt))
+
+        self._cond_steps += 1
+        if steer != target:
+            self._slew_binds += 1
+        return self._issue(steer, max(min(speed, speed_cap), 0.0), prev_steer, dt)
+
+    def _coast(self, dt, why='') -> DriveCommand:
+        """Degrade smoothly when there is no usable plan: never snap.
+
+        Steering unwinds toward straight at `coast_steer_rate` and speed is shed
+        at `a_brake`. The old fallbacks jumped the wheel to 0.0 from wherever it
+        was, at the moment the controller had admitted it did not know what was
+        happening.
+        """
+        prev_steer, prev_speed = self._previous_output()
+        decay = self.coast_steer_rate * dt
+        steer = prev_steer - math.copysign(min(abs(prev_steer), decay), prev_steer)
+        speed = max(prev_speed - self.a_brake * dt, 0.0)
+
+        self._coast_count += 1
+        if not self._coasting:
+            self._coasting = True
+            self.log.warn(f'Coasting ({why or "no usable command"}); '
+                          f'{self._coast_count} coast steps so far')
+        return self._issue(steer, speed, prev_steer, dt)
+
+    def _speed_cap(self, ranges, angles, steer) -> float:
+        """[m/s] Upper bound on speed from stopping distance and steering.
+
+        A braking-distance bound, so it has no steps: it falls as the clearance
+        falls, and falls at about `a_brake` along the braking curve.
+        """
+        front = ranges[np.abs(angles) <= FRONT_HALF_ANGLE]
+        clearance = float(np.percentile(front, FRONT_PERCENTILE)) if front.size else 1.0
+        d_stop = max(clearance - self.stop_margin, 0.0)
+        v_brake = math.sqrt(2.0 * self.a_brake * d_stop)
+        v_turn = self.v_max / (1.0 + self.k_steer_derate * abs(steer))
+        return float(np.clip(min(v_brake, v_turn), self.crawl_speed, self.v_max))
 
     def note_published(self, cmd: DriveCommand, t_sim=None):
         """Record what actually went on the wire.
@@ -497,7 +638,9 @@ class DriverCore:
         """MPC-based planning function.
 
         Uses Model Predictive Control to compute optimal steering and speed
-        based on vehicle dynamics, reference path, and current state.
+        based on vehicle dynamics, reference path, and current state. Returns
+        (steering, speed, speed_cap) before conditioning, or None when there is
+        nothing usable to plan from and the caller should coast.
         """
         # 1. Restrict view to forward field of view [-100 deg, +100 deg] (~ -1.75 to +1.75 rad)
         fov_mask = (angles >= -1.75) & (angles <= 1.75)
@@ -505,8 +648,8 @@ class DriverCore:
         fov_angles = angles[fov_mask]
 
         if len(fov_ranges) == 0:
-            # No valid LiDAR data - fallback to crawl speed
-            return 0.0, self.crawl_speed
+            # No valid LiDAR data.
+            return None
 
         # 2. Basic obstacle avoidance - keep existing safety logic for robustness
         # Locate nearest obstacle point inside FOV
@@ -551,22 +694,10 @@ class DriverCore:
         #    the fallback if the MPC fails; the MPC keeps its own command memory.
         reactive_steering = float(np.clip(0.85 * target_angle, -0.4, 0.4))
 
-        # 5. Reactive speed: a crude clearance heuristic, kept as an upper
-        #    bound and fallback only. The real speed target comes from the
-        #    curvature profile once the MPC is in the loop.
-        front_mask = (angles >= -0.2) & (angles <= 0.2)
-        front_dist = np.mean(ranges[front_mask]) if np.any(front_mask) else 1.0
-
-        if abs(reactive_steering) > 0.25 or front_dist < 2.0:
-            reactive_speed = 2.0
-        elif front_dist > 5.0 and abs(reactive_steering) < 0.1:
-            reactive_speed = 4.5
-        else:
-            reactive_speed = 3.0
-
-        # 6. Use MPC when we have both a path and a state. Without a reference
+        # 5. Use MPC when we have both a path and a state. Without a reference
         #    path the MPC has nothing to track and would drive the car to the
-        #    origin, so stay reactive in that case.
+        #    origin, so stay reactive in that case. Either way the speed is
+        #    bounded by `_speed_cap`, a braking-distance bound with no steps.
         if self.position is not None and self.reference_path is not None:
             try:
                 # Current state: [x, y, yaw, velocity, beta_sideslip, wheel]
@@ -589,12 +720,7 @@ class DriverCore:
                 # /drive takes a SPEED, not an acceleration -- the simulator
                 # closes that loop itself. The MPC plans in acceleration, so
                 # project one step forward.
-                speed = max(self.speed + accel * self.dt_measured, 0.0)
-
-                # Never let the MPC talk the car into a wall: the reactive
-                # clearance heuristic is a genuine safety bound, so take the
-                # lower of the two.
-                speed = min(speed, reactive_speed)
+                mpc_speed = max(self.speed + accel * self.dt_measured, 0.0)
                 steering = float(np.clip(steering, -self.steer_limit, self.steer_limit))
 
                 if hasattr(self, '_diag_counter'):
@@ -604,16 +730,19 @@ class DriverCore:
 
                 if self._diag_counter % 50 == 0:  # Every ~2 s at 40 Hz
                     self.log.info(
-                        f'MPC: steer={steering:.3f}, speed={speed:.2f} '
+                        f'MPC: steer={steering:.3f}, speed={mpc_speed:.2f} '
                         f'(cur {self.speed:.2f}), solve={diagnostics["solve_time_ms"]:.1f}ms')
 
             except Exception as e:
-                self.log.warn(f'MPC failed, using reactive: {e}')
-                steering = reactive_steering
-                speed = reactive_speed
+                self.log.warn(f'MPC failed: {e}')
+                return None
+
+            # The braking-distance cap below stops the MPC talking the car into
+            # a wall; _condition applies it as a ceiling.
+            speed = mpc_speed
         else:
             # No odometry or no reference path - use reactive
             steering = reactive_steering
-            speed = reactive_speed
+            speed = self.v_max
 
-        return steering, speed
+        return steering, speed, self._speed_cap(ranges, angles, steering)

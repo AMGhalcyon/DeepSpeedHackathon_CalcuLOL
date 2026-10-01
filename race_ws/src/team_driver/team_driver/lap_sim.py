@@ -75,6 +75,11 @@ MAX_SAT_DUTY = 0.05             # fraction of physics steps rate-saturated
 # Step 6: the wheel estimate handed to the MPC, against the plant's own wheel
 # at the same instant. Past this the actuator state does net harm.
 MAX_DELTA_EST_ERR = 0.02        # rad
+# Step 7: the slew limiter sits at exactly what the servo can follow, so with
+# an accurate actuator model it should almost never bind; frequent binding
+# means the model is wrong or the estimate has drifted. Coasting is a fallback
+# for a controller with nothing to say, so a clean run never needs it.
+MAX_SLEW_BIND_RATE = 0.02       # fraction of commands the limiter shortened
 # Step 2's binding gate on the harness itself: today's controller must fail the
 # way it fails when judged (7 collisions / 10 laps in the judged run).
 GATE_MIN_COLLISIONS_PER_10 = 3
@@ -226,6 +231,7 @@ class _Log:
 
     def __init__(self):
         self.cmd_steer = []
+        self.cmd_speed = []
         self.solve_ms = []
         self.holds = []
         self.saturated = []
@@ -241,8 +247,9 @@ def _stat(fn, values):
     return float(fn(values)) if len(values) else 0.0
 
 
-def _summarise(cfg, log, plant, counter, line, wall_s, contact):
+def _summarise(cfg, log, plant, counter, line, wall_s, contact, conditioning):
     cmd = np.asarray(log.cmd_steer)
+    cmd_speed = np.asarray(log.cmd_speed)
     delta = np.asarray(log.delta)
     err = np.asarray(log.track_err)
     holds = np.asarray(log.holds, dtype=float)
@@ -276,6 +283,10 @@ def _summarise(cfg, log, plant, counter, line, wall_s, contact):
         'track_err_p95': float(np.percentile(err, 95)) if err.size else 0.0,
         'reversals': reversals,
         'reversals_per_m': reversals / log.distance if log.distance > 0 else 0.0,
+        'slew_bind_rate': conditioning.slew_bind_rate,
+        'coast_count': conditioning.coast_count,
+        'cmd_speed_step_max': (float(np.max(np.abs(np.diff(cmd_speed))))
+                               if cmd_speed.size > 1 else 0.0),
         'delta_est_err_mean': _stat(np.mean, log.delta_est_err),
         'delta_est_err_p95': _stat(lambda v: np.percentile(v, 95), log.delta_est_err),
         'delta_est_err_max': _stat(np.max, log.delta_est_err),
@@ -324,6 +335,7 @@ def run(cfg: HarnessConfig):
         held = hold_for(cfg, solve_s)
         log.holds.append(held)
         log.cmd_steer.append(cmd.steering_angle)
+        log.cmd_speed.append(cmd.speed)
 
         # The sim keeps running the previous command while this one solves;
         # it reaches the bridge only when the solve ends.
@@ -352,7 +364,8 @@ def run(cfg: HarnessConfig):
                   f'v={log.speed[-1]:.2f}  coll={counter.events}  '
                   f'sat={np.mean(log.saturated):.1%}')
 
-    return _summarise(cfg, log, plant, counter, line, time.perf_counter() - wall0, contact)
+    return _summarise(cfg, log, plant, counter, line, time.perf_counter() - wall0, contact,
+                      core.conditioning_stats())
 
 
 def verdict(r):
@@ -369,6 +382,11 @@ def verdict(r):
     if r.get('delta_est_err_max', 0.0) >= MAX_DELTA_EST_ERR:
         reasons.append(f"wheel estimate off by {r['delta_est_err_max']:.4f} rad "
                        f">= {MAX_DELTA_EST_ERR}")
+    if r.get('slew_bind_rate', 0.0) > MAX_SLEW_BIND_RATE:
+        reasons.append(f"slew limiter bound on {r['slew_bind_rate']:.1%} of commands "
+                       f"> {MAX_SLEW_BIND_RATE:.0%}")
+    if r.get('coast_count', 0):
+        reasons.append(f"{r['coast_count']} coast steps in a clean run")
     return reasons
 
 
@@ -401,6 +419,9 @@ def report(r):
           f"p95 {r['delta_est_err_p95']:.4f}, max {r['delta_est_err_max']:.4f} rad "
           f"(gate < {MAX_DELTA_EST_ERR})")
     print(f"  reversals         {r['reversals']} ({r['reversals_per_m']:.2f} per m)")
+    print(f"  slew limiter      bound on {r['slew_bind_rate']:.2%} of commands "
+          f"(gate <= {MAX_SLEW_BIND_RATE:.0%}); coast steps {r['coast_count']} (gate 0); "
+          f"max speed step {r['cmd_speed_step_max']:.3f} m/s")
     print(f"  solve             mean {r['solve_ms_mean']:.1f}, p95 {r['solve_ms_p95']:.1f}, "
           f"max {r['solve_ms_max']:.1f} ms")
     print(f"  dead time         {r['dead_time_ms_mean']:.0f} ms mean "

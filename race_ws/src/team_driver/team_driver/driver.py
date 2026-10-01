@@ -212,6 +212,11 @@ class Driver(Node):
             f'delta_hat={self.core.delta_hat:.3f} rad, '
             f'p95|delta_hat - delta_meas|={self.core.steering_residual_summary():.4f} rad, '
             f'rtf={rtf if rtf is not None else float("nan"):.2f}')
+        # Healthy: the limiter almost never binds and coasting never happens.
+        stats = self.core.conditioning_stats()
+        self.get_logger().info(
+            f'conditioning: slew bound {stats.slew_binds}/{stats.steps} '
+            f'({stats.slew_bind_rate:.1%}), coast steps {stats.coast_count}')
 
     # ------------------------------------------------------------------
     # Output
@@ -221,6 +226,7 @@ class Driver(Node):
         msg.header.stamp = (now if now is not None else self.get_clock().now()).to_msg()
         msg.drive.steering_angle = float(cmd.steering_angle)
         msg.drive.speed = float(cmd.speed)
+        msg.drive.steering_angle_velocity = float(cmd.steering_angle_velocity)
         self.drive_pub.publish(msg)
 
     def publish_marker(self, target_angle):
