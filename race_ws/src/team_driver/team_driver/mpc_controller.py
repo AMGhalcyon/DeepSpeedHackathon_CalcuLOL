@@ -338,7 +338,8 @@ class MPCController:
     def speed_profile(self, path: np.ndarray = None, *, v_max: float = 3.0,
                       a_lat_max: float = 0.8, lock_margin: float = 0.95,
                       a_accel_max: float = 9.51, a_brake_max: float = 0.8,
-                      closed: bool = True) -> np.ndarray:
+                      closed: bool = True,
+                      sector_scale: Sequence[Sequence[float]] = ()) -> np.ndarray:
         """Closed-loop speed profile for the lap; see `speed_profile.py`.
 
         The reference used to demand an instant jump to corner speed, so the car
@@ -351,6 +352,8 @@ class MPCController:
             path: Path to profile; defaults to the configured one. Pass it
                 explicitly when calling before set_reference_path.
             closed: The path is a lap (last point joins the first).
+            sector_scale: (s_start, s_end, scale) sectors that lower the slip
+                budget (`speed_profile.slip_budget`).
         Returns:
             Speed per waypoint, shape (N,).
         """
@@ -361,7 +364,7 @@ class MPCController:
         return _speed_profile.speed_profile(
             path, a_lat_max=a_lat_max, lock_margin=lock_margin,
             a_accel_max=a_accel_max, a_brake_max=a_brake_max, v_max=v_max,
-            closed=closed)
+            closed=closed, sector_scale=sector_scale)
 
     @property
     def arc_position(self) -> Optional[float]:

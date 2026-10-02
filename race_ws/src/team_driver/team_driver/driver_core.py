@@ -31,6 +31,7 @@ try:
     from .mpc_controller import MPCController   # ROS / package import
     from .vehicle_model import F1TENTH_VEHICLE_PARAMETERS, SpeedLoop, VehicleModel
     from . import raceline
+    from .speed_profile import sector_triples, slip_budget
     from .latch_predictor import (LATCH_TIME_TOL, LatchPredictor, Prediction,
                                   plant_servo_rate, servo_kp)
     from .longitudinal import (LIDAR_FORWARD, ClosedPath, bearing_lookahead,
@@ -40,6 +41,7 @@ except ImportError:
     from mpc_controller import MPCController    # standalone `python3 lap_sim.py`
     from vehicle_model import F1TENTH_VEHICLE_PARAMETERS, SpeedLoop, VehicleModel
     import raceline
+    from speed_profile import sector_triples, slip_budget
     from latch_predictor import (LATCH_TIME_TOL, LatchPredictor, Prediction,
                                  plant_servo_rate, servo_kp)
     from longitudinal import (LIDAR_FORWARD, ClosedPath, bearing_lookahead,
@@ -74,14 +76,21 @@ class DriverConfig:
     v_max: float = 10.0             # [m/s] caps the profile and emergency bound; should not bind
     # Speed profile (speed_profile.py). `a_lat_max` is a slip budget, not a grip
     # limit: the plant's tyres are linear, so rear slip is a_y / 56.1 rad.
-    # [m/s^2] Cornering budget: ~5 deg of rear slip. Step 4 gate: 10 harness laps,
-    # 0 collisions at stale 9 and 14, best 17.93 s.
-    a_lat_max: float = 5.0
+    # [m/s^2] Cornering budget: ~10 deg of rear slip, held to 8 in `sector_scale`.
+    # Step 5: 0 collisions in 18 harness runs (stale 5/9/14), best 14.07-14.12 s.
+    a_lat_max: float = 10.0
     lock_margin: float = 0.95       # fraction of the steering lock the profile may use
     a_accel_max: float = 9.51       # [m/s^2] acceleration the profile plans (plant: 9.51)
     # [m/s^2] Braking the profile plans, and the most the conditioner passes on
     # from the MPC (plant: 9.51). The profile and emergency caps may brake harder.
     a_brake_max: float = 6.0
+    # Where the slip budget is lowered: flat (s_start [m], s_end [m], scale) triples,
+    # s the arc length from the reference's first waypoint, scale in (0, 1].
+    # Flat because ROS parameters are flat lists (speed_profile.sector_triples);
+    # never empty, or rclpy types it as a byte array: (0, 1, 1) turns it off.
+    # Step 5: the sectors where a uniform budget of 9-10 collided (s~5, the
+    # hairpin approach, the lock-bound right). Off the raceline, see _slip_budget_for.
+    sector_scale: tuple[float, ...] = (2.0, 8.5, 0.8, 29.0, 37.0, 0.8, 38.0, 43.5, 0.8)
     # [m/s^2] Braking the emergency cap assumes, and the rate a coast sheds speed.
     a_emergency: float = 7.0
     steer_limit: float = 0.4189     # [rad] the real lock, VehicleParameters.s_max
@@ -101,6 +110,11 @@ class DriverConfig:
     # published commands over the dead time (latch_predictor.py); False plans
     # from the measured, dead-time-old state.
     predict_latch: bool = True
+
+    def __post_init__(self):
+        # Here, not only in driver_params.validate(): a bad list raised later, inside
+        # the reference loader, would quietly drop the car to the reactive controller.
+        sector_triples(self.sector_scale)
 
 
 class DriveCommand(NamedTuple):
@@ -593,9 +607,12 @@ class DriverCore:
             self.log.info(
                 f'Loaded {len(centerline_data)} centerline points from {centerline_path}')
 
-            path = centerline_data[:, :2]
+            centerline_xy = centerline_data[:, :2]
+            path = centerline_xy
             if self.cfg.reference == 'raceline':
-                path = self._raceline_reference(centerline_path, path)
+                path = self._raceline_reference(centerline_path, centerline_xy)
+            on_raceline = path is not centerline_xy
+            a_lat_max, sectors = self._slip_budget_for(path, on_raceline=on_raceline)
 
             # Curvature-limited speeds, not a flat 3 m/s. The track is ~0.5 m
             # wide and the centerline peaks well above a curvature that 3 m/s
@@ -603,14 +620,37 @@ class DriverCore:
             # outside wall at the first real corner.
             speeds = self.mpc_controller.speed_profile(
                 path=path, v_max=self.v_max,
-                a_lat_max=self.cfg.a_lat_max, lock_margin=self.cfg.lock_margin,
-                a_accel_max=self.cfg.a_accel_max, a_brake_max=self.cfg.a_brake_max)
+                a_lat_max=a_lat_max, lock_margin=self.cfg.lock_margin,
+                a_accel_max=self.cfg.a_accel_max, a_brake_max=self.cfg.a_brake_max,
+                sector_scale=sectors)
             self.log.info(f'Speed profile: {speeds.min():.2f}-{speeds.max():.2f} m/s')
             self.set_reference(path, speeds)
 
         except Exception as e:
             self.log.error(f'Error loading reference path: {e}')
             self.reference_path = None
+
+    def _slip_budget_for(self, path, on_raceline):
+        """(a_lat_max, sectors) for the profile of `path`.
+
+        The sectors are arc positions on the raceline. On the centreline they would
+        land on the wrong corners, so there the whole lap gets the lowest budget
+        any sector allows instead.
+        """
+        sectors = sector_triples(self.cfg.sector_scale)
+        if not sectors:
+            return self.cfg.a_lat_max, ()
+        if not on_raceline:
+            a_lat = self.cfg.a_lat_max * min(scale for _, _, scale in sectors)
+            self.log.warn(f'sector_scale is tuned to the raceline; on the centreline the '
+                          f'slip budget is a uniform {a_lat:.2f} m/s^2')
+            return a_lat, ()
+        for sector in sectors:
+            lowered = int(np.count_nonzero(slip_budget(path, 1.0, [sector]) < 1.0))
+            if lowered == 0:
+                self.log.warn(f'sector_scale {sector} lowers no waypoint of the '
+                              f'{len(path)}-point raceline')
+        return self.cfg.a_lat_max, sectors
 
     def set_reference(self, path: np.ndarray, speeds: np.ndarray) -> None:
         """Track `path` at `speeds`: the MPC's reference, and the speed caps' lookup.

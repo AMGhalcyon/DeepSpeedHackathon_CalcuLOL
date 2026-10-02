@@ -232,6 +232,34 @@ class TestDriverCoreReference(unittest.TestCase):
         self.assertIn('raceline', log.text('info').lower())
         self.assertEqual(len(core.mpc_controller.reference_speeds), len(core.reference_path))
 
+    def test_sector_scale_slows_the_profile_only_inside_its_sector(self):
+        import speed_profile as sp
+        base, _ = self._core(a_lat_max=8.0)
+        backed_off, _ = self._core(a_lat_max=8.0, sector_scale=(30.0, 36.0, 0.5))
+        path = base.reference_path
+        s = np.concatenate([[0.0], np.cumsum(sp.segment_lengths(path, True)[:-1])])
+        corner = (s >= 32.0) & (s < 35.0)
+        far = (s >= 55.0) & (s < 70.0)
+        self.assertTrue(np.all(backed_off.reference_speeds[corner]
+                               < base.reference_speeds[corner] - 0.3))
+        np.testing.assert_allclose(backed_off.reference_speeds[far],
+                                   base.reference_speeds[far])
+
+    def test_on_the_centreline_the_sectors_become_their_lowest_uniform_budget(self):
+        # Sectors are tuned to the raceline's arc axis; on the centreline they would
+        # land on the wrong corners, so the whole lap gets the most cautious budget.
+        import speed_profile as sp
+        core, log = self._core(reference='centerline', a_lat_max=10.0,
+                               sector_scale=(30.0, 36.0, 0.8, 38.0, 43.0, 0.5))
+        uniform = sp.speed_profile(core.reference_path, a_lat_max=5.0, lock_margin=0.95,
+                                   a_accel_max=9.51, a_brake_max=6.0, v_max=10.0)
+        np.testing.assert_allclose(core.reference_speeds, uniform)
+        self.assertIn('sector', log.text('warn'))
+
+    def test_a_sector_that_lowers_no_waypoint_is_warned_about(self):
+        _, log = self._core(a_lat_max=8.0, sector_scale=(500.0, 510.0, 0.5))
+        self.assertIn('500', log.text('warn'))
+
     def test_failed_build_falls_back_to_the_cached_csv(self):
         import driver_core
         original = rl.build_raceline

@@ -1,5 +1,7 @@
 """Tests for the Step 2 harness: timing model, lap counting and metrics."""
 
+import contextlib
+import io
 import os
 import sys
 import unittest
@@ -283,13 +285,46 @@ class EmptyRunTest(unittest.TestCase):
         self.assertEqual(result['sat_duty'], 0.0)
 
 
+class CollisionPositionTest(unittest.TestCase):
+    """Step 5 backs off per sector, so each collision is logged with its arc s."""
+
+    SQUARE = np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]])
+
+    def test_arc_is_measured_from_the_first_waypoint(self):
+        meter = lap_sim.LateralError(self.SQUARE)
+        self.assertAlmostEqual(meter.arc((5.0, 0.3)), 5.0, places=1)
+        self.assertAlmostEqual(meter.arc((10.4, 2.0)), 12.0, places=1)
+
+    def test_arc_on_the_closing_segment_runs_on_past_the_last_waypoint(self):
+        meter = lap_sim.LateralError(self.SQUARE)
+        self.assertAlmostEqual(meter.arc((-0.2, 5.0)), 35.0, places=1)
+
+    def test_a_collision_event_records_where_and_how_fast(self):
+        meter = lap_sim.LateralError(self.SQUARE)
+        event = lap_sim.collision_event(t=3.25, xy=(5.0, 0.2), speed=6.5, beta=-0.12,
+                                        lap=2, lateral=meter)
+        self.assertEqual(event['t'], 3.25)
+        self.assertEqual(event['lap'], 2)
+        self.assertAlmostEqual(event['s'], 5.0, places=1)
+        self.assertEqual(event['v'], 6.5)
+        self.assertEqual(event['beta'], 0.12)
+
+    def test_without_a_reference_the_arc_is_unknown(self):
+        event = lap_sim.collision_event(t=0.0, xy=(0.0, 0.0), speed=0.0, beta=0.0,
+                                        lap=0, lateral=None)
+        self.assertIsNone(event['s'])
+
+
 class ClosedLoopSmokeTest(unittest.TestCase):
     """A short run through the real DriverCore, plant, scanner and contact."""
 
     @classmethod
     def setUpClass(cls):
+        # The solve budget is wall-clock: under load it aborts different solves
+        # in each run, so lift it for the determinism comparison.
         cfg = lap_sim.HarnessConfig(laps=1, max_time=2.0, stale_steps=10,
-                                    fixed_solve_ms=35.0, quiet=True)
+                                    fixed_solve_ms=35.0, quiet=True,
+                                    mpc_overrides=(('solve_budget_ms', 1e6),))
         cls.result = lap_sim.run(cfg)
         cls.result_again = lap_sim.run(cfg)
 
@@ -305,10 +340,19 @@ class ClosedLoopSmokeTest(unittest.TestCase):
         for key in ('distance_m', 'sat_duty', 'cmd_slew_mean', 'collisions'):
             self.assertEqual(self.result[key], self.result_again[key], key)
 
+    def test_the_report_lists_each_collision(self):
+        r = dict(self.result)
+        r['collision_events'] = [{'t': 3.25, 'lap': 2, 's': 41.3, 'v': 6.5, 'beta': 0.12}]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            lap_sim.report(r)
+        self.assertIn('s=41.3', out.getvalue())
+
     def test_reports_every_gate_metric(self):
         for key in ('sat_duty', 'cmd_slew_mean', 'actual_slew_mean',
                     'track_err_mean', 'track_err_p95', 'collisions',
-                    'reversals_per_m', 'laps', 'lap_times'):
+                    'reversals_per_m', 'laps', 'lap_times', 'collision_events',
+                    'beta_peak'):
             self.assertIn(key, self.result)
 
 

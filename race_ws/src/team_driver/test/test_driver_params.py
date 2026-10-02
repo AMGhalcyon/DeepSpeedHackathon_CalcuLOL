@@ -68,11 +68,12 @@ class DeclarationTableTests(unittest.TestCase):
         # stop_margin, coast_steer_rate and accel_limit were
         # core-only: the node could not override them.
         cfg = driver_core.DriverConfig()
+        declared = driver_params.driver_config(driver_params.DEFAULTS)
         for field in dataclasses.fields(driver_core.DriverConfig):
             with self.subTest(field=field.name):
                 self.assertIn(field.name, driver_params.DEFAULTS)
-                self.assertEqual(driver_params.DEFAULTS[field.name],
-                                 getattr(cfg, field.name))
+                # Through driver_config(): a tuple field is declared as a ROS list.
+                self.assertEqual(getattr(declared, field.name), getattr(cfg, field.name))
 
     def test_mpc_defaults_are_what_the_harness_calls_the_judged_config(self):
         # lap_sim.JUDGED_MPC is "what the judge runs"; the node must agree.
@@ -180,6 +181,35 @@ class Step9TunedWeightsTests(unittest.TestCase):
                 self.assertEqual(params[name], value)
 
 
+STEP5_TUNED = {'a_lat_max': 10.0, 'a_brake_max': 6.0, 'lock_margin': 0.95,
+               'sector_scale': [2.0, 8.5, 0.8, 29.0, 37.0, 0.8, 38.0, 43.5, 0.8]}
+
+
+class Step5TunedProfileTests(unittest.TestCase):
+    """The Phase 2 Step 5 sweep (lap_sim, 10 laps, raceline margin 0.25).
+
+    Uniform budgets: a_lat_max 8 was the fastest clean one (14.85 s); 9 hit the
+    s~33 m hairpin entry every lap, 10+ also s~5 and s~41, 12+ s~14; any
+    a_brake_max 9.5 made it worse (trail-braking yaw). So the budget is 10, held
+    to 8 (scale 0.8) in the three sectors that collided: s 2-8.5 m, the hairpin
+    and its approach 29-37 m, and the lock-bound right 38-43.5 m. 0 collisions
+    in 18 runs: stale 5/9/14 x fixed solve 5/7/12 ms, and 8 measured-solve runs;
+    best 14.07-14.12 s, 10 laps 141.1-141.5 s. a12 with sectors was faster on
+    one setting but collided under measured timing.
+    """
+
+    def test_the_code_defaults_carry_the_tuned_profile(self):
+        for name, value in STEP5_TUNED.items():
+            with self.subTest(name=name):
+                self.assertEqual(driver_params.DEFAULTS[name], value)
+
+    def test_the_params_file_carries_the_tuned_profile(self):
+        params = _node_params()
+        for name, value in STEP5_TUNED.items():
+            with self.subTest(name=name):
+                self.assertEqual(params[name], value)
+
+
 class ValidateTests(unittest.TestCase):
 
     def test_the_defaults_pass(self):
@@ -198,6 +228,34 @@ class ValidateTests(unittest.TestCase):
         values = {**_defaults(), 'mpc.block_map': [0, 1, 2]}
         with self.assertRaisesRegex(ValueError, r'block_map.*prediction_horizon'):
             driver_params.validate(values)
+
+    def test_a_sector_scale_that_is_not_whole_sectors_is_refused(self):
+        values = {**_defaults(), 'sector_scale': [29.0, 37.0]}
+        with self.assertRaisesRegex(ValueError, r'sector'):
+            driver_params.validate(values)
+
+    def test_a_sector_scale_above_one_is_refused(self):
+        values = {**_defaults(), 'sector_scale': [29.0, 37.0, 1.5]}
+        with self.assertRaisesRegex(ValueError, r'sector'):
+            driver_params.validate(values)
+
+    def test_list_defaults_are_non_empty_so_ros_can_type_them(self):
+        # rclpy types an empty list as a byte array, and the node would then
+        # refuse the file's list of doubles at startup.
+        for name, value in _defaults().items():
+            if isinstance(value, list):
+                with self.subTest(name=name):
+                    self.assertTrue(value)
+
+    def test_a_bad_sector_scale_is_refused_by_the_config_itself(self):
+        # Not only by validate(): a DriverCore built without it must not quietly
+        # fall back to the reactive controller.
+        with self.assertRaisesRegex(ValueError, r'sector'):
+            driver_core.DriverConfig(sector_scale=(29.0, 37.0))
+
+    def test_sector_scale_reaches_the_driver_config_as_a_tuple(self):
+        cfg = driver_params.driver_config({**_defaults(), 'sector_scale': [29.0, 37.0, 0.8]})
+        self.assertEqual(cfg.sector_scale, (29.0, 37.0, 0.8))
 
     def test_a_longer_horizon_without_a_longer_block_map_is_refused(self):
         values = {**_defaults(), 'mpc.prediction_horizon': 10}

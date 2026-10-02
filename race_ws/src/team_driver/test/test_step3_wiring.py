@@ -168,6 +168,18 @@ class HarnessFlagsTest(unittest.TestCase):
         dc = lap_sim.driver_config(cfg)
         self.assertEqual((dc.v_max, dc.reference), (8.0, 'raceline'))
 
+    def test_sector_scale_override_is_a_flat_list_of_sectors(self):
+        cfg = lap_sim.parse_config(['--driver', 'sector_scale=29,37,0.8,38,43.5,0.5'])
+        self.assertEqual(cfg.driver_overrides,
+                         (('sector_scale', (29.0, 37.0, 0.8, 38.0, 43.5, 0.5)),))
+        self.assertEqual(lap_sim.driver_config(cfg).sector_scale,
+                         (29.0, 37.0, 0.8, 38.0, 43.5, 0.5))
+
+    def test_a_malformed_sector_scale_is_rejected(self):
+        self.assertRejected(['--driver', 'sector_scale=29,37'])
+        self.assertRejected(['--driver', 'sector_scale=29,37,1.5'])
+        self.assertRejected(['--driver', 'sector_scale=29,37,fast'])
+
     def test_an_unknown_driver_field_is_rejected(self):
         self.assertRejected(['--driver', 'warp_drive=1'])
 

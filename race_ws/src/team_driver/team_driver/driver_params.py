@@ -29,9 +29,11 @@ if _current_dir not in sys.path:
     sys.path.insert(0, _current_dir)
 try:
     from .driver_core import DriverConfig, REFERENCES   # ROS / package import
+    from .speed_profile import sector_triples
     from .vehicle_model import MODEL_TYPES, ServoModel, VehicleModel
 except ImportError:
     from driver_core import DriverConfig, REFERENCES    # standalone / tests
+    from speed_profile import sector_triples
     from vehicle_model import MODEL_TYPES, ServoModel, VehicleModel
 
 PARAMS_SOURCE_DEFAULT = 'CODE_DEFAULTS'
@@ -61,7 +63,9 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
     ParamSpec('scan_topic', '/scan'),
     ParamSpec('odom_topic', '/ego_racecar/odom'),
     ParamSpec('drive_topic', '/drive'),
-    *(ParamSpec(f.name, f.default) for f in fields(DriverConfig)),
+    # A tuple field is a ROS list; driver_config() turns it back into a tuple.
+    *(ParamSpec(f.name, list(f.default) if isinstance(f.default, tuple) else f.default)
+      for f in fields(DriverConfig)),
     ParamSpec('control_period', 0.025),             # [s] must equal mpc.dt
     # The MPC's prediction model: 'KS' (kinematic, beta pinned at 0) or 'ST'
     # (the judged dynamic single track; adds the yaw rate as a state).
@@ -146,6 +150,7 @@ def validate(values: Mapping[str, Any]) -> None:
     if values['crawl_speed'] > values['v_max']:
         raise ValueError(f"crawl_speed {values['crawl_speed']} must not exceed "
                          f"v_max {values['v_max']}")
+    sector_triples(values['sector_scale'])   # raises ValueError naming the sector
 
 
 def _validate_schedule(schedule: list, horizon: int, period: float) -> None:
@@ -172,7 +177,8 @@ def echo_lines(values: Mapping[str, Any]) -> list[str]:
 
 def driver_config(values: Mapping[str, Any]) -> DriverConfig:
     """The control path's configuration, from resolved values."""
-    return DriverConfig(**{f.name: values[f.name] for f in fields(DriverConfig)})
+    return DriverConfig(**{f.name: tuple(values[f.name]) if isinstance(f.default, tuple)
+                           else values[f.name] for f in fields(DriverConfig)})
 
 
 def servo_model(values: Mapping[str, Any]) -> ServoModel:

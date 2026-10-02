@@ -24,6 +24,7 @@ Every plant constant comes from `VehicleParameters`; none is a tunable.
 
 import os
 import sys
+from collections.abc import Sequence
 from typing import Optional
 
 import numpy as np
@@ -132,10 +133,53 @@ def _accel_pass(v: np.ndarray, ds: np.ndarray, a_accel_max: float, closed: bool)
         v[j] = min(v[j], reach)
 
 
+def _check_sector(s_start: float, s_end: float, scale: float) -> None:
+    if not (np.isfinite(s_start) and np.isfinite(s_end) and 0.0 < scale <= 1.0):
+        raise ValueError(f'sector ({s_start}, {s_end}, {scale}): bounds must be '
+                         'finite and the scale in (0, 1]')
+
+
+def sector_triples(flat: Sequence[float]) -> tuple[tuple[float, float, float], ...]:
+    """A flat parameter list [s_start, s_end, scale, ...] as validated sectors.
+
+    ROS parameters are flat lists of doubles, so the node stores sectors that way.
+    """
+    if len(flat) % 3:
+        raise ValueError(f'sector_scale has {len(flat)} numbers; it needs whole '
+                         '(s_start, s_end, scale) sectors')
+    sectors = tuple(tuple(float(x) for x in flat[i:i + 3]) for i in range(0, len(flat), 3))
+    for sector in sectors:
+        _check_sector(*sector)
+    return sectors
+
+
+def slip_budget(path: np.ndarray, a_lat_max: float,
+                sectors: Sequence[Sequence[float]] = (), closed: bool = True) -> np.ndarray:
+    """[m/s^2] The slip budget per waypoint: `a_lat_max`, lowered in sectors.
+
+    Each sector is (s_start, s_end, scale): waypoints whose arc length from
+    waypoint 0 lies in [s_start, s_end) get `scale * a_lat_max`. A sector with
+    s_start > s_end wraps through the start line. Where sectors overlap, the
+    lower scale wins. A scale outside (0, 1] is refused: sectors only back off.
+    """
+    pts = np.asarray(path, dtype=np.float64)[:, :2]
+    scale = np.ones(len(pts))
+    if len(sectors):
+        # Open: n-1 segments, so the last point's arc is the whole length.
+        s = np.concatenate([[0.0], np.cumsum(segment_lengths(pts, closed))])[:len(pts)]
+        for s_start, s_end, c in sectors:
+            _check_sector(s_start, s_end, c)
+            inside = ((s >= s_start) & (s < s_end) if s_start <= s_end
+                      else (s >= s_start) | (s < s_end))
+            scale = np.where(inside, np.minimum(scale, c), scale)
+    return float(a_lat_max) * scale
+
+
 def speed_profile(path: np.ndarray, *, a_lat_max: float, lock_margin: float,
                   a_accel_max: float, a_brake_max: float, v_max: float,
                   kappa: Optional[np.ndarray] = None, closed: bool = True,
-                  v_start: float = 0.0) -> np.ndarray:
+                  v_start: float = 0.0,
+                  sector_scale: Sequence[Sequence[float]] = ()) -> np.ndarray:
     """Speed per waypoint, shape (N,).
 
     Args:
@@ -148,6 +192,8 @@ def speed_profile(path: np.ndarray, *, a_lat_max: float, lock_margin: float,
         kappa: curvature per point; computed from `path` when omitted.
         closed: a lap (wrapped passes) rather than a one-way path.
         v_start: speed at point 0 of an open path (a standing start).
+        sector_scale: (s_start, s_end, scale) sectors that lower `a_lat_max`
+            (see `slip_budget`); empty keeps it uniform.
     """
     pts = np.asarray(path, dtype=np.float64)[:, :2]
     n = len(pts)
@@ -156,7 +202,8 @@ def speed_profile(path: np.ndarray, *, a_lat_max: float, lock_margin: float,
     k = closed_curvature(pts, closed=closed) if kappa is None else np.asarray(kappa, float)
     k = np.maximum(np.abs(k), KAPPA_FLOOR)
 
-    v = np.minimum(np.sqrt(a_lat_max / k), lock_speed(k, lock_margin))
+    budget = slip_budget(pts, a_lat_max, sector_scale, closed)
+    v = np.minimum(np.sqrt(budget / k), lock_speed(k, lock_margin))
     v = np.minimum(v, v_max)
     if not closed:
         v[0] = min(v[0], v_start)

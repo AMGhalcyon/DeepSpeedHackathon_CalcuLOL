@@ -81,6 +81,76 @@ class TestCornering(unittest.TestCase):
         self.assertAlmostEqual(float(v.max()), 6.0, places=6)
 
 
+class TestSectorScale(unittest.TestCase):
+    """Step 5: back off the slip budget only where the car collided."""
+
+    RADIUS = 3.0
+
+    def setUp(self):
+        self.path = _circle(self.RADIUS)
+        self.s = np.concatenate([[0.0], np.cumsum(_ds(self.path)[:-1])])
+        self.lap = float(np.sum(_ds(self.path)))
+
+    def test_no_sectors_is_the_global_budget(self):
+        np.testing.assert_allclose(sp.slip_budget(self.path, 5.0), 5.0)
+
+    def test_a_sector_scales_the_budget_by_arc_position(self):
+        budget = sp.slip_budget(self.path, 10.0, [(2.0, 5.0, 0.5)])
+        inside = (self.s >= 2.0) & (self.s < 5.0)
+        np.testing.assert_allclose(budget[inside], 5.0)
+        np.testing.assert_allclose(budget[~inside], 10.0)
+
+    def test_a_sector_past_the_end_wraps_through_the_start(self):
+        budget = sp.slip_budget(self.path, 10.0, [(self.lap - 1.0, 1.0, 0.6)])
+        inside = (self.s >= self.lap - 1.0) | (self.s < 1.0)
+        np.testing.assert_allclose(budget[inside], 6.0)
+        np.testing.assert_allclose(budget[~inside], 10.0)
+
+    def test_overlapping_sectors_take_the_lower_scale(self):
+        budget = sp.slip_budget(self.path, 10.0, [(2.0, 6.0, 0.8), (4.0, 8.0, 0.5)])
+        both = (self.s >= 4.0) & (self.s < 6.0)
+        np.testing.assert_allclose(budget[both], 5.0)
+
+    def test_a_scale_outside_0_to_1_is_refused(self):
+        for scale in (0.0, -0.5, 1.5, float('nan')):
+            with self.subTest(scale=scale), self.assertRaises(ValueError):
+                sp.slip_budget(self.path, 10.0, [(2.0, 5.0, scale)])
+
+    def test_a_non_finite_bound_is_refused(self):
+        with self.assertRaises(ValueError):
+            sp.slip_budget(self.path, 10.0, [(float('inf'), 5.0, 0.5)])
+
+    def test_an_open_path_takes_sectors_too(self):
+        n = 200
+        path = np.column_stack([np.linspace(0.0, 19.9, n), np.zeros(n)])
+        budget = sp.slip_budget(path, 10.0, [(5.0, 10.0, 0.5)], closed=False)
+        np.testing.assert_allclose(budget[(path[:, 0] >= 5.05) & (path[:, 0] < 9.95)], 5.0)
+        np.testing.assert_allclose(budget[path[:, 0] > 10.05], 10.0)
+
+    def test_a_flat_parameter_list_groups_into_sectors(self):
+        self.assertEqual(sp.sector_triples([29.0, 37.0, 0.8, 38.0, 43.5, 0.5]),
+                         ((29.0, 37.0, 0.8), (38.0, 43.5, 0.5)))
+        self.assertEqual(sp.sector_triples([]), ())
+
+    def test_a_flat_list_that_is_not_whole_sectors_is_refused(self):
+        with self.assertRaises(ValueError):
+            sp.sector_triples([29.0, 37.0])
+
+    def test_a_flat_list_with_a_bad_scale_is_refused(self):
+        with self.assertRaises(ValueError):
+            sp.sector_triples([29.0, 37.0, 2.0])
+
+    def test_the_profile_holds_the_scaled_budget_inside_the_sector(self):
+        a_lat = 6.0
+        v = sp.speed_profile(self.path, **{**SPEC, 'a_lat_max': a_lat},
+                             sector_scale=[(5.0, 12.0, 0.5)])
+        # The middle of the sector, clear of its braking and acceleration zones.
+        middle = (self.s >= 7.0) & (self.s < 10.0)
+        np.testing.assert_allclose(v[middle], math.sqrt(0.5 * a_lat * self.RADIUS), rtol=0.01)
+        far = (self.s >= 15.0) & (self.s < 18.0)
+        np.testing.assert_allclose(v[far], math.sqrt(a_lat * self.RADIUS), rtol=0.01)
+
+
 def _plant_params_array():
     from plant_sim import F1TENTH_VEHICLE_PARAMETERS
     return F1TENTH_VEHICLE_PARAMETERS.to_array()

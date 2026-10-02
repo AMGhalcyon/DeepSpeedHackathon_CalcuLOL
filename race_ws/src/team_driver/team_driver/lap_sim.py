@@ -49,6 +49,7 @@ import plant_sim  # noqa: E402
 import scan_sim  # noqa: E402
 from driver_core import REFERENCES, DriverConfig, DriverCore  # noqa: E402
 from mpc_controller import MPCController  # noqa: E402
+from speed_profile import sector_triples  # noqa: E402
 from vehicle_model import MODEL_TYPES, VehicleModel  # noqa: E402
 
 PHYSICS_DT = 0.01               # s, gym_bridge.py sim_timestep
@@ -173,6 +174,14 @@ def parse_driver_override(text):
         if key == 'reference' and raw not in REFERENCES:
             raise argparse.ArgumentTypeError(f'reference must be one of {REFERENCES}')
         return key, raw
+    if isinstance(default, tuple):
+        # sector_scale: `s_start,s_end,scale,...`, the node's flat list.
+        try:
+            flat = tuple(float(part) for part in raw.split(','))
+            sector_triples(flat)
+        except ValueError as err:
+            raise argparse.ArgumentTypeError(f'{key}: {err}') from None
+        return key, flat
     try:
         value = float(raw)
     except ValueError:
@@ -200,6 +209,7 @@ class LateralError:
     included, and the nearest sample stands for the nearest point: high by at
     most half a spacing, and only for a point almost on the line. `values`
     (one per waypoint, e.g. the speed profile) are interpolated the same way.
+    `arc` is the arc length there, from the first waypoint, along the line.
     """
 
     def __init__(self, path, spacing=LATERAL_ERROR_SPACING, values=None):
@@ -207,15 +217,24 @@ class LateralError:
         ends = np.roll(p, -1, axis=0)
         v = None if values is None else np.asarray(values, dtype=np.float64)
         v_ends = None if v is None else np.roll(v, -1)
-        samples, sample_values = [], []
+        samples, sample_values, sample_arcs = [], [], []
+        s0 = 0.0
         for i, (a, b) in enumerate(zip(p, ends, strict=True)):
-            count = max(1, int(math.ceil(math.hypot(*(b - a)) / spacing)))
+            length = math.hypot(*(b - a))
+            count = max(1, int(math.ceil(length / spacing)))
             f = np.arange(count) / count
             samples.append(a + np.outer(f, b - a))
+            sample_arcs.append(s0 + f * length)
+            s0 += length
             if v is not None:
                 sample_values.append(v[i] + f * (v_ends[i] - v[i]))
         self._tree = cKDTree(np.vstack(samples))
+        self._arcs = np.concatenate(sample_arcs)
         self._values = np.concatenate(sample_values) if v is not None else None
+
+    def arc(self, xy):
+        """[m] Arc length of the nearest point, from the first waypoint."""
+        return float(self._arcs[self._tree.query(np.asarray(xy[:2], dtype=np.float64))[1]])
 
     def distance(self, xy):
         return float(self._tree.query(np.asarray(xy[:2], dtype=np.float64))[0])
@@ -414,6 +433,14 @@ class _Log:
         self.lateral_err = []  # [m] per racing-lap physics step, base_link to the reference
         self.overshoot = []    # [m/s] per racing-lap physics step, plant speed - profile
         self.beta_peak = 0.0   # [rad] the largest |sideslip| the plant reached
+        self.collisions = []   # collision_event per scored collision
+
+
+def collision_event(*, t, xy, speed, beta, lap, lateral):
+    """Where and how a scored collision happened; `s` is None without a reference."""
+    return {'t': float(t), 'lap': int(lap),
+            's': None if lateral is None else lateral.arc(xy),
+            'v': float(speed), 'beta': abs(float(beta))}
 
 
 def _stat(fn, values):
@@ -455,6 +482,7 @@ def _summarise(cfg, log, plant, counter, line, wall_s, contact, conditioning,
         'distance_m': log.distance,
         'mean_speed': float(np.mean(log.speed)) if log.speed else 0.0,
         'collisions': counter.events,
+        'collision_events': list(log.collisions),
         'contact_steps': counter.steps_in_contact,
         'penalty_s': counter.penalty,
         'disqualified': counter.disqualified,
@@ -508,13 +536,18 @@ def _advance(steps, plant, contact, counter, line, ring, log, prev_xy, cfg):
     """
     for _ in range(steps):
         plant.step()
-        counter.update(plant.time, contact.resolve(plant.state))
+        scored = counter.update(plant.time, contact.resolve(plant.state))
         log.saturated.append(plant.is_rate_saturated)
         log.delta.append(float(plant.state[plant_sim.DELTA]))
         log.track_err.append(abs(plant.steer_cmd - log.delta[-1]))
         log.speed.append(float(plant.state[plant_sim.V]))
-        log.beta_peak = max(log.beta_peak, abs(float(plant.state[plant_sim.BETA])))
+        beta = float(plant.state[plant_sim.BETA])
+        log.beta_peak = max(log.beta_peak, abs(beta))
         xy = plant.base_link_pose[:2]
+        if scored:
+            log.collisions.append(collision_event(t=plant.time, xy=xy, speed=log.speed[-1],
+                                                  beta=beta, lap=line.laps,
+                                                  lateral=log.lateral))
         # Racing laps only: the spawn sits on the centreline, so the out-lap
         # measures joining the reference, not holding it.
         if log.lateral is not None and line.crossings:
@@ -650,6 +683,10 @@ def report(r):
     print(f"  distance, speed   {r['distance_m']:.1f} m, mean {r['mean_speed']:.2f} m/s")
     print(f"  collisions        {r['collisions']} ({per10:.1f} per 10 laps; "
           f"{r['contact_steps']} contact steps){'  DQ' if r['disqualified'] else ''}")
+    for e in r.get('collision_events', []):
+        where = '-' if e['s'] is None else f"{e['s']:.1f}"
+        print(f"    t={e['t']:.2f} s  lap {e['lap']}  s={where} m  v={e['v']:.2f} m/s  "
+              f"|beta|={e['beta']:.3f} rad")
     print(f"  rate-sat duty     {r['sat_duty']:.1%}  (gate <= {MAX_SAT_DUTY:.0%})")
     print(f"  cmd slew          mean {r['cmd_slew_mean']:.4f}, max {r['cmd_slew_max']:.4f} "
           f"rad/cmd  (old gate < {MAX_MEAN_CMD_SLEW})")
