@@ -129,6 +129,9 @@ FRONT_HALF_ANGLE = 0.2          # [rad] the sector the braking-distance cap look
 # The near end of that sector, not its mean: one long beam down a gap must not
 # lift the cap.
 FRONT_PERCENTILE = 10
+# [rad] Largest odometry sideslip handed to the ST model (its state bound,
+# VehicleModel.get_state_bounds); beyond it the car is reversing or spinning.
+MPC_BETA_LIMIT = 0.5
 
 
 class DtTracker:
@@ -347,7 +350,7 @@ class DriverCore:
         self.yaw = 0.0            # [rad]
         self.speed = 0.0          # [m/s]
         # Sideslip and yaw rate arrive free on /ego_racecar/odom. Both leash the
-        # steering estimate; the MPC itself still assumes beta = 0.
+        # steering estimate, and the ST model starts its predictions from them.
         self.beta = 0.0           # [rad]
         self.yaw_rate = 0.0       # [rad/s]
         self.t_odom = None        # [s] stamp the pose was measured at
@@ -699,6 +702,26 @@ class DriverCore:
         angles = self._scan_angle_min + np.arange(len(ranges)) * self._scan_angle_inc
         return ranges, angles
 
+    def _mpc_state(self):
+        """The MPC's initial state, at the length its model takes.
+
+        [x, y, yaw, v, beta, wheel], plus the yaw rate for the ST model.
+        Odometry carries the real sideslip and yaw rate at the CoG, which is
+        what the ST model's beta and r are. The KS model gets beta = 0: it
+        holds beta constant across the horizon, so the measured value would
+        bend every prediction rather than inform it.
+        """
+        dynamic = getattr(self.mpc_controller, 'state_dim', 6) == 7
+        # Odometry's beta is atan2(vy, vx) beside a speed that is a magnitude,
+        # so reversing reads as beta ~ pi. Past the model's slip bound it is
+        # that, or a spin, not a slip the tyre model describes.
+        beta = self.beta if dynamic and abs(self.beta) <= MPC_BETA_LIMIT else 0.0
+        state = [self.position[0], self.position[1], self.yaw, self.speed,
+                 beta, self.steering.delta_hat]
+        if dynamic:
+            state.append(self.yaw_rate)
+        return np.array(state)
+
     # ==================================================================
     # THIS IS THE PART YOU WRITE.
     # ==================================================================
@@ -768,16 +791,7 @@ class DriverCore:
         #    bounded by `_speed_cap`, a braking-distance bound with no steps.
         if self.position is not None and self.reference_path is not None:
             try:
-                # Current state: [x, y, yaw, velocity, beta_sideslip, wheel]
-                # Beta (sideslip) is assumed 0 for simplified model
-                current_state = np.array([
-                    self.position[0],  # x
-                    self.position[1],  # y
-                    self.yaw,          # yaw
-                    self.speed,        # velocity
-                    0.0,               # beta_sideslip (assumed zero)
-                    self.steering.delta_hat,  # wheel angle, estimated
-                ])
+                current_state = self._mpc_state()
 
                 mpc_control, diagnostics = self.mpc_controller.get_control(
                     current_state)

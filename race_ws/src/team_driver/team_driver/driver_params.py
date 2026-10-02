@@ -16,6 +16,7 @@ They are fixed by the judged simulator and read from `VehicleParameters`;
 exposing them would only let the model drift from the plant it predicts.
 """
 
+import math
 import os
 import sys
 from collections.abc import Callable, Mapping
@@ -28,14 +29,15 @@ if _current_dir not in sys.path:
     sys.path.insert(0, _current_dir)
 try:
     from .driver_core import DriverConfig, REFERENCES   # ROS / package import
-    from .vehicle_model import ServoModel
+    from .vehicle_model import MODEL_TYPES, ServoModel, VehicleModel
 except ImportError:
     from driver_core import DriverConfig, REFERENCES    # standalone / tests
-    from vehicle_model import ServoModel
+    from vehicle_model import MODEL_TYPES, ServoModel, VehicleModel
 
 PARAMS_SOURCE_DEFAULT = 'CODE_DEFAULTS'
 CONTROL_PERIOD_TOLERANCE = 1e-9   # [s] the same physical quantity, set in two places
 MPC_PREFIX = 'mpc.'
+JUDGED_HORIZON = 8
 
 
 @dataclass(frozen=True)
@@ -58,13 +60,21 @@ PARAM_SPECS: tuple[ParamSpec, ...] = (
     ParamSpec('drive_topic', '/drive'),
     *(ParamSpec(f.name, f.default) for f in fields(DriverConfig)),
     ParamSpec('control_period', 0.025),             # [s] must equal mpc.dt
-    ParamSpec('mpc.prediction_horizon', 8),
+    # The MPC's prediction model: 'KS' (kinematic, beta pinned at 0) or 'ST'
+    # (the judged dynamic single track; adds the yaw rate as a state).
+    ParamSpec('vehicle.model', 'KS'),
+    ParamSpec('mpc.prediction_horizon', JUDGED_HORIZON),
     ParamSpec('mpc.control_horizon', 3),
     # Move blocking: the 8 prediction steps share 3 free moves (6 variables).
     ParamSpec('mpc.block_map', [0, 1, 1, 2, 2, 2, 2, 2]),
     ParamSpec('mpc.maxiter', 25),
     ParamSpec('mpc.solve_budget_ms', 15.0),
     ParamSpec('mpc.dt', 0.025),
+    # [s] Length of each prediction step; the first must be mpc.dt. Longer
+    # later steps buy lookahead with no more decision variables.
+    ParamSpec('mpc.dt_schedule', [0.025] * JUDGED_HORIZON),
+    # Seed the first steering move with the wheel angle the reference needs.
+    ParamSpec('mpc.feedforward', False),
     ParamSpec('mpc.q_pos', 2.0),
     ParamSpec('mpc.q_yaw', 2.0),
     ParamSpec('mpc.q_vel', 0.5),
@@ -122,6 +132,26 @@ def validate(values: Mapping[str, Any]) -> None:
         raise ValueError(
             f'mpc.block_map has {entries} entries but mpc.prediction_horizon is '
             f'{horizon}: it needs one entry per prediction step')
+    _validate_schedule(values['mpc.dt_schedule'], horizon, period)
+    if values['vehicle.model'] not in MODEL_TYPES:
+        raise ValueError(
+            f"vehicle.model {values['vehicle.model']!r} must be one of {MODEL_TYPES}")
+
+
+def _validate_schedule(schedule: list, horizon: int, period: float) -> None:
+    """One positive step per prediction step, the first the control period."""
+    if not isinstance(schedule, (list, tuple)):
+        raise ValueError(f'mpc.dt_schedule must be a list of step lengths, got {schedule!r}')
+    if len(schedule) != horizon:
+        raise ValueError(
+            f'mpc.dt_schedule has {len(schedule)} entries but mpc.prediction_horizon '
+            f'is {horizon}: it needs one entry per prediction step')
+    if not all(step > 0.0 and math.isfinite(step) for step in schedule):
+        raise ValueError(f'mpc.dt_schedule entries must be positive, got {schedule}')
+    if abs(schedule[0] - period) > CONTROL_PERIOD_TOLERANCE:
+        raise ValueError(
+            f'mpc.dt_schedule starts at {schedule[0]} but must start at the '
+            f'control_period {period}: each command is held for exactly one step')
 
 
 def echo_lines(values: Mapping[str, Any]) -> list[str]:
@@ -138,6 +168,11 @@ def driver_config(values: Mapping[str, Any]) -> DriverConfig:
 def servo_model(values: Mapping[str, Any]) -> ServoModel:
     """The steering-servo model the MPC predicts with."""
     return ServoModel(alpha=values['servo.alpha'], d_max_cal=values['servo.d_max'])
+
+
+def vehicle_model(values: Mapping[str, Any]) -> VehicleModel:
+    """The vehicle model the MPC predicts with: its dynamics and its servo."""
+    return VehicleModel(model_type=values['vehicle.model'], servo=servo_model(values))
 
 
 def mpc_kwargs(values: Mapping[str, Any]) -> dict[str, Any]:

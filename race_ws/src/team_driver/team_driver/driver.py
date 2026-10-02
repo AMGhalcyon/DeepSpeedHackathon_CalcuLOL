@@ -34,7 +34,6 @@ from visualization_msgs.msg import Marker, MarkerArray
 from . import driver_params
 from .driver_core import DriverCore, LatchClock
 from .mpc_controller import MPCController
-from .vehicle_model import VehicleModel
 
 DT_REPORT_PERIOD = 5.0   # [s] how often to log dt_measured statistics
 
@@ -78,7 +77,7 @@ class Driver(Node):
             Odometry, params['odom_topic'], self.odom_callback, sensor_qos)
 
         mpc_controller = MPCController(
-            vehicle_model=VehicleModel(servo=driver_params.servo_model(params)),
+            vehicle_model=driver_params.vehicle_model(params),
             **driver_params.mpc_kwargs(params))
 
         self.core = DriverCore(

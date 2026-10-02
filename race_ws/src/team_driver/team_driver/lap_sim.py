@@ -30,6 +30,7 @@ WHAT IS EXACT, WHAT IS NOT
 """
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -40,14 +41,15 @@ from dataclasses import asdict, dataclass
 from typing import Optional
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import plant_sim  # noqa: E402
 import scan_sim  # noqa: E402
-from driver_core import DriverConfig, DriverCore  # noqa: E402
+from driver_core import REFERENCES, DriverConfig, DriverCore  # noqa: E402
 from mpc_controller import MPCController  # noqa: E402
-from vehicle_model import VehicleModel  # noqa: E402
+from vehicle_model import MODEL_TYPES, VehicleModel  # noqa: E402
 
 PHYSICS_DT = 0.01               # s, gym_bridge.py sim_timestep
 # Scan and odom are both 9 physics steps old when the driver reads them: the
@@ -77,7 +79,12 @@ JUDGED_MPC = dict(prediction_horizon=8, control_horizon=3, dt=0.025,
                   q_pos=2.0, q_yaw=2.0, q_vel=0.5, r_steer=0.08, r_accel=0.01,
                   r_delta_steer=3.0, r_delta_accel=0.005,
                   block_map=[0, 1, 1, 2, 2, 2, 2, 2], maxiter=25,
-                  solve_budget_ms=15.0)
+                  solve_budget_ms=15.0, dt_schedule=[0.025] * 8, feedforward=False)
+# The node's `vehicle.model` (driver_params.py; test_step3_wiring.py holds them equal).
+JUDGED_MODEL = 'KS'
+# [m] Spacing of the resampled reference the lateral-error meter measures to;
+# the distance it reports is high by at most half of it.
+LATERAL_ERROR_SPACING = 0.01
 # What `--mpc KEY=VALUE` may override for one run (the Step 9 sweep). Horizon,
 # block map, dt and maxiter are structure, held by the node's startup checks.
 TUNABLE_MPC_KEYS = ('q_pos', 'q_yaw', 'q_vel', 'r_steer', 'r_accel',
@@ -119,6 +126,10 @@ class HarnessConfig:
     seed: Optional[int] = None  # plant noise RNG; inert unless noise is on
     quiet: bool = False
     mpc_overrides: tuple[tuple[str, float], ...] = ()  # over JUDGED_MPC, in order
+    model: str = JUDGED_MODEL
+    dt_schedule: Optional[tuple[float, ...]] = None    # None: JUDGED_MPC's
+    feedforward: bool = False
+    driver_overrides: tuple[tuple[str, object], ...] = ()  # over DriverConfig()
 
     @property
     def time_limit(self):
@@ -127,7 +138,75 @@ class HarnessConfig:
 
 def mpc_kwargs(cfg):
     """JUDGED_MPC with this run's overrides applied; JUDGED_MPC itself untouched."""
-    return {**JUDGED_MPC, **dict(cfg.mpc_overrides)}
+    kwargs = {**JUDGED_MPC, **dict(cfg.mpc_overrides)}
+    kwargs['block_map'] = list(kwargs['block_map'])
+    kwargs['dt_schedule'] = list(cfg.dt_schedule if cfg.dt_schedule is not None
+                                 else kwargs['dt_schedule'])
+    if cfg.feedforward:
+        kwargs['feedforward'] = True
+    return kwargs
+
+
+def driver_config(cfg):
+    """The driver's configuration for this run: DriverConfig() with the overrides."""
+    return dataclasses.replace(DriverConfig(), **dict(cfg.driver_overrides))
+
+
+_DRIVER_FIELDS = {f.name: f for f in dataclasses.fields(DriverConfig)}
+
+
+def parse_driver_override(text):
+    """`KEY=VALUE` -> (key, value) for a DriverConfig field, typed by its default."""
+    key, sep, raw = text.partition('=')
+    if not sep:
+        raise argparse.ArgumentTypeError(f'expected KEY=VALUE, got {text!r}')
+    if key not in _DRIVER_FIELDS:
+        raise argparse.ArgumentTypeError(
+            f'{key!r} is not a DriverConfig field; choose from {", ".join(_DRIVER_FIELDS)}')
+    default = _DRIVER_FIELDS[key].default
+    if isinstance(default, str):
+        if key == 'reference' and raw not in REFERENCES:
+            raise argparse.ArgumentTypeError(f'reference must be one of {REFERENCES}')
+        return key, raw
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'{key}: {raw!r} is not a number') from None
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f'{key}: {value} must be finite')
+    return key, value
+
+
+def parse_schedule(text):
+    """`0.025,0.025,0.05,...` -> a tuple of positive step lengths [s]."""
+    try:
+        steps = tuple(float(part) for part in text.split(','))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'not a list of numbers: {text!r}') from None
+    if not all(math.isfinite(s) and s > 0.0 for s in steps):
+        raise argparse.ArgumentTypeError(f'steps must be positive and finite: {text!r}')
+    return steps
+
+
+class LateralError:
+    """Distance from a point to a closed reference polyline.
+
+    The line is resampled every LATERAL_ERROR_SPACING, closing segment
+    included, and the nearest sample stands for the nearest point: high by at
+    most half a spacing, and only for a point almost on the line.
+    """
+
+    def __init__(self, path, spacing=LATERAL_ERROR_SPACING):
+        p = np.asarray(path, dtype=np.float64)[:, :2]
+        ends = np.roll(p, -1, axis=0)
+        samples = []
+        for a, b in zip(p, ends):
+            count = max(1, int(math.ceil(math.hypot(*(b - a)) / spacing)))
+            samples.append(a + np.outer(np.arange(count) / count, b - a))
+        self._tree = cKDTree(np.vstack(samples))
+
+    def distance(self, xy):
+        return float(self._tree.query(np.asarray(xy[:2], dtype=np.float64))[0])
 
 
 def parse_mpc_override(text):
@@ -314,6 +393,9 @@ class _Log:
         self.speed = []
         self.delta_est_err = []
         self.distance = 0.0
+        self.lateral = None    # LateralError against the driver's reference
+        self.lateral_err = []  # [m] per racing-lap physics step, base_link to the reference
+        self.beta_peak = 0.0   # [rad] the largest |sideslip| the plant reached
 
 
 def _stat(fn, values):
@@ -321,7 +403,17 @@ def _stat(fn, values):
     return float(fn(values)) if len(values) else 0.0
 
 
-def _summarise(cfg, log, plant, counter, line, wall_s, contact, conditioning):
+def _controller_stats(mpc):
+    """Solves and fallbacks of the MPC, from its own counters."""
+    solves = int(getattr(mpc, 'solve_count', 0))
+    fallbacks = (int(getattr(mpc, 'budget_exceeded_count', 0))
+                 + int(getattr(mpc, 'solver_failure_count', 0)))
+    return {'solves': solves, 'fallbacks': fallbacks,
+            'fallback_rate': fallbacks / solves if solves else 0.0}
+
+
+def _summarise(cfg, log, plant, counter, line, wall_s, contact, conditioning,
+               controller_stats=None):
     cmd = np.asarray(log.cmd_steer)
     cmd_speed = np.asarray(log.cmd_speed)
     delta = np.asarray(log.delta)
@@ -373,6 +465,15 @@ def _summarise(cfg, log, plant, counter, line, wall_s, contact, conditioning):
         'latency_steps_mean': _stat(np.mean, latencies),
         # Scan age plus the wait for the solve; the period is not dead time.
         'dead_time_ms_mean': (cfg.stale_steps + _stat(np.mean, latencies)) * PHYSICS_DT * 1e3,
+        'model': cfg.model,
+        # Chatter as a sign-reversal rate: fast legitimate steering through a
+        # slalom moves the wheel a lot per step but reverses no more often.
+        'reversals_per_s': reversals / plant.time if plant.time > 0 else 0.0,
+        'lateral_err_mean': _stat(np.mean, log.lateral_err),
+        'lateral_err_p95': _stat(lambda v: np.percentile(v, 95), log.lateral_err),
+        'lateral_err_max': _stat(np.max, log.lateral_err),
+        'beta_peak': log.beta_peak,
+        **(controller_stats or {'solves': 0, 'fallbacks': 0, 'fallback_rate': 0.0}),
     }
 
 
@@ -389,7 +490,12 @@ def _advance(steps, plant, contact, counter, line, ring, log, prev_xy, cfg):
         log.delta.append(float(plant.state[plant_sim.DELTA]))
         log.track_err.append(abs(plant.steer_cmd - log.delta[-1]))
         log.speed.append(float(plant.state[plant_sim.V]))
+        log.beta_peak = max(log.beta_peak, abs(float(plant.state[plant_sim.BETA])))
         xy = plant.base_link_pose[:2]
+        # Racing laps only: the spawn sits on the centreline, so the out-lap
+        # measures joining the reference, not holding it.
+        if log.lateral is not None and line.crossings:
+            log.lateral_err.append(log.lateral.distance(xy))
         log.distance += math.hypot(xy[0] - prev_xy[0], xy[1] - prev_xy[1])
         if line.update(prev_xy, xy, plant.time) and not cfg.quiet:
             print(f'  lap {line.laps}: {line.lap_times[-1]:.2f} s')
@@ -408,13 +514,17 @@ def run(cfg: HarnessConfig):
     plant = make_plant(cfg.plant, cfg.seed)
     plant.reset(SPAWN_POSE)
     lr = float(plant.params.lr)
-    core = DriverCore(cfg=DriverConfig(),
-                      mpc_controller=MPCController(vehicle_model=VehicleModel(), **mpc_kwargs(cfg)))
+    core = DriverCore(cfg=driver_config(cfg),
+                      mpc_controller=MPCController(
+                          vehicle_model=VehicleModel(model_type=cfg.model),
+                          **mpc_kwargs(cfg)))
 
     counter = scan_sim.CollisionCounter()
     line = FinishLine()
     ring = SnapshotRing(cfg.stale_steps, (plant.state.copy(), plant.time))
     log = _Log()
+    if core.reference_path is not None:
+        log.lateral = LateralError(core.reference_path)
     prev_xy = plant.base_link_pose[:2]
     tick = 0
     next_report = 5.0
@@ -462,7 +572,7 @@ def run(cfg: HarnessConfig):
                   f'sat={np.mean(log.saturated):.1%}')
 
     return _summarise(cfg, log, plant, counter, line, time.perf_counter() - wall0, contact,
-                      core.conditioning_stats())
+                      core.conditioning_stats(), _controller_stats(core.mpc_controller))
 
 
 def verdict(r):
@@ -520,7 +630,13 @@ def report(r):
           f"(gate <= {MAX_SLEW_BIND_RATE:.0%}); coast steps {r['coast_count']} (gate 0); "
           f"max speed step {r['cmd_speed_step_max']:.3f} m/s")
     print(f"  solve             mean {r['solve_ms_mean']:.1f}, p95 {r['solve_ms_p95']:.1f}, "
-          f"max {r['solve_ms_max']:.1f} ms")
+          f"max {r['solve_ms_max']:.1f} ms; fallbacks {r.get('fallbacks', 0)}/"
+          f"{r.get('solves', 0)} ({r.get('fallback_rate', 0.0):.2%})")
+    print(f"  model             {r.get('model', JUDGED_MODEL)}; peak |beta| "
+          f"{r.get('beta_peak', 0.0):.3f} rad; reversals {r.get('reversals_per_s', 0.0):.2f}/s")
+    print(f"  lateral error     mean {r.get('lateral_err_mean', 0.0):.3f}, p95 "
+          f"{r.get('lateral_err_p95', 0.0):.3f}, max {r.get('lateral_err_max', 0.0):.3f} m "
+          f"from the reference")
     print(f"  dead time         {r['dead_time_ms_mean']:.0f} ms mean "
           f"(solve wait {r['latency_steps_mean']:.1f} steps; period "
           f"{r['hold_steps_mean']:.1f} steps, max {r['hold_steps_max']})")
@@ -554,6 +670,18 @@ def _parser():
                     metavar='KEY=VALUE',
                     help='override one MPC weight for this run (repeatable): '
                          + ', '.join(TUNABLE_MPC_KEYS))
+    ap.add_argument('--model', choices=MODEL_TYPES, default=JUDGED_MODEL,
+                    help="the MPC's prediction model (the node's vehicle.model)")
+    ap.add_argument('--dt-schedule', type=parse_schedule, default=None,
+                    metavar='DT,DT,...',
+                    help='prediction step lengths, one per step, the first the '
+                         'control period (the node\'s mpc.dt_schedule)')
+    ap.add_argument('--feedforward', action='store_true',
+                    help='seed the first steering move from the reference curvature')
+    ap.add_argument('--driver', type=parse_driver_override, action='append', default=[],
+                    metavar='KEY=VALUE',
+                    help='override one DriverConfig field for this run (repeatable), '
+                         'e.g. reference=raceline, v_max=6, a_lat_max=5')
     ap.add_argument('--json', default=None, help='write the result dict here')
     return ap
 
@@ -564,7 +692,9 @@ def _config_from(args):
                         control_period=args.control_period,
                         fixed_solve_ms=args.fixed_solve_ms, solve_scale=args.solve_scale,
                         plant=args.plant, seed=args.seed, quiet=args.quiet,
-                        mpc_overrides=tuple(args.mpc))
+                        mpc_overrides=tuple(args.mpc), model=args.model,
+                        dt_schedule=args.dt_schedule, feedforward=args.feedforward,
+                        driver_overrides=tuple(args.driver))
 
 
 def parse_config(argv=None):

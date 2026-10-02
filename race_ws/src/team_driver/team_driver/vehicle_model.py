@@ -4,6 +4,7 @@
 Provides interface to F1TENTH vehicle dynamics for use in MPC prediction.
 """
 
+import cmath
 import math
 from dataclasses import dataclass
 import numpy as np
@@ -115,6 +116,129 @@ def vehicle_dynamics_ks_cog(state, u, params):
     return np.array([x_dot, y_dot, psi_dot, v_dot, beta_dot])
 
 
+MODEL_TYPES = ('KS', 'ST')
+GRAVITY = 9.81            # [m/s^2] as single_track.py has it
+# single_track.py:103 -- below this the gym switches to its kinematic branch,
+# where the tyre model's 1/v terms would blow up.
+ST_SWITCH_SPEED = 0.5     # [m/s]
+# |s^2 - det| below which the lateral block's eigenvalues count as repeated.
+_REPEATED_ROOT_TOL = 1e-9
+
+
+@dataclass(frozen=True)
+class _SingleTrackConstants:
+    """The terms of single_track.py's tyre model that do not depend on the state."""
+
+    mu: float
+    lf: float
+    lr: float
+    wheelbase: float
+    h: float
+    c_sf: float
+    c_sr: float
+    k_yaw: float           # mu m / (I (lf + lr)), the yaw equation's prefactor
+    understeer: float      # K = (1 / (mu g)) (1 / C_Sf - 1 / C_Sr), rad per m/s^2
+
+    @classmethod
+    def of(cls, p: 'VehicleParameters') -> '_SingleTrackConstants':
+        wheelbase = p.lf + p.lr
+        return cls(mu=p.mu, lf=p.lf, lr=p.lr, wheelbase=wheelbase, h=p.h,
+                   c_sf=p.C_Sf, c_sr=p.C_Sr, k_yaw=p.mu * p.m / (p.I * wheelbase),
+                   understeer=(1.0 / (p.mu * GRAVITY)) * (1.0 / p.C_Sf - 1.0 / p.C_Sr))
+
+    def lateral(self, v: float, a: float):
+        """single_track.py's beta and yaw-rate equations as x' = A x + b delta.
+
+        x = [beta, r]. The load transfer (glr, glf) makes A depend on the
+        acceleration as well as the speed; both are held over a step.
+        Returns (a11, a12, a21, a22, b1, b2).
+        """
+        cf = self.c_sf * (GRAVITY * self.lr - a * self.h)
+        cr = self.c_sr * (GRAVITY * self.lf + a * self.h)
+        mu_vl = self.mu / (v * self.wheelbase)
+        return (-mu_vl * (cr + cf),
+                mu_vl * (cr * self.lr - cf * self.lf) / v - 1.0,
+                self.k_yaw * (self.lr * cr - self.lf * cf),
+                -self.k_yaw * (self.lf * self.lf * cf + self.lr * self.lr * cr) / v,
+                mu_vl * cf,
+                self.k_yaw * self.lf * cf)
+
+    def kinematic_slip(self, delta: float) -> float:
+        """The gym's beta below the switch speed: the no-slip geometry."""
+        return math.atan(math.tan(delta) * self.lr / self.wheelbase)
+
+
+def vehicle_dynamics_st_rear(state, u, c: _SingleTrackConstants):
+    """single_track.py's model, at the rear axle, state [x, y, psi, v, beta, r].
+
+    The gym integrates the CoG. Odometry reports the rear axle (base_link),
+    and so does the MPC's reference, so the position rows here are the rear
+    axle's velocity: the CoG's, v (cos(psi + beta), sin(psi + beta)), plus
+    omega x (-lr) along the heading. In the body frame that is
+    (v cos beta, v sin beta - lr r): the rear axle slides sideways by exactly
+    the rear tyre's slip.
+    """
+    x, y, psi, v, beta, r = state
+    delta, a = u
+    if v < ST_SWITCH_SPEED:
+        # The gym's kinematic branch: no tyre slip, beta from the geometry.
+        beta = c.kinematic_slip(delta)
+        r = v * math.cos(beta) * math.tan(delta) / c.wheelbase
+        return np.array([v * math.cos(beta) * math.cos(psi),
+                         v * math.cos(beta) * math.sin(psi), r, a, 0.0, 0.0])
+    a11, a12, a21, a22, b1, b2 = c.lateral(v, a)
+    return np.array([v * math.cos(psi + beta) + c.lr * r * math.sin(psi),
+                     v * math.sin(psi + beta) - c.lr * r * math.cos(psi),
+                     r,
+                     a,
+                     a11 * beta + a12 * r + b1 * delta,
+                     a21 * beta + a22 * r + b2 * delta])
+
+
+def _phi1(lam: float, h: float) -> float:
+    """(e^{lam h} - 1) / lam, i.e. the integral of e^{lam t} over [0, h]."""
+    return h if lam == 0.0 else math.expm1(lam * h) / lam
+
+
+def _lateral_zoh(c: _SingleTrackConstants, v, a, beta, r, delta, h):
+    """Exact zero-order-hold step of [beta, r] with v, a and delta held over h.
+
+    The block is stiff at low speed (eigenvalues ~ -113/v and -52/v), so
+    explicit Euler diverges below ~2.5 m/s on a 25 ms step. It is linear for a
+    held speed, so step it exactly instead: x(h) = E x + G b delta, with
+    E = e^{A h} and G the integral of e^{A t} over [0, h]. For a 2x2 matrix
+    both are c0 I + c1 (A - s I), s = tr(A)/2, with scalar c0, c1 from the
+    eigenvalues s +/- q. G is built from (e^{lam h} - 1)/lam per eigenvalue,
+    not from A^{-1}: det(A) does reach 0 -- braking hard above ~12 m/s, where
+    load transfer makes the car oversteer and one eigenvalue crosses zero.
+    """
+    a11, a12, a21, a22, b1, b2 = c.lateral(v, a)
+    s = 0.5 * (a11 + a22)
+    disc = s * s - (a11 * a22 - a12 * a21)
+    if disc > _REPEATED_ROOT_TOL:
+        q = math.sqrt(disc)
+        e_hi, e_lo = math.exp((s + q) * h), math.exp((s - q) * h)
+        p_hi, p_lo = _phi1(s + q, h), _phi1(s - q, h)
+        e0, e1 = 0.5 * (e_hi + e_lo), 0.5 * (e_hi - e_lo) / q
+        g0, g1 = 0.5 * (p_hi + p_lo), 0.5 * (p_hi - p_lo) / q
+    elif disc < -_REPEATED_ROOT_TOL:
+        w = math.sqrt(-disc)
+        lam = complex(s, w)
+        e = cmath.exp(lam * h)
+        g = (e - 1.0) / lam            # |lam|^2 = det > s^2 > 0 here: no zero
+        e0, e1 = e.real, e.imag / w
+        g0, g1 = g.real, g.imag / w
+    else:
+        e0, e1 = math.exp(s * h), h * math.exp(s * h)
+        g0 = _phi1(s, h)
+        g1 = h * h / 2.0 if s == 0.0 else (h * math.exp(s * h) - g0) / s
+    f1, f2 = b1 * delta, b2 * delta
+    return ((e0 + e1 * (a11 - s)) * beta + e1 * a12 * r
+            + (g0 + g1 * (a11 - s)) * f1 + g1 * a12 * f2,
+            e1 * a21 * beta + (e0 + e1 * (a22 - s)) * r
+            + g1 * a21 * f1 + (g0 + g1 * (a22 - s)) * f2)
+
+
 class VehicleModel:
     """Vehicle model wrapper for MPC prediction."""
 
@@ -124,72 +248,175 @@ class VehicleModel:
 
         Args:
             params: Vehicle parameters (defaults to F1TENTH)
-            model_type: 'KS' for kinematic single track
+            model_type: 'KS' for kinematic single track, beta pinned at 0;
+                'ST' for the judged dynamic single track (linear tyres), which
+                adds the yaw rate as a seventh actuated state
             servo: Steering servo model for `actuated_step` (defaults to the
                 one calibrated against the judged plant)
         """
         self.params = params if params is not None else F1TENTH_VEHICLE_PARAMETERS
         self.model_type = model_type
         self.servo = servo if servo is not None else ServoModel()
+        self._st = _SingleTrackConstants.of(self.params)
 
         # State dimensions
         if model_type == 'KS':
             self.state_dim = 5  # [x, y, yaw, velocity, sideslip]
-            self.control_dim = 2  # [steering_angle, acceleration]
+            self.actuated_dim = 6  # + wheel angle
+        elif model_type == 'ST':
+            self.state_dim = 6  # [x, y, yaw, velocity, sideslip, yaw rate]
+            self.actuated_dim = 7  # [x, y, yaw, v, beta, delta, yaw rate]
         else:
-            raise ValueError(f"Unsupported model type: {model_type}")
+            raise ValueError(f"Unsupported model type: {model_type}; "
+                             f"choose from {MODEL_TYPES}")
+        self.control_dim = 2  # [steering_angle, acceleration]
 
     def dynamics_continuous(self, state: np.ndarray, control: np.ndarray) -> np.ndarray:
         """Continuous-time dynamics function.
 
         Args:
-            state: [x, y, yaw, v, beta]
+            state: KS [x, y, yaw, v, beta]; ST [x, y, yaw, v, beta, yaw_rate]
             control: [steering_angle, acceleration]
 
         Returns:
-            State derivative [x_dot, y_dot, yaw_dot, v_dot, beta_dot]
+            The state's derivative, in the same order
         """
         if self.model_type == 'KS':
             return vehicle_dynamics_ks_cog(state, control, self.params)
-        else:
-            raise ValueError(f"Unsupported model type: {self.model_type}")
+        return vehicle_dynamics_st_rear(state, control, self._st)
 
     def dynamics_discrete(self, state: np.ndarray, control: np.ndarray, dt: float) -> np.ndarray:
-        """Discrete-time dynamics using Euler integration.
+        """Discrete-time dynamics: Euler for KS, an exact lateral step for ST.
 
         Args:
-            state: Current state [x, y, yaw, v, beta]
+            state: Current state, as `dynamics_continuous` takes it
             control: Control input [steering_angle, acceleration]
             dt: Time step
 
         Returns:
-            Next state [x, y, yaw, v, beta]
+            Next state, in the same order
         """
-        state_dot = self.dynamics_continuous(state, control)
-        return state + state_dot * dt
+        if self.model_type == 'KS':
+            state_dot = self.dynamics_continuous(state, control)
+            return state + state_dot * dt
+        x, y, psi, v, beta, r = (float(s) for s in state)
+        return np.array(self._st_step(x, y, psi, v, beta, r,
+                                      float(control[0]), float(control[1]), dt))
+
+    def _st_step(self, x, y, psi, v, beta, r, delta, a, h):
+        """One single-track step of length h, wheel and acceleration held.
+
+        Slip and yaw rate advance exactly (`_lateral_zoh`) for the speed at
+        mid-step -- the tyre terms go as 1/v, and on a 100 ms step under
+        acceleration the start-of-step speed is visibly wrong. Heading and
+        position follow by the trapezoid on them, which is second order.
+        """
+        c = self._st
+        v1 = v + a * h
+        if v < ST_SWITCH_SPEED:
+            beta1 = c.kinematic_slip(delta)
+            cos_b = math.cos(beta1)
+            r1 = v1 * cos_b * math.tan(delta) / c.wheelbase
+            r_mid = 0.5 * (v + v1) * cos_b * math.tan(delta) / c.wheelbase
+            psi_m = psi + 0.5 * h * r_mid
+            ground = 0.5 * (v + v1) * cos_b
+            return (x + h * ground * math.cos(psi_m), y + h * ground * math.sin(psi_m),
+                    psi + h * r_mid, v1, beta1, r1)
+        beta1, r1 = _lateral_zoh(c, v + 0.5 * a * h, a, beta, r, delta, h)
+        psi1 = psi + 0.5 * h * (r + r1)
+        psi_m = 0.5 * (psi + psi1)
+        course = psi_m + 0.5 * (beta + beta1)
+        v_m = 0.5 * (v + v1)
+        lr_r = c.lr * 0.5 * (r + r1)
+        return (x + h * (v_m * math.cos(course) + lr_r * math.sin(psi_m)),
+                y + h * (v_m * math.sin(course) - lr_r * math.cos(psi_m)),
+                psi1, v1, beta1, r1)
 
     def actuated_step(self, state: np.ndarray, control: np.ndarray, dt: float) -> np.ndarray:
         """One step with the steering servo in the loop.
 
         The wheel angle is the sixth state. The car turns with the wheel as it
-        stands, not with the command: rows 0-4 are the Euler kinematic step
-        driven by state[5], and the command only moves the wheel, through the
-        servo model. So the rate limit is a property of every predicted
-        trajectory, at no cost in decision variables or constraints.
+        stands, not with the command: the dynamics are stepped on state[5],
+        and the command only moves the wheel, through the servo model. So the
+        rate limit is a property of every predicted trajectory, at no cost in
+        decision variables or constraints.
 
         Args:
-            state: [x, y, yaw, v, beta, delta]
+            state: KS [x, y, yaw, v, beta, delta];
+                ST [x, y, yaw, v, beta, delta, yaw_rate]
             control: [delta_cmd, acceleration]
             dt: Time step
 
         Returns:
-            Next state [x, y, yaw, v, beta, delta]
+            Next state, in the same order
         """
         delta = state[5]
+        if self.model_type == 'ST':
+            return np.array(self.scalar_step(tuple(float(s) for s in state),
+                                             float(control[0]), float(control[1]), dt))
         nxt = np.empty(6)
         nxt[:5] = self.dynamics_discrete(state[:5], (delta, control[1]), dt)
         nxt[5] = delta + self.servo.move(control[0] - delta, dt)
         return nxt
+
+    def scalar_step(self, state: tuple, cmd: float, a: float, h: float) -> tuple:
+        """`actuated_step` on a tuple of Python floats, with no arrays.
+
+        The MPC's fused objective calls this a few thousand times a solve, where
+        a per-step numpy array costs more than the physics. KS is the same
+        arithmetic in the same order as `actuated_step`, so it agrees to the bit.
+        """
+        if self.model_type == 'ST':
+            # The tyres are driven by the wheel as it stood at the start of the
+            # step, as in KS. The mid-step wheel predicts a sweeping wheel
+            # better open-loop (yaw within 3 % over a 100 ms sweep, against
+            # ~2x low here), but closed-loop it was worse: 10 harness laps at
+            # a_lat_max 5 went from 0 collisions / 17.18 s to 2 / 17.80 s. The
+            # ~100 ms of command dead time the MPC does not model is the likely
+            # reason; the start-of-step wheel's lag offsets part of it. Revisit
+            # together with latency compensation.
+            x, y, psi, v, beta, delta, r = state
+            x, y, psi, v, beta, r = self._st_step(x, y, psi, v, beta, r, delta, a, h)
+            return (x, y, psi, v, beta, delta + self.servo.move(cmd - delta, h), r)
+        x, y, psi, v, beta, delta = state
+        wheelbase = self.params.lf + self.params.lr
+        return (x + v * math.cos(psi + beta) * h,
+                y + v * math.sin(psi + beta) * h,
+                psi + v * math.cos(beta) * math.tan(delta) / wheelbase * h,
+                v + a * h,
+                beta,
+                delta + self.servo.move(cmd - delta, h))
+
+    def rollout(self, state0: np.ndarray, controls: np.ndarray, dts: np.ndarray,
+                out: np.ndarray) -> np.ndarray:
+        """`actuated_step` over a horizon, written into `out` (N+1 rows).
+
+        For ST the loop runs on Python floats with no per-step array; KS keeps
+        its original step, so its predictions are unchanged to the bit.
+        """
+        out[0] = state0
+        if self.model_type != 'ST':
+            for k in range(len(dts)):
+                out[k + 1] = self.actuated_step(out[k], controls[k], dts[k])
+            return out
+        state = tuple(float(s) for s in state0)
+        for k in range(len(dts)):
+            cmd, a = controls[k]
+            state = self.scalar_step(state, float(cmd), float(a), float(dts[k]))
+            out[k + 1] = state
+        return out
+
+    def steady_steer(self, kappa: float, v: float) -> float:
+        """[rad] The wheel angle that holds curvature `kappa` at speed `v`.
+
+        KS: the geometry, atan(L kappa). ST is linear in the wheel angle, so
+        its steady state is (L + K v^2) kappa with the understeer
+        K = 0.00279 rad per m/s^2: the steady state the speed profile's lock
+        limit is built on (speed_profile.py).
+        """
+        if self.model_type == 'KS':
+            return math.atan(self._st.wheelbase * kappa)
+        return (self._st.wheelbase + self._st.understeer * v * v) * kappa
 
     def get_initial_state(self, pose: Tuple[float, float, float] = None) -> np.ndarray:
         """Get initial vehicle state.
@@ -222,6 +449,7 @@ class VehicleModel:
             self.params.v_min,  # velocity
             -0.5,  # sideslip (rough estimate)
             self.params.s_min,  # wheel angle, for actuated_step's sixth state
+            -float('inf'),  # yaw rate, ST's seventh
         ])
 
         max_bounds = np.array([
@@ -231,9 +459,11 @@ class VehicleModel:
             self.params.v_max,  # velocity
             0.5,   # sideslip
             self.params.s_max,  # wheel angle
+            float('inf'),   # yaw rate
         ])
 
-        return min_bounds, max_bounds
+        # One row per actuated state: the yaw rate exists only for ST.
+        return min_bounds[:self.actuated_dim], max_bounds[:self.actuated_dim]
 
     def get_control_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
         """Get control input bounds.

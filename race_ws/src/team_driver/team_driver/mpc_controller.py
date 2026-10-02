@@ -16,16 +16,21 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 try:
-    from .vehicle_model import VehicleModel   # ROS / package import
+    from .vehicle_model import ST_SWITCH_SPEED, VehicleModel   # ROS / package import
     from . import speed_profile as _speed_profile
 except ImportError:
-    from vehicle_model import VehicleModel    # standalone `python3 mpc_controller.py`
+    from vehicle_model import ST_SWITCH_SPEED, VehicleModel    # standalone `python3 mpc_controller.py`
     import speed_profile as _speed_profile
 
 # scipy's SLSQP status for "iteration limit reached". The iterate is still a
 # feasible improvement on the warm start, so a capped solve is applied, not
 # discarded: with a warm start the cap makes the solve a continuation method.
 SLSQP_ITERATION_LIMIT = 9
+# [s] Slack when comparing step lengths that are sums of floats.
+SCHEDULE_DT_TOLERANCE = 1e-9
+# SLSQP's default finite-difference step (its `eps` option), absolute. The
+# fused gradient uses the same step so it finds the same optimum.
+SLSQP_FD_STEP = 1.4901161193847656e-08
 
 
 class SolveBudgetExceeded(Exception):
@@ -49,7 +54,9 @@ class MPCController:
                  r_delta_accel: float = 0.005,
                  block_map: Optional[Sequence[int]] = None,
                  maxiter: int = 25,
-                 solve_budget_ms: float = 15.0):
+                 solve_budget_ms: float = 15.0,
+                 dt_schedule: Optional[Sequence[float]] = None,
+                 feedforward: bool = False):
         """Initialize MPC controller.
 
         Args:
@@ -76,6 +83,14 @@ class MPCController:
             maxiter: SLSQP iteration cap per solve
             solve_budget_ms: Wall-clock budget per solve. Once spent, the solve
                 is abandoned and the previous plan, advanced one step, is used.
+            dt_schedule: Length of each prediction step [s], one per step.
+                None is `dt` throughout. The first entry must be `dt`, the
+                control period: the servo latch and the warm-start shift both
+                assume a command is held for exactly one step. Later steps may
+                be longer, buying lookahead without decision variables.
+            feedforward: Seed the warm start's first steering move with the
+                wheel angle the reference curvature needs (steady_steer), so
+                the solver corrects around it instead of finding it.
         """
         self.vehicle_model = vehicle_model if vehicle_model is not None else VehicleModel()
         self.prediction_horizon = prediction_horizon
@@ -85,31 +100,52 @@ class MPCController:
         self._block_starts = np.flatnonzero(np.diff(self.block_map, prepend=-1))
         self._block_counts = np.diff(np.append(self._block_starts, prediction_horizon))
         self.dt = dt
+        self.dt_schedule = self._resolve_dt_schedule(prediction_horizon, dt, dt_schedule)
+        self._uniform = bool(np.all(self.dt_schedule == dt))
+        self._t_offsets = self._time_offsets(prediction_horizon + 1)
+        self.lookahead = float(self._t_offsets[-1])
+        self._shift_index = self._resolve_shift_index(self.dt_schedule, self._t_offsets)
+        self.feedforward = bool(feedforward)
         self.maxiter = maxiter
         self.solve_budget_ms = solve_budget_ms
         self._deadline = math.inf        # only armed while solve() is running
         self.last_fallback = None        # None, 'budget', 'solver' or 'error'
         self.budget_exceeded_count = 0
         self.solver_failure_count = 0
+        self.solve_count = 0
 
-        # Cost function weights. Neither beta nor the wheel angle is tracked:
-        # the wheel is where it is, and the command is costed through R.
-        self.Q = np.diag([q_pos, q_pos, q_yaw, q_vel, 0.0, 0.0])  # [x, y, yaw, v, beta, delta]
+        # State and control dimensions. The wheel angle is a state because the
+        # judged servo is rate-limited: the car turns with the wheel, and the
+        # command only moves the wheel (VehicleModel.actuated_step). The ST
+        # model adds the yaw rate as a seventh.
+        self.state_dim = self.vehicle_model.actuated_dim  # [x, y, yaw, v, beta, delta(, r)]
+        self.control_dim = 2  # [steering_command, acceleration]
+        untracked = [0.0] * (self.state_dim - 4)
+
+        # Cost function weights. Neither beta, the wheel angle nor the yaw rate
+        # is tracked: the wheel is where it is, and the command is costed
+        # through R.
+        self.Q = np.diag([q_pos, q_pos, q_yaw, q_vel] + untracked)
         self.R = np.diag([r_steer, r_accel])           # [steering, acceleration]
         self.R_delta = np.diag([r_delta_steer, r_delta_accel])  # Control change weights
 
         # Diagonal forms, for the vectorized cost. q_yaw is handled separately
         # (angle wrapping) so it is zeroed here and re-added wrapped.
-        self.Q_diag_masked = np.array([q_pos, q_pos, 0.0, q_vel, 0.0, 0.0])
+        self.Q_diag_masked = np.array([q_pos, q_pos, 0.0, q_vel] + untracked)
         self.q_yaw_wrap = q_yaw
         self.R_diag = np.array([r_steer, r_accel])
         self.R_delta_diag = np.array([r_delta_steer, r_delta_accel])
+        self._lr = float(self.vehicle_model.params.lr)
 
-        # State and control dimensions. The wheel angle is a state because the
-        # judged servo is rate-limited: the car turns with the wheel, and the
-        # command only moves the wheel (VehicleModel.actuated_step).
-        self.state_dim = 6  # [x, y, yaw, v, beta, delta]
-        self.control_dim = 2  # [steering_command, acceleration]
+        # The fused objective (`_objective` / `_gradient`): the same cost and
+        # the same forward differences as SLSQP's own, on Python floats. False
+        # hands SLSQP `_cost_function` and lets scipy difference it.
+        self.fused_objective = True
+        self._weights = (float(q_pos), float(q_vel), float(q_yaw), float(r_steer),
+                         float(r_accel), float(r_delta_steer), float(r_delta_accel))
+        self._block_list = self.block_map.tolist()
+        self._dts_list = [float(h) for h in self.dt_schedule]
+        self._base = None   # (u, states, cumulative stage cost) of the last _objective
 
         # Get bounds from vehicle model
         _, self.state_max = self.vehicle_model.get_state_bounds()
@@ -150,7 +186,9 @@ class MPCController:
         print(f"  Prediction horizon: {self.prediction_horizon}")
         print(f"  Control horizon: {self.control_horizon} (block map {self.block_map.tolist()})")
         print(f"  SLSQP maxiter: {self.maxiter}, solve budget: {self.solve_budget_ms} ms")
-        print(f"  DT: {self.dt}s ({1/dt:.1f} Hz)")
+        print(f"  DT: {self.dt}s ({1/dt:.1f} Hz), schedule {self.dt_schedule.tolist()} "
+              f"({self.lookahead:.3f} s lookahead)")
+        print(f"  Model: {self.vehicle_model.model_type}, feed-forward: {self.feedforward}")
         print(f"  State dim: {self.state_dim}, Control dim: {self.control_dim}")
 
     @staticmethod
@@ -181,6 +219,53 @@ class MPCController:
                 f"which has {blocks[-1] + 1} blocks")
         return blocks
 
+    @staticmethod
+    def _resolve_dt_schedule(prediction_horizon: int, dt: float,
+                             dt_schedule: Optional[Sequence[float]]) -> np.ndarray:
+        """Validate `dt_schedule`, or hold `dt` for every step."""
+        if dt_schedule is None:
+            return np.full(prediction_horizon, float(dt))
+        steps = np.asarray(dt_schedule, dtype=np.float64)
+        if steps.shape != (prediction_horizon,):
+            raise ValueError(
+                f"dt_schedule needs one entry per prediction step "
+                f"({prediction_horizon}), got shape {steps.shape}")
+        if not np.all(np.isfinite(steps) & (steps > 0.0)):
+            raise ValueError(f"dt_schedule entries must be positive, got {steps.tolist()}")
+        if abs(steps[0] - dt) > SCHEDULE_DT_TOLERANCE:
+            raise ValueError(
+                f"dt_schedule's first step {steps[0]} must be the control period "
+                f"dt {dt}: a command is held for exactly one step")
+        return steps
+
+    def _time_offsets(self, count: int) -> np.ndarray:
+        """[s] Time of each of `count` reference states after the first.
+
+        A uniform schedule keeps the old `k * dt`, so it reproduces the
+        controller as it was to the bit; a cumulative sum differs in the last
+        place. Past the horizon the last step length repeats.
+        """
+        if self._uniform:
+            return np.arange(count) * self.dt
+        steps = np.resize(self.dt_schedule, max(count - 1, 0))
+        steps[len(self.dt_schedule):] = self.dt_schedule[-1]
+        return np.concatenate([[0.0], np.cumsum(steps)])
+
+    @staticmethod
+    def _resolve_shift_index(dt_schedule: np.ndarray, t_offsets: np.ndarray) -> np.ndarray:
+        """Step of the last plan that covers each step's start, one control period on.
+
+        Advancing a plan by one control period is a one-step shift only when
+        every step is that long. With longer later steps, step k of the next
+        plan starts dt_schedule[0] later on the old plan's clock, inside the
+        step this returns. The tolerance absorbs float sums, so a uniform
+        schedule gives exactly k + 1.
+        """
+        starts = t_offsets[:len(dt_schedule)]
+        due = starts + dt_schedule[0] + SCHEDULE_DT_TOLERANCE
+        index = np.searchsorted(starts, due, side='right') - 1
+        return np.minimum(index, len(dt_schedule) - 1)
+
     def set_reference_path(self, path: np.ndarray, speeds: np.ndarray = None):
         """Set reference path for tracking.
 
@@ -208,11 +293,19 @@ class MPCController:
             # drivable lap is arc[n-1] + that last gap, not arc[n-1].
             self._path_len = float(self._path_arc[-1]
                                    + np.linalg.norm(path[0, :2] - path[-1, :2]))
+            # Signed (left positive) and wrapped at the seam, for feed-forward:
+            # the same curvature raceline_table writes in its kappa column.
+            kappa = _speed_profile.closed_curvature(path[:, :2], signed=True)
+            self._ff_arc = np.append(self._path_arc, self._path_len)
+            self._ff_kappa = np.append(kappa, kappa[0])
         else:
             self._mean_waypoint_spacing = 0.2
             self._path_arc = None
             self._kappa_smooth = None
             self._path_len = 0.0
+            self._ff_arc = None
+            self._ff_kappa = None
+        self._window_s = None
 
         # A new path invalidates the local search window.
         self._last_path_index = None
@@ -439,7 +532,12 @@ class MPCController:
             pace = self.ref_speed
         else:
             pace = max(float(car_speed), self._ref_speed_floor)
-        s = (s_start % L) + np.arange(count) * self.dt * pace
+        # State k is where the car will be after the first k steps, which
+        # with a dt_schedule is a cumulative time, not k * dt.
+        offsets = (self._t_offsets if count == len(self._t_offsets)
+                   else self._time_offsets(count))
+        s = (s_start % L) + offsets * pace
+        self._window_s = s
 
         # The path array stores a single lap and no closing waypoint, so
         # sampling is only an interpolation while s stays inside the array.
@@ -490,8 +588,7 @@ class MPCController:
         out[:, 1] = ref_pos[:, 1]
         out[:, 2] = heading
         out[:, 3] = speed
-        out[:, 4] = 0.0
-        out[:, 5] = 0.0     # wheel angle; untracked (Q weight 0)
+        out[:, 4:] = 0.0    # beta, wheel angle (and yaw rate); untracked (Q weight 0)
         return out
 
     def _predict_trajectory(self,
@@ -511,16 +608,9 @@ class MPCController:
         per_step = control_sequence.reshape(
             (self.control_horizon, self.control_dim))[self.block_map]
 
-        # Initialize state trajectory
-        states = self._states
-        states[0] = initial_state
-
         # Propagate dynamics, with the steering servo in the loop
-        for k in range(self.prediction_horizon):
-            states[k+1] = self.vehicle_model.actuated_step(
-                states[k], per_step[k], self.dt)
-
-        return states
+        return self.vehicle_model.rollout(initial_state, per_step, self.dt_schedule,
+                                          self._states)
 
     def _cost_function(self,
                       control_sequence: np.ndarray,
@@ -556,6 +646,19 @@ class MPCController:
         np.subtract(states, reference_states, out=err)
         cost = float(np.sum(err * (self.Q_diag_masked * err)))
 
+        if self.state_dim == 7:
+            # The reference heading is the path's tangent, which a sliding
+            # car's rear axle follows while its body points elsewhere: its
+            # velocity is (v cos beta, v sin beta - lr r) in the body frame.
+            # Compare the direction of travel, or the cost charges the slip
+            # the corner needs as a heading error. KS pins beta at 0, so its
+            # rear axle travels along the yaw and needs no correction. Below
+            # the switch speed the model's rear axle has no side slip anyway,
+            # and the angle would flip by pi as a predicted v crosses zero.
+            v, beta = states[:, 3], states[:, 4]
+            drift = np.arctan2(v * np.sin(beta) - self._lr * states[:, 6], v * np.cos(beta))
+            err[:, 2] += np.where(v > ST_SWITCH_SPEED, drift, 0.0)
+
         # yaw is an angle, not a coordinate: compare it wrapped to +/-pi so the
         # cost does not spike when the reference heading crosses the branch cut.
         yaw_err = np.arctan2(np.sin(err[:, 2]), np.cos(err[:, 2]))
@@ -574,6 +677,104 @@ class MPCController:
 
         return cost
 
+    # ------------------------------------------------------------------
+    # The fused objective: `_cost_function` and SLSQP's forward differences,
+    # on Python floats
+    # ------------------------------------------------------------------
+    def _prepare_objective(self, initial_state: np.ndarray,
+                           reference_states: np.ndarray) -> None:
+        """Cache what every evaluation of one solve shares, as Python floats."""
+        self._x0 = tuple(float(s) for s in initial_state)
+        self._ref_rows = [tuple(float(c) for c in row[:4]) for row in reference_states]
+        self._prev_u = (float(self.prev_control[0]), float(self.prev_control[1]))
+        self._upper = [float(b) for b in np.tile(self.control_max, self.control_horizon)]
+        self._stage0 = self._stage_cost(self._x0, self._ref_rows[0])
+        self._base = None
+
+    def _stage_cost(self, s: tuple, ref: tuple) -> float:
+        """One predicted state's tracking cost, as `_cost_function` weighs it."""
+        q_pos, q_vel, q_yaw = self._weights[:3]
+        ex, ey, ev = s[0] - ref[0], s[1] - ref[1], s[3] - ref[3]
+        e_yaw = s[2] - ref[2]
+        v = s[3]
+        if self.state_dim == 7 and v > ST_SWITCH_SPEED:   # as in _cost_function
+            beta = s[4]
+            e_yaw += math.atan2(v * math.sin(beta) - self._lr * s[6], v * math.cos(beta))
+        e_yaw = math.atan2(math.sin(e_yaw), math.cos(e_yaw))
+        return q_pos * (ex * ex + ey * ey) + q_vel * ev * ev + q_yaw * e_yaw * e_yaw
+
+    def _control_cost(self, u: list) -> float:
+        """Effort and rate cost of the free moves, as `_cost_function` weighs them."""
+        r_s, r_a, r_ds, r_da = self._weights[3:]
+        prev_s, prev_a = self._prev_u
+        cost = 0.0
+        for b in range(self.control_horizon):
+            s, a = u[2 * b], u[2 * b + 1]
+            ds, da = s - prev_s, a - prev_a
+            cost += r_s * s * s + r_a * a * a + r_ds * ds * ds + r_da * da * da
+            prev_s, prev_a = s, a
+        return cost
+
+    def _track_from(self, u: list, start: int, state: tuple, acc: float,
+                    states: list = None, cumulative: list = None) -> float:
+        """Roll the moves `u` on from step `start` and add up the stage costs.
+
+        `state` is the predicted state at `start` and `acc` the stage cost of
+        states 0..start. When `states` / `cumulative` are given, each state and
+        running total is recorded so a perturbed rollout can restart mid-way.
+        """
+        step = self.vehicle_model.scalar_step
+        blocks, dts, refs = self._block_list, self._dts_list, self._ref_rows
+        for k in range(start, self.prediction_horizon):
+            b = blocks[k]
+            state = step(state, u[2 * b], u[2 * b + 1], dts[k])
+            acc += self._stage_cost(state, refs[k + 1])
+            if states is not None:
+                states.append(state)
+                cumulative.append(acc)
+        return acc
+
+    def _check_deadline(self) -> None:
+        if time.perf_counter() >= self._deadline:
+            raise SolveBudgetExceeded
+
+    def _objective(self, control_sequence: np.ndarray) -> float:
+        """`_cost_function` for the prepared solve, on Python floats."""
+        self._check_deadline()
+        u = control_sequence.tolist()
+        states, cumulative = [self._x0], [self._stage0]
+        track = self._track_from(u, 0, self._x0, self._stage0, states, cumulative)
+        total = track + self._control_cost(u)
+        self._base = (u, states, cumulative, total)
+        return total
+
+    def _gradient(self, control_sequence: np.ndarray) -> np.ndarray:
+        """SLSQP's own forward difference of `_objective`, restarted mid-horizon.
+
+        Same step (SLSQP_FD_STEP) and same bound handling as scipy's
+        approx_derivative: a step that would cross the upper bound is taken
+        backwards. A move only acts from its block's first step on, so the
+        perturbed rollout restarts there from the recorded base trajectory.
+        """
+        self._check_deadline()
+        u = control_sequence.tolist()
+        if self._base is None or self._base[0] != u:
+            self._objective(control_sequence)
+        _, states, cumulative, f0 = self._base
+        starts = self._block_starts
+        grad = np.empty(len(u))
+        for i in range(len(u)):
+            h = SLSQP_FD_STEP
+            if u[i] + h > self._upper[i]:
+                h = -h
+            moved = list(u)
+            moved[i] = u[i] + h
+            start = int(starts[i // 2])
+            f = (self._track_from(moved, start, states[start], cumulative[start])
+                 + self._control_cost(moved))
+            grad[i] = (f - f0) / (moved[i] - u[i])
+        return grad
+
     def solve(self, current_state: np.ndarray) -> Tuple[np.ndarray, float]:
         """Solve MPC optimization problem.
 
@@ -581,27 +782,20 @@ class MPCController:
         controller's own previous output; callers cannot inject either.
 
         Args:
-            current_state: [x, y, yaw, v, beta, delta]. A caller with no wheel
-                estimate may pass [x, y, yaw, v, beta] or [x, y, yaw, v]:
-                beta then defaults to 0 and the wheel to the last command,
-                i.e. a wheel that has caught up with it.
+            current_state: [x, y, yaw, v, beta, delta], plus the yaw rate for
+                the ST model. A caller with no wheel estimate may pass
+                [x, y, yaw, v, beta] or [x, y, yaw, v]: beta then defaults to
+                0 and the wheel to the last command, i.e. a wheel that has
+                caught up with it. A missing yaw rate defaults to 0.
 
         Returns:
             (optimal_control, solve_time)
         """
         start_time = time.perf_counter()
         self.last_fallback = None
+        self.solve_count += 1
 
-        current_state = np.asarray(current_state, dtype=np.float64)
-        wheel = self.prev_control[0]
-        if len(current_state) == 4:
-            current_state = np.append(current_state, [0.0, wheel])
-        elif len(current_state) == 5:
-            current_state = np.append(current_state, wheel)
-        elif len(current_state) != self.state_dim:
-            raise ValueError(
-                f"Expected state of length 4, 5 or {self.state_dim}, "
-                f"got {len(current_state)}")
+        current_state = self._complete_state(current_state)
 
         # Generate reference trajectory over prediction horizon
         reference_states = []
@@ -650,32 +844,43 @@ class MPCController:
             reference_states = np.array(reference_states)
             reference_speeds = np.array(reference_speeds)
 
-        initial_guess = self._warm_start()
+        # A fallback continues the plan itself, so the feed-forward seed goes
+        # into a copy: a blown budget must not jump the wheel to the seed.
+        warm_start = self._warm_start()
+        initial_guess = warm_start.copy()
+        if self.feedforward and self._ff_kappa is not None and self._window_s is not None:
+            initial_guess[0] = self._feedforward_steer(float(current_state[3]))
 
         # Bounds for optimization
         bounds = []
         for _ in range(self.control_horizon):
             bounds.extend(list(zip(self.control_min, self.control_max)))
 
+        if self.fused_objective:
+            self._prepare_objective(current_state, reference_states)
+            fun, problem = self._objective, dict(jac=self._gradient)
+        else:
+            fun, problem = self._cost_function, dict(
+                args=(current_state, reference_states, reference_speeds))
         # Optimize. The deadline is only armed around the solver call so a
         # direct _cost_function call never trips it.
         self._deadline = start_time + self.solve_budget_ms / 1e3
         try:
             result = minimize(
-                self._cost_function,
+                fun,
                 initial_guess,
-                args=(current_state, reference_states, reference_speeds),
                 method='SLSQP',
                 bounds=bounds,
-                options={'maxiter': self.maxiter, 'ftol': 1e-6}
+                options={'maxiter': self.maxiter, 'ftol': 1e-6},
+                **problem
             )
         except SolveBudgetExceeded:
             self.budget_exceeded_count += 1
-            return self._fall_back('budget', initial_guess, start_time)
+            return self._fall_back('budget', warm_start, start_time)
         except Exception as e:
             print(f"MPC optimization error: {e}")
             self.solver_failure_count += 1
-            return self._fall_back('error', initial_guess, start_time)
+            return self._fall_back('error', warm_start, start_time)
         finally:
             self._deadline = math.inf
 
@@ -684,7 +889,7 @@ class MPCController:
         if not usable:
             print(f"MPC optimization failed: {result.message}")
             self.solver_failure_count += 1
-            return self._fall_back('solver', initial_guess, start_time)
+            return self._fall_back('solver', warm_start, start_time)
 
         self._u_prev = result.x.copy()
         optimal_control = self._u_prev.reshape(
@@ -692,18 +897,50 @@ class MPCController:
         self.prev_control = optimal_control.copy()
         return optimal_control, time.perf_counter() - start_time
 
+    def _complete_state(self, current_state) -> np.ndarray:
+        """The state at the model's length, padding what the caller left out."""
+        state = np.asarray(current_state, dtype=np.float64)
+        wheel = self.prev_control[0]
+        if len(state) == 4:
+            state = np.append(state, [0.0, wheel])
+        elif len(state) == 5:
+            state = np.append(state, wheel)
+        if len(state) == 6 and self.state_dim == 7:
+            state = np.append(state, 0.0)
+        if len(state) != self.state_dim:
+            raise ValueError(
+                f"Expected state of length {sorted({4, 5, 6, self.state_dim})}, "
+                f"got {len(np.atleast_1d(current_state))}")
+        return state
+
+    def _feedforward_steer(self, v: float) -> float:
+        """[rad] The wheel angle the reference needs over the first block.
+
+        The curvature is averaged over the reference states the first block
+        drives towards (its steps' end points), and turned into a wheel angle
+        by the model's own steady state, so ST includes the understeer.
+        """
+        first_block = int(self._block_counts[0])
+        s = self._window_s[1:first_block + 1] % self._path_len
+        kappa = float(np.mean(np.interp(s, self._ff_arc, self._ff_kappa)))
+        steer = self.vehicle_model.steady_steer(kappa, max(v, 0.0))
+        return float(np.clip(steer, self.control_min[0], self.control_max[0]))
+
     def _warm_start(self) -> np.ndarray:
-        """The last plan advanced one time step, refitted to the blocks.
+        """The last plan advanced one control period, refitted to the blocks.
 
         With blocking, one slot of `_u_prev` is a block of steps, so shifting by
         a slot would jump the plan ahead by a whole block. Expand to one control
-        per step, shift by one step, and average each block back down: a
-        least-squares fit of the shifted plan onto the blocked parameterisation.
-        With no blocking every block is one step and this is a plain shift.
+        per step, advance by one control period, and average each block back
+        down. With equal steps that is a least-squares fit of the advanced
+        plan onto the blocked parameterisation and the advance is a one-step
+        shift. With a dt_schedule each step reads the old step covering its
+        start time one period later (`_shift_index`), and the block mean is
+        over steps, not weighted by their length -- a warm start, not a fit.
         """
         per_step = self._u_prev.reshape(
             (self.control_horizon, self.control_dim))[self.block_map]
-        shifted = np.concatenate([per_step[1:], per_step[-1:]])
+        shifted = per_step[self._shift_index]
         sums = np.add.reduceat(shifted, self._block_starts, axis=0)
         return (sums / self._block_counts[:, None]).ravel()
 

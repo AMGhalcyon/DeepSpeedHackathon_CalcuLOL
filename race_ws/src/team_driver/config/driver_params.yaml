@@ -64,6 +64,12 @@ driver:
     # held for exactly one MPC step, and the node refuses to start otherwise.
     control_period: 0.025     # [s] (40 Hz)
 
+    # The MPC's prediction model. "KS": kinematic, sideslip pinned at 0. "ST":
+    # the judged dynamic single track (linear tyres), started from odometry's
+    # real sideslip and yaw rate; it adds the yaw rate as a seventh state.
+    vehicle:
+      model: "KS"
+
     # MPC Controller Parameters
     #
     # NOTE: horizon is capped by solve time, not by taste. The control loop runs
@@ -99,6 +105,10 @@ driver:
       maxiter: 25                       # SLSQP iteration cap (warm-started, so a continuation)
       solve_budget_ms: 15.0             # Wall-clock solve budget; past it the plan advances one step
       dt: 0.025                         # Time step [s] (40 Hz)
+      # Length of each prediction step [s]; the first must equal dt. Longer
+      # later steps buy lookahead with no more decision variables.
+      dt_schedule: [0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025]
+      feedforward: false                # Seed the first steering move from the curvature
       q_pos: 2.0                        # Position tracking weight
       q_yaw: 2.0                        # Yaw tracking weight
       q_vel: 0.5                        # Velocity tracking weight

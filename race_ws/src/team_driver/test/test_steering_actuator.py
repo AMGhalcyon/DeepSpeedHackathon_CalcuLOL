@@ -166,33 +166,31 @@ class MpcActuatorStateTest(unittest.TestCase):
         right, _ = _controller().solve(np.array([2.0, 0.0, 0.0, 2.0, 0.0, -0.3]))
         self.assertLess(left[0], right[0])
 
+    # The initial state reaches the optimiser through _prepare_objective (the
+    # fused objective, Phase 2 Step 3), so that is where these spy.
+    def _initial_state_seen(self, mpc, state):
+        seen = []
+        real = mpc._prepare_objective
+
+        def spy(x0, ref):
+            seen.append(np.array(x0))
+            return real(x0, ref)
+
+        mpc._prepare_objective = spy
+        mpc.solve(state)
+        return seen[0]
+
     def test_a_five_state_input_assumes_the_wheel_is_at_the_last_command(self):
         mpc = _controller()
         mpc.prev_control = np.array([0.2, 0.0])
-        seen = []
-        real = mpc._predict_trajectory
-
-        def spy(x0, u):
-            seen.append(np.array(x0))
-            return real(x0, u)
-
-        mpc._predict_trajectory = spy
-        mpc.solve(np.array([2.0, 0.0, 0.0, 2.0, 0.0]))
-        self.assertEqual(seen[0][5], 0.2)
+        x0 = self._initial_state_seen(mpc, np.array([2.0, 0.0, 0.0, 2.0, 0.0]))
+        self.assertEqual(x0[5], 0.2)
 
     def test_a_four_state_input_assumes_no_sideslip_and_the_last_command(self):
         mpc = _controller()
         mpc.prev_control = np.array([-0.1, 0.0])
-        seen = []
-        real = mpc._predict_trajectory
-
-        def spy(x0, u):
-            seen.append(np.array(x0))
-            return real(x0, u)
-
-        mpc._predict_trajectory = spy
-        mpc.solve(np.array([2.0, 0.0, 0.0, 2.0]))
-        self.assertEqual((seen[0][4], seen[0][5]), (0.0, -0.1))
+        x0 = self._initial_state_seen(mpc, np.array([2.0, 0.0, 0.0, 2.0]))
+        self.assertEqual((x0[4], x0[5]), (0.0, -0.1))
 
     def test_other_state_lengths_are_rejected(self):
         with self.assertRaises(ValueError):
