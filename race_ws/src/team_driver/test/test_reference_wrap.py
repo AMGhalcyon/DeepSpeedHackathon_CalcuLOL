@@ -43,7 +43,7 @@ def _controller(path):
     mpc = MPCController(
         vehicle_model=VehicleModel(),
         prediction_horizon=HORIZON, control_horizon=HORIZON, dt=0.025)
-    profile = mpc.speed_profile(v_max=3.0, lat_accel=0.8, a_brake=0.8, path=path)
+    profile = mpc.speed_profile(path, v_max=3.0)
     mpc.set_reference_path(path, profile)
     return mpc
 

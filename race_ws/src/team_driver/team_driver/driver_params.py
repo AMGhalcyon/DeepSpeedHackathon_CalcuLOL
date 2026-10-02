@@ -27,10 +27,10 @@ _current_dir = os.path.dirname(os.path.abspath(__file__))
 if _current_dir not in sys.path:
     sys.path.insert(0, _current_dir)
 try:
-    from .driver_core import DriverConfig        # ROS / package import
+    from .driver_core import DriverConfig, REFERENCES   # ROS / package import
     from .vehicle_model import ServoModel
 except ImportError:
-    from driver_core import DriverConfig         # standalone / tests
+    from driver_core import DriverConfig, REFERENCES    # standalone / tests
     from vehicle_model import ServoModel
 
 PARAMS_SOURCE_DEFAULT = 'CODE_DEFAULTS'
@@ -111,6 +111,12 @@ def validate(values: Mapping[str, Any]) -> None:
         raise ValueError(
             f'control_period {period} must equal mpc.dt {dt}: the model assumes '
             'each command is held for exactly one MPC step')
+    if values['reference'] not in REFERENCES:
+        raise ValueError(
+            f"reference {values['reference']!r} must be one of {REFERENCES}")
+    margin = values['raceline_margin']
+    if not margin >= 0.0:            # also refuses NaN
+        raise ValueError(f'raceline_margin {margin} must be >= 0 m')
     entries, horizon = len(values['mpc.block_map']), values['mpc.prediction_horizon']
     if entries != horizon:
         raise ValueError(

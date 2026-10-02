@@ -40,9 +40,19 @@ driver:
     crawl_speed: 1.0          # [m/s]; you ask for a speed and the sim holds it
     max_range: 8.0            # [m] clip the scan here
     v_max: 3.0                # [m/s] speed cap on the profile
-    lat_accel: 0.8            # [m/s^2] cornering budget
-    a_brake: 0.8              # [m/s^2] braking budget
+    # Speed profile (speed_profile.py). a_lat_max is a slip budget, not a grip
+    # limit: the plant's tyres are linear, so rear slip is a_y / 56.1 rad.
+    a_lat_max: 0.8            # [m/s^2] cornering budget
+    lock_margin: 0.95         # fraction of the steering lock the profile may use
+    a_accel_max: 9.51         # [m/s^2] acceleration the profile plans (plant: 9.51)
+    a_brake_max: 0.8          # [m/s^2] braking the profile plans (plant: 9.51)
+    a_brake: 0.8              # [m/s^2] braking budget of the safety layers
     steer_limit: 0.4          # [rad]
+    # Reference line the MPC tracks: "centerline" (the shipped CSV) or "raceline"
+    # (minimum curvature, built from the map at startup; falls back to
+    # config/icra26_raceline.csv if the build fails).
+    reference: "centerline"
+    raceline_margin: 0.10     # [m] clearance beyond the car's half-width kept from walls
 
     # Output conditioning (driver_core._condition / _coast)
     stop_margin: 0.0          # [m] clearance the braking-distance cap keeps in hand

@@ -29,9 +29,11 @@ if _current_dir not in sys.path:
 try:
     from .mpc_controller import MPCController   # ROS / package import
     from .vehicle_model import VehicleModel
+    from . import raceline
 except ImportError:
     from mpc_controller import MPCController    # standalone `python3 lap_sim.py`
     from vehicle_model import VehicleModel
+    import raceline
 
 
 class _NullLogger:
@@ -59,9 +61,18 @@ class DriverConfig:
     crawl_speed: float = 1.0        # [m/s]
     max_range: float = 8.0          # [m] clip the scan here
     v_max: float = 3.0              # [m/s] speed cap on the profile
-    lat_accel: float = 0.8          # [m/s^2] cornering budget
-    a_brake: float = 0.8            # [m/s^2] braking budget
+    # Speed profile (speed_profile.py). `a_lat_max` is a slip budget, not a grip
+    # limit: the plant's tyres are linear, so rear slip is a_y / 56.1 rad.
+    a_lat_max: float = 0.8          # [m/s^2] cornering budget
+    lock_margin: float = 0.95       # fraction of the steering lock the profile may use
+    a_accel_max: float = 9.51       # [m/s^2] acceleration the profile plans (plant: 9.51)
+    a_brake_max: float = 0.8        # [m/s^2] braking the profile plans (plant: 9.51)
+    a_brake: float = 0.8            # [m/s^2] braking budget of the safety layers
     steer_limit: float = 0.4        # [rad]
+    # Reference line the MPC tracks: 'centerline' (the shipped CSV) or 'raceline'
+    # (minimum curvature, built from the map at startup; see raceline.py).
+    reference: str = 'centerline'
+    raceline_margin: float = 0.10   # [m] clearance beyond the car's half-width kept from walls
     # [m] Clearance the braking-distance cap keeps in hand. Swept 0.0-0.5 over
     # 10 harness laps: 0 collisions at every value and at stale 5/9/14, and each
     # 0.1 m cost ~1 s of lap time, so the smallest value was taken. The cap
@@ -98,6 +109,9 @@ class ConditioningStats(NamedTuple):
     def slew_bind_rate(self) -> float:
         return self.slew_binds / self.steps if self.steps else 0.0
 
+
+REFERENCES = ('centerline', 'raceline')
+CACHED_RACELINE = 'icra26_raceline.csv'   # config/: the fallback if the runtime build fails
 
 DT_CLAMP_LOW = 0.5     # x nominal: a burst of scans must not zero the interval
 DT_CLAMP_HIGH = 3.0    # x nominal: a dropped scan must not hand over a 1 s dt
@@ -311,7 +325,6 @@ class DriverCore:
         self.crawl_speed = self.cfg.crawl_speed
         self.max_range = self.cfg.max_range
         self.v_max = self.cfg.v_max
-        self.lat_accel = self.cfg.lat_accel
         self.a_brake = self.cfg.a_brake
         self.steer_limit = self.cfg.steer_limit
         self.stop_margin = self.cfg.stop_margin
@@ -437,6 +450,58 @@ class DriverCore:
 
         return [os.path.join(c, 'icra26_centerline.csv') for c in candidates]
 
+    def _cached_raceline_candidates(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates = [os.path.join(os.path.dirname(here), 'config', CACHED_RACELINE)]
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            candidates.append(os.path.join(
+                get_package_share_directory('team_driver'), 'config', CACHED_RACELINE))
+        except Exception:
+            pass
+        return candidates
+
+    def _raceline_reference(self, centerline_path, centerline_xy):
+        """The runtime raceline, else the cached one, else the centreline.
+
+        Built from the map at startup, which is what rule 41 rewards. The cache
+        is the same line, generated offline by `raceline.py --write`; it is used
+        only when the build fails, and only if it was built with at least the
+        margin asked for.
+        """
+        try:
+            yaml_path = raceline.find_map_yaml(centerline_path)
+            if yaml_path is None:
+                raise FileNotFoundError(f'no map yaml beside {centerline_path}')
+            line = raceline.build_raceline(
+                centerline_xy, raceline.load_occupancy(yaml_path),
+                margin=self.cfg.raceline_margin)
+            self.log.info(
+                f'raceline: {len(line.xy)} points, built in {line.build_seconds:.2f} s')
+            return line.xy
+        except Exception as e:
+            reason = f'build failed: {e}'
+
+        cached = next((p for p in self._cached_raceline_candidates() if os.path.exists(p)), None)
+        if cached is None:
+            self.log.error(f'raceline: {reason}; no cached raceline found, '
+                           'using the centreline')
+            return centerline_xy
+        try:
+            xy, margin = raceline.read_cached(cached)
+        except Exception as e:
+            self.log.error(f'raceline: {reason}; cached raceline unusable ({e}), '
+                           'using the centreline')
+            return centerline_xy
+        if margin < self.cfg.raceline_margin:
+            self.log.error(f'raceline: {reason}; the cached raceline keeps {margin} m of '
+                           f'margin, less than the {self.cfg.raceline_margin} m asked for, '
+                           'using the centreline')
+            return centerline_xy
+        self.log.warn(f'raceline: {reason}; using the cached raceline {cached} '
+                      f'(margin {margin} m)')
+        return xy
+
     def _load_reference_path(self):
         """Load centerline as reference path."""
         try:
@@ -460,14 +525,18 @@ class DriverCore:
                 f'Loaded {len(centerline_data)} centerline points from {centerline_path}')
 
             self.reference_path = centerline_data[:, :2]
+            if self.cfg.reference == 'raceline':
+                self.reference_path = self._raceline_reference(
+                    centerline_path, self.reference_path)
 
             # Curvature-limited speeds, not a flat 3 m/s. The track is ~0.5 m
             # wide and the centerline peaks well above a curvature that 3 m/s
             # can hold, so a constant reference drives straight into the
             # outside wall at the first real corner.
             self.reference_speeds = self.mpc_controller.speed_profile(
-                v_max=self.v_max, lat_accel=self.lat_accel, a_brake=self.a_brake,
-                path=self.reference_path)
+                path=self.reference_path, v_max=self.v_max,
+                a_lat_max=self.cfg.a_lat_max, lock_margin=self.cfg.lock_margin,
+                a_accel_max=self.cfg.a_accel_max, a_brake_max=self.cfg.a_brake_max)
             self.log.info(
                 f'Speed profile: {self.reference_speeds.min():.2f}'
                 f'-{self.reference_speeds.max():.2f} m/s')

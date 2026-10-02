@@ -17,8 +17,10 @@ if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 try:
     from .vehicle_model import VehicleModel   # ROS / package import
+    from . import speed_profile as _speed_profile
 except ImportError:
     from vehicle_model import VehicleModel    # standalone `python3 mpc_controller.py`
+    import speed_profile as _speed_profile
 
 # scipy's SLSQP status for "iteration limit reached". The iterate is still a
 # feasible improvement on the warm start, so a capped solve is applied, not
@@ -239,44 +241,33 @@ class MPCController:
         kern = np.ones(smooth) / smooth
         return np.convolve(kappa, kern, mode='same')
 
-    def speed_profile(self, v_max: float = 3.0, lat_accel: float = 0.8,
-                      a_brake: float = 0.8, path: np.ndarray = None) -> np.ndarray:
-        """Curvature-limited speed profile with a backward braking pass.
+    def speed_profile(self, path: np.ndarray = None, *, v_max: float = 3.0,
+                      a_lat_max: float = 0.8, lock_margin: float = 0.95,
+                      a_accel_max: float = 9.51, a_brake_max: float = 0.8,
+                      closed: bool = True) -> np.ndarray:
+        """Closed-loop speed profile for the lap; see `speed_profile.py`.
 
-        v = sqrt(a_lat / kappa) is the textbook cornering limit, but on its own
-        it is not drivable: the reference demands an instant jump to corner
-        speed, and the cost function's v-tracking term fights that, so the car
-        brakes late and runs wide into the wall. Sweeping backwards from the
-        end of the path and lowering any speed the car cannot shed in time
-        (sqrt(v_next^2 + 2*a_brake*ds)) makes the profile achievable.
+        The reference used to demand an instant jump to corner speed, so the car
+        braked late and ran wide into the wall. The profile is now braked for
+        round the finish line, limited by what the plant can accelerate, and
+        capped by the slip budget `a_lat_max` and the steering lock. It uses its
+        own wrapped curvature, not `_kappa_smooth`.
 
         Args:
-            path: Optional path to profile. Defaults to the configured one.
-                Pass the path explicitly when calling before set_reference_path.
+            path: Path to profile; defaults to the configured one. Pass it
+                explicitly when calling before set_reference_path.
+            closed: The path is a lap (last point joins the first).
         Returns:
             Speed per waypoint, shape (N,).
         """
         if path is None:
             path = self.reference_path
-            kappa = self._kappa_smooth
-            ds = self._mean_waypoint_spacing
-        else:
-            path = np.asarray(path, dtype=np.float64)
-            if len(path) < 3:
-                return np.zeros(len(path))
-            kappa = self._curvature(path[:, :2])
-            ds = float(np.mean(np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1))) or 0.2
-
-        if path is None or kappa is None:
-            return np.zeros(0 if path is None else len(path))
-
-        kappa = np.maximum(kappa, 1e-6)
-        v = np.minimum(np.sqrt(lat_accel / kappa), v_max)
-
-        for i in range(len(v) - 2, -1, -1):
-            v[i] = min(v[i], np.sqrt(v[i + 1] ** 2 + 2.0 * a_brake * ds))
-
-        return v
+        if path is None:
+            return np.zeros(0)
+        return _speed_profile.speed_profile(
+            path, a_lat_max=a_lat_max, lock_margin=lock_margin,
+            a_accel_max=a_accel_max, a_brake_max=a_brake_max, v_max=v_max,
+            closed=closed)
 
     @property
     def search_window(self) -> int:
