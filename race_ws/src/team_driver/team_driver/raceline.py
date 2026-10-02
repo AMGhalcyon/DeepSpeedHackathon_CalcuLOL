@@ -15,8 +15,11 @@ Pipeline (Heilmeier et al. 2019, docs/04 section 4.6):
 4. Minimise the sum of squared second differences of the path over the lateral
    offsets, subject to those bounds. The path is linear in the offsets, so this
    is a box-bounded linear least-squares problem: `scipy.optimize.lsq_linear`.
-5. Re-linearise (resample, recompute the normals and bounds) two or three times,
-   because second differences only approximate curvature on an even spacing.
+5. Re-linearise (resample, recompute the normals and bounds), because second
+   differences only approximate curvature on an even spacing. Each round weights
+   the rows by the previous round's curvature (`KAPPA_REF`), so that a tight apex
+   is not left sharper than the steering can follow; if that solve fails, the
+   plain two-or-three-round solve takes over.
 
 Pure numpy / scipy, no ROS. Only reads files it is told to read.
 """
@@ -26,6 +29,7 @@ import os
 import re
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from typing import NamedTuple, Optional, Sequence
 
@@ -55,6 +59,9 @@ MARCH_STEP_CELLS = 0.5        # march along a normal in half-cell steps
 MAX_OFFSET = 3.0              # [m] no lateral bound is searched past this
 SAFETY_SLACKS = (0.02, 0.05, 0.10)   # [m] extra clearance aimed for, widened if the line falls short
 SOLVER_MAX_ITER = 30
+REWEIGHT_ITERATIONS = 6       # re-linearisations of the curvature-reweighted QP
+KAPPA_REF = 0.6               # [1/m] rows where the line is tighter than this are weighted up
+REWEIGHT_MAX_ITER = 200       # the weighted operator is worse conditioned and needs more steps
 MIN_CACHED_POINTS = 50
 MAX_CLOSING_GAP = 1.0         # [m] a cached lap must close to within this
 CLEARANCE_EPS = 1e-3          # [m] tolerance on the delivered clearance
@@ -90,10 +97,16 @@ class OccupancyGrid:
         return row, col
 
 
+class RacelineError(RuntimeError):
+    """The QP did not converge, or the line could not keep its clearance. The
+    reweighted build falls back to the uniform solve on this and on nothing else."""
+
+
 class Raceline(NamedTuple):
     xy: np.ndarray            # (N, 2) the line, at OUTPUT_SPACING
     sealed: OccupancyGrid     # the grid the line was bounded by
     build_seconds: float
+    reweighted: bool = False  # False: the uniform solve (asked for, or the fallback)
 
 
 # ----------------------------------------------------------------------------
@@ -277,55 +290,121 @@ def _second_difference(n: int) -> sparse.csr_matrix:
 
 
 def _min_curvature_offsets(ref: np.ndarray, normals: np.ndarray,
-                           lower: np.ndarray, upper: np.ndarray) -> np.ndarray:
-    """Lateral offsets minimising the squared second differences of ref + a * n."""
-    d2 = _second_difference(len(ref))
+                           lower: np.ndarray, upper: np.ndarray, *,
+                           weights: Optional[np.ndarray] = None,
+                           max_iter: int = SOLVER_MAX_ITER) -> np.ndarray:
+    """Lateral offsets minimising the squared second differences of ref + a * n.
+
+    `weights` (one positive value per point) multiplies that point's second
+    difference before it is squared, so its share of the sum scales as w squared
+    and a stretch weighted up is straightened at the expense of the rest. None,
+    or all ones, is the plain minimum-curvature solve.
+    """
+    n = len(ref)
+    if weights is not None:
+        weights = np.asarray(weights, dtype=np.float64)
+        if weights.shape != (n,) or not np.all(np.isfinite(weights)) or np.any(weights <= 0.0):
+            raise ValueError(f'weights must be {n} finite positive values')
+    d2 = _second_difference(n)
     a = sparse.vstack([d2 @ sparse.diags(normals[:, 0]),
                        d2 @ sparse.diags(normals[:, 1])]).tocsr()
     b = -np.concatenate([d2 @ ref[:, 0], d2 @ ref[:, 1]])
+    if weights is not None:
+        rows = np.concatenate([weights, weights])
+        a = (sparse.diags(rows) @ a).tocsr()
+        b = rows * b
     upper = np.maximum(upper, lower + 1e-9)
     # Dense exact trust-region steps: a few hundred unknowns solve in ~0.5 s.
     # `bvls` took 16 s per solve here and the iterative sparse solver 4 s; both
     # crawl on this ill-conditioned operator.
     result = lsq_linear(a.toarray(), b, bounds=(lower, upper), method='trf',
-                        lsq_solver='exact', max_iter=SOLVER_MAX_ITER)
+                        lsq_solver='exact', max_iter=max_iter)
     if result.status <= 0:
-        raise RuntimeError(f'raceline QP did not converge: {result.message}')
+        raise RacelineError(f'raceline QP did not converge: {result.message}')
     return np.clip(result.x, lower, upper)
 
 
 # ----------------------------------------------------------------------------
 # The line
 # ----------------------------------------------------------------------------
-def build_raceline(centerline: np.ndarray, grid: OccupancyGrid, *,
-                   margin: float = DEFAULT_MARGIN, half_width: float = HALF_WIDTH,
-                   seal_radius: float = SEAL_RADIUS, opt_spacing: float = OPT_SPACING,
-                   spacing: float = OUTPUT_SPACING, iterations: int = ITERATIONS) -> Raceline:
-    """Minimum-curvature line inside the sealed track, at least `half_width + margin`
-    from every wall. `centerline` is a closed lap; its first point stays the first."""
-    started = time.perf_counter()
-    sealed = seal_cones(grid, seal_radius)
-    clearance_map = _clearance_map(sealed)
-    required = half_width + margin
+def _relinearise(centerline: np.ndarray, sealed: OccupancyGrid, clearance_map: np.ndarray,
+                 required: float, *, opt_spacing: float, iterations: int,
+                 kappa_ref: Optional[float]) -> np.ndarray:
+    """`iterations` rounds of resample, bound, solve, on the QP's own spacing.
 
+    With `kappa_ref`, each round weights a point's second difference by
+    `max(1, kappa / kappa_ref)`, kappa being the previous round's curvature
+    there. Plain minimum curvature spreads the turn evenly in the sum of
+    squares, which leaves one tight apex sharper than the steering can follow;
+    the weights trade a little length elsewhere for a gentler apex.
+    """
+    ref = resample_closed(centerline, opt_spacing)
+    weights = None if kappa_ref is None else np.ones(len(ref))
+    for _ in range(iterations):
+        normals = _left_normals(ref)
+        lower, upper = _offset_bounds(sealed, clearance_map, ref, normals, required)
+        if weights is None:
+            offsets = _min_curvature_offsets(ref, normals, lower, upper)
+        else:
+            offsets = _min_curvature_offsets(ref, normals, lower, upper, weights=weights,
+                                             max_iter=REWEIGHT_MAX_ITER)
+        ref = resample_closed(ref + offsets[:, None] * normals, opt_spacing)
+        if kappa_ref is not None:
+            weights = np.maximum(1.0, sp.closed_curvature(ref) / kappa_ref)
+    return ref
+
+
+def _solve_line(centerline: np.ndarray, sealed: OccupancyGrid, clearance_map: np.ndarray,
+                required: float, *, opt_spacing: float, spacing: float, iterations: int,
+                kappa_ref: Optional[float]) -> np.ndarray:
+    """The delivered line, at least `required` from every wall."""
     # Resampling and re-interpolating shave a few millimetres off the clearance
     # the bounds guaranteed, so aim a little past it and widen the slack if the
     # delivered line still comes up short.
     for slack in SAFETY_SLACKS:
-        ref = resample_closed(centerline, opt_spacing)
-        for _ in range(iterations):
-            normals = _left_normals(ref)
-            lower, upper = _offset_bounds(sealed, clearance_map, ref, normals,
-                                          required + slack)
-            offsets = _min_curvature_offsets(ref, normals, lower, upper)
-            ref = resample_closed(ref + offsets[:, None] * normals, opt_spacing)
+        ref = _relinearise(centerline, sealed, clearance_map, required + slack,
+                           opt_spacing=opt_spacing, iterations=iterations, kappa_ref=kappa_ref)
         line = resample_closed(ref, spacing)
         if float(_sample(clearance_map, sealed, line).min()) >= required - CLEARANCE_EPS:
-            break
-    else:
-        raise RuntimeError(f'raceline keeps closer than {required:.3f} m to a wall '
-                           f'even with {SAFETY_SLACKS[-1]} m of slack')
-    return Raceline(xy=line, sealed=sealed, build_seconds=time.perf_counter() - started)
+            return line
+    raise RacelineError(f'raceline keeps closer than {required:.3f} m to a wall '
+                        f'even with {SAFETY_SLACKS[-1]} m of slack')
+
+
+def build_raceline(centerline: np.ndarray, grid: OccupancyGrid, *,
+                   margin: float = DEFAULT_MARGIN, half_width: float = HALF_WIDTH,
+                   seal_radius: float = SEAL_RADIUS, opt_spacing: float = OPT_SPACING,
+                   spacing: float = OUTPUT_SPACING, iterations: int = ITERATIONS,
+                   reweight: bool = True, reweight_iterations: int = REWEIGHT_ITERATIONS,
+                   kappa_ref: float = KAPPA_REF) -> Raceline:
+    """Minimum-curvature line inside the sealed track, at least `half_width + margin`
+    from every wall. `centerline` is a closed lap; its first point stays the first.
+
+    `reweight` straightens the tightest corners (see `_relinearise`). If that solve
+    fails to converge, or cannot keep the clearance, the plain solve of `iterations`
+    rounds is used instead and `Raceline.reweighted` says so: a failed build must
+    not drop the car to the centreline at startup. A build that falls back pays for
+    both attempts, several times the normal ~3 s.
+    """
+    if kappa_ref <= 0.0 or reweight_iterations < 1:
+        raise ValueError(f'kappa_ref ({kappa_ref}) must be positive and '
+                         f'reweight_iterations ({reweight_iterations}) at least 1')
+    started = time.perf_counter()
+    sealed = seal_cones(grid, seal_radius)
+    clearance_map = _clearance_map(sealed)
+    common = dict(opt_spacing=opt_spacing, spacing=spacing)
+    required = half_width + margin
+    if reweight:
+        try:
+            line = _solve_line(centerline, sealed, clearance_map, required, **common,
+                               iterations=reweight_iterations, kappa_ref=kappa_ref)
+            return Raceline(line, sealed, time.perf_counter() - started, reweighted=True)
+        except RacelineError as error:
+            warnings.warn(f'reweighted raceline failed ({error}); using the uniform solve',
+                          RuntimeWarning, stacklevel=2)
+    line = _solve_line(centerline, sealed, clearance_map, required, **common,
+                       iterations=iterations, kappa_ref=None)
+    return Raceline(line, sealed, time.perf_counter() - started, reweighted=False)
 
 
 def raceline_table(xy: np.ndarray, *, a_lat_max: float, lock_margin: float,
@@ -388,13 +467,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     center = lap_floor.load_path(center_csv)
     line = build_raceline(center, load_occupancy(yaml_path), margin=args.margin)
 
-    print(f'built in {line.build_seconds:.2f} s; {len(line.xy)} points')
+    print(f'built in {line.build_seconds:.2f} s; {len(line.xy)} points; '
+          f'reweighted: {line.reweighted}')
     clearance = wall_clearance(line.sealed, line.xy)
     print(f'min wall clearance {clearance.min():.3f} m (required {HALF_WIDTH + args.margin:.3f})')
     for name, path in (('centreline', center), ('raceline', line.xy)):
         row = lap_floor.floor_table(path, (10.0,))[0]
         length = float(np.sum(sp.segment_lengths(path, True)))
         print(f'{name:11s} length {length:6.2f} m  floor@10 {row.lap_time:6.2f} s')
+    if args.write and not line.reweighted:
+        print('refusing to write: the reweighted solve failed and this is the uniform line, '
+              'which the tuned speed profile does not expect', file=sys.stderr)
+        return 1
     if args.write:
         np.savetxt(args.write, line.xy, delimiter=',', fmt='%.4f',
                    header=f'x_m, y_m\nmargin_m: {args.margin}\nMinimum-curvature racing line '

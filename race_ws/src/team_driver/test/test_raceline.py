@@ -10,6 +10,7 @@ and a lower lap-time floor.
 import os
 import sys
 import unittest
+from unittest import mock
 
 import numpy as np
 from scipy import ndimage
@@ -27,6 +28,9 @@ RES = 0.05
 HALF_WIDTH = 0.155
 MARGIN = 0.10
 CLEARANCE_TOL = 0.03          # [m] one grid cell of slack on a rasterised wall
+FULL_LOCK_KAPPA = 1.269       # [1/m] the tightest turn the steering can follow
+SHIPPED_MARGIN = 0.25         # [m] raceline_margin the driver and the cached CSV use
+BUILD_HANG_GUARD_SECONDS = 30.0   # measured 3.4 s idle, up to ~15 s on a contended machine
 MAP_YAML = os.path.join(_HERE, os.pardir, os.pardir, os.pardir, os.pardir,
                         'maps', 'icra26.yaml')
 
@@ -139,6 +143,143 @@ class TestSyntheticTrack(unittest.TestCase):
         # ax is the acceleration implied by vx along s.
         ds = np.linalg.norm(np.roll(t[:, 1:3], -1, axis=0) - t[:, 1:3], axis=1)
         np.testing.assert_allclose(ax, (np.roll(vx, -1) ** 2 - vx ** 2) / (2 * ds), atol=1e-6)
+
+
+class TestWeightedSolve(unittest.TestCase):
+    """Per-row weights on the second differences of `_min_curvature_offsets`."""
+
+    def setUp(self):
+        center = _rounded_rectangle(8.0, 5.0, 1.2)
+        sealed = rl.seal_cones(_track_grid(center, half_width=0.8), 0.3)
+        self.ref = rl.resample_closed(center, rl.OPT_SPACING)
+        self.normals = rl._left_normals(self.ref)
+        self.lower, self.upper = rl._offset_bounds(
+            sealed, rl._clearance_map(sealed), self.ref, self.normals, HALF_WIDTH + MARGIN)
+
+    def _solve(self, **kwargs):
+        return rl._min_curvature_offsets(self.ref, self.normals, self.lower, self.upper,
+                                         **kwargs)
+
+    def test_unit_weights_reproduce_the_uniform_solve(self):
+        np.testing.assert_allclose(self._solve(weights=np.ones(len(self.ref))), self._solve(),
+                                   atol=1e-9)
+
+    def test_uneven_weights_change_the_solution(self):
+        weights = np.where(self.ref[:, 0] > 6.0, 8.0, 1.0)
+        shift = np.abs(self._solve(weights=weights) - self._solve())
+        self.assertGreater(float(shift.max()), 1e-3)
+
+    def test_weights_must_match_the_rows_and_be_positive(self):
+        n = len(self.ref)
+        for name, bad in (('short', np.ones(n - 1)), ('zero', np.zeros(n)),
+                          ('negative', -np.ones(n)), ('nan', np.full(n, np.nan))):
+            with self.subTest(weights=name), self.assertRaises(ValueError):
+                self._solve(weights=bad)
+
+
+class TestReweightedBuild(unittest.TestCase):
+    """The build reweights by curvature, and falls back to the uniform solve."""
+
+    def setUp(self):
+        self.center = _rounded_rectangle(8.0, 5.0, 1.2)
+        self.grid = _track_grid(self.center, half_width=0.8)
+
+    def _build(self, **kwargs):
+        return rl.build_raceline(self.center, self.grid, margin=MARGIN,
+                                 half_width=HALF_WIDTH, **kwargs)
+
+    def test_the_default_build_is_reweighted(self):
+        self.assertTrue(self._build().reweighted)
+
+    def test_reweight_off_gives_the_uniform_line(self):
+        self.assertFalse(self._build(reweight=False).reweighted)
+
+    def test_non_convergence_falls_back_to_the_uniform_solve(self):
+        original = rl._min_curvature_offsets
+
+        def fails_when_weighted(*args, weights=None, **kwargs):
+            if weights is not None:
+                raise rl.RacelineError('raceline QP did not converge: boom')
+            return original(*args, **kwargs)
+
+        with mock.patch.object(rl, '_min_curvature_offsets', fails_when_weighted), \
+                self.assertWarns(RuntimeWarning):
+            line = self._build()
+        self.assertFalse(line.reweighted)
+        np.testing.assert_allclose(line.xy, self._build(reweight=False).xy, atol=1e-9)
+        clearance = rl.wall_clearance(line.sealed, line.xy)
+        self.assertGreaterEqual(float(clearance.min()), HALF_WIDTH + MARGIN - CLEARANCE_TOL)
+
+    def test_clearance_shortfall_also_falls_back_to_the_uniform_solve(self):
+        original = rl._relinearise
+
+        def weighted_line_hugs_the_walls(centerline, *args, kappa_ref, **kwargs):
+            if kappa_ref is not None:
+                return rl.resample_closed(centerline + 0.7, rl.OPT_SPACING)
+            return original(centerline, *args, kappa_ref=kappa_ref, **kwargs)
+
+        with mock.patch.object(rl, '_relinearise', weighted_line_hugs_the_walls), \
+                self.assertWarns(RuntimeWarning) as caught:
+            line = self._build()
+        self.assertIn('closer than', str(caught.warning))
+        self.assertFalse(line.reweighted)
+        clearance = rl.wall_clearance(line.sealed, line.xy)
+        self.assertGreaterEqual(float(clearance.min()), HALF_WIDTH + MARGIN - CLEARANCE_TOL)
+
+    def test_a_failing_uniform_solve_still_raises(self):
+        with mock.patch.object(rl, '_min_curvature_offsets',
+                               side_effect=rl.RacelineError('raceline QP did not converge')), \
+                self.assertWarns(RuntimeWarning), self.assertRaises(rl.RacelineError):
+            self._build()
+
+    def test_an_unrelated_runtime_error_is_not_swallowed(self):
+        with mock.patch.object(rl, '_min_curvature_offsets',
+                               side_effect=RuntimeError('something else broke')):
+            with self.assertRaisesRegex(RuntimeError, 'something else broke'):
+                self._build()
+
+    def test_nonsense_reweighting_parameters_are_refused(self):
+        for name, kwargs in (('zero kappa_ref', dict(kappa_ref=0.0)),
+                             ('negative kappa_ref', dict(kappa_ref=-0.6)),
+                             ('no iterations', dict(reweight_iterations=0))):
+            with self.subTest(case=name), self.assertRaises(ValueError):
+                self._build(**kwargs)
+
+
+@unittest.skipUnless(os.path.exists(MAP_YAML), 'maps/icra26.yaml not found')
+class TestIcra26Reweighted(unittest.TestCase):
+    """The shipped line (margin 0.25) must be steerable through the sector-D apex."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.grid = rl.load_occupancy(MAP_YAML)
+        cls.center = lap_floor.load_path(lap_floor.default_centerline_path())
+        with mock.patch.object(rl, '_min_curvature_offsets',
+                               wraps=rl._min_curvature_offsets) as solves:
+            cls.line = rl.build_raceline(cls.center, cls.grid, margin=SHIPPED_MARGIN,
+                                         half_width=HALF_WIDTH)
+        cls.solve_count = solves.call_count
+        cls.uniform = rl.build_raceline(cls.center, cls.grid, margin=SHIPPED_MARGIN,
+                                        half_width=HALF_WIDTH, reweight=False)
+
+    def test_the_build_did_not_silently_fall_back(self):
+        self.assertTrue(self.line.reweighted)
+
+    def test_peak_smoothed_curvature_is_below_full_lock(self):
+        peak = float(sp.closed_curvature(self.line.xy).max())
+        self.assertLess(peak, FULL_LOCK_KAPPA)
+        self.assertLess(peak, float(sp.closed_curvature(self.uniform.xy).max()) - 0.05)
+
+    def test_clearance_is_at_least_the_required_distance(self):
+        clearance = rl.wall_clearance(self.line.sealed, self.line.xy)
+        self.assertGreaterEqual(float(clearance.min()),
+                                HALF_WIDTH + SHIPPED_MARGIN - rl.CLEARANCE_EPS)
+
+    def test_build_cost_is_one_solve_per_iteration_with_no_slack_retry(self):
+        # Wall time swings 2-5x with BLAS threads and machine load, so the cost is
+        # pinned by the work done; the clock only guards against a hang.
+        self.assertEqual(self.solve_count, rl.REWEIGHT_ITERATIONS)
+        self.assertLess(self.line.build_seconds, BUILD_HANG_GUARD_SECONDS)
 
 
 @unittest.skipUnless(os.path.exists(MAP_YAML), 'maps/icra26.yaml not found')
@@ -323,6 +464,18 @@ class TestCachedRaceline(unittest.TestCase):
             rl.build_raceline = original
         self.assertEqual(len(core.reference_path), 392, 'fell back to a thinner-margin cache')
         self.assertIn('margin', log.text('error'))
+
+    def test_write_refuses_a_line_that_fell_back_to_the_uniform_solve(self):
+        import tempfile
+        xy, _ = rl.read_cached(self.CACHE)
+        grid = rl.load_occupancy(MAP_YAML)
+        uniform = rl.Raceline(xy=xy, sealed=grid, build_seconds=0.0, reweighted=False)
+        with tempfile.TemporaryDirectory() as folder:
+            target = os.path.join(folder, 'line.csv')
+            with mock.patch.object(rl, 'build_raceline', return_value=uniform):
+                status = rl.main(['--margin', '0.25', '--write', target])
+            self.assertNotEqual(status, 0)
+            self.assertFalse(os.path.exists(target), 'a uniform line was cached')
 
     def test_negative_or_nan_margin_is_refused(self):
         import driver_params
