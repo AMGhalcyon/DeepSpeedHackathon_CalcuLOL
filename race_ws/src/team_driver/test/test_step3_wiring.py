@@ -33,14 +33,15 @@ def _values(**changes):
 
 class ParamTableTest(unittest.TestCase):
 
-    def test_the_schedule_defaults_to_the_control_period_throughout(self):
-        self.assertEqual(driver_params.DEFAULTS['mpc.dt_schedule'], [0.025] * 8)
+    def test_the_schedule_defaults_to_the_long_one(self):
+        # Step 4: the 0.5 s lookahead the gate was run at.
+        self.assertEqual(driver_params.DEFAULTS['mpc.dt_schedule'], [0.025, 0.025, 0.05, 0.05, 0.075, 0.075, 0.1, 0.1])
 
     def test_feedforward_defaults_off(self):
         self.assertIs(driver_params.DEFAULTS['mpc.feedforward'], False)
 
-    def test_the_model_defaults_to_kinematic(self):
-        self.assertEqual(driver_params.DEFAULTS['vehicle.model'], 'KS')
+    def test_the_model_defaults_to_the_judged_single_track(self):
+        self.assertEqual(driver_params.DEFAULTS['vehicle.model'], 'ST')
 
     def test_the_harness_runs_the_declared_model(self):
         self.assertEqual(lap_sim.JUDGED_MODEL, driver_params.DEFAULTS['vehicle.model'])
@@ -139,7 +140,7 @@ class HarnessFlagsTest(unittest.TestCase):
 
     def test_defaults_are_the_declared_car(self):
         cfg = lap_sim.parse_config([])
-        self.assertEqual(cfg.model, 'KS')
+        self.assertEqual(cfg.model, 'ST')
         self.assertIsNone(cfg.dt_schedule)
         self.assertFalse(cfg.feedforward)
         self.assertEqual(cfg.driver_overrides, ())

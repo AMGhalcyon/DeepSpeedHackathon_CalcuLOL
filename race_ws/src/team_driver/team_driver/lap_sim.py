@@ -79,9 +79,11 @@ JUDGED_MPC = dict(prediction_horizon=8, control_horizon=3, dt=0.025,
                   q_pos=2.0, q_yaw=2.0, q_vel=0.5, r_steer=0.08, r_accel=0.01,
                   r_delta_steer=3.0, r_delta_accel=0.005,
                   block_map=[0, 1, 1, 2, 2, 2, 2, 2], maxiter=25,
-                  solve_budget_ms=15.0, dt_schedule=[0.025] * 8, feedforward=False)
+                  solve_budget_ms=15.0,
+                  dt_schedule=[0.025, 0.025, 0.05, 0.05, 0.075, 0.075, 0.1, 0.1],
+                  feedforward=False)
 # The node's `vehicle.model` (driver_params.py; test_step3_wiring.py holds them equal).
-JUDGED_MODEL = 'KS'
+JUDGED_MODEL = 'ST'
 # [m] Spacing of the resampled reference the lateral-error meter measures to;
 # the distance it reports is high by at most half of it.
 LATERAL_ERROR_SPACING = 0.01
@@ -102,6 +104,9 @@ MAX_DELTA_EST_ERR = 0.02        # rad
 # means the model is wrong or the estimate has drifted. Coasting is a fallback
 # for a controller with nothing to say, so a clean run never needs it.
 MAX_SLEW_BIND_RATE = 0.02       # fraction of commands the limiter shortened
+# Step 4: the emergency cap is a safety net under the profile. If it binds
+# often, the line or the profile is wrong, not the cap.
+MAX_EMERGENCY_BIND_RATE = 0.01  # fraction of commands the emergency cap slowed
 # Step 2's binding gate on the harness itself: today's controller must fail the
 # way it fails when judged (7 collisions / 10 laps in the judged run).
 GATE_MIN_COLLISIONS_PER_10 = 3
@@ -189,24 +194,36 @@ def parse_schedule(text):
 
 
 class LateralError:
-    """Distance from a point to a closed reference polyline.
+    """Distance from a point to a closed reference polyline, and the value there.
 
     The line is resampled every LATERAL_ERROR_SPACING, closing segment
     included, and the nearest sample stands for the nearest point: high by at
-    most half a spacing, and only for a point almost on the line.
+    most half a spacing, and only for a point almost on the line. `values`
+    (one per waypoint, e.g. the speed profile) are interpolated the same way.
     """
 
-    def __init__(self, path, spacing=LATERAL_ERROR_SPACING):
+    def __init__(self, path, spacing=LATERAL_ERROR_SPACING, values=None):
         p = np.asarray(path, dtype=np.float64)[:, :2]
         ends = np.roll(p, -1, axis=0)
-        samples = []
-        for a, b in zip(p, ends):
+        v = None if values is None else np.asarray(values, dtype=np.float64)
+        v_ends = None if v is None else np.roll(v, -1)
+        samples, sample_values = [], []
+        for i, (a, b) in enumerate(zip(p, ends, strict=True)):
             count = max(1, int(math.ceil(math.hypot(*(b - a)) / spacing)))
-            samples.append(a + np.outer(np.arange(count) / count, b - a))
+            f = np.arange(count) / count
+            samples.append(a + np.outer(f, b - a))
+            if v is not None:
+                sample_values.append(v[i] + f * (v_ends[i] - v[i]))
         self._tree = cKDTree(np.vstack(samples))
+        self._values = np.concatenate(sample_values) if v is not None else None
 
     def distance(self, xy):
         return float(self._tree.query(np.asarray(xy[:2], dtype=np.float64))[0])
+
+    def nearest(self, xy):
+        """(distance, value) at the nearest point; the value is None without values."""
+        d, i = self._tree.query(np.asarray(xy[:2], dtype=np.float64))
+        return float(d), (None if self._values is None else float(self._values[i]))
 
 
 def parse_mpc_override(text):
@@ -395,6 +412,7 @@ class _Log:
         self.distance = 0.0
         self.lateral = None    # LateralError against the driver's reference
         self.lateral_err = []  # [m] per racing-lap physics step, base_link to the reference
+        self.overshoot = []    # [m/s] per racing-lap physics step, plant speed - profile
         self.beta_peak = 0.0   # [rad] the largest |sideslip| the plant reached
 
 
@@ -452,6 +470,11 @@ def _summarise(cfg, log, plant, counter, line, wall_s, contact, conditioning,
         'reversals_per_m': reversals / log.distance if log.distance > 0 else 0.0,
         'slew_bind_rate': conditioning.slew_bind_rate,
         'coast_count': conditioning.coast_count,
+        'emergency_bind_rate': conditioning.emergency_bind_rate,
+        # Racing laps only, like the lateral error: the plant against the profile
+        # at its nearest point on the reference.
+        'profile_overshoot_max': _stat(np.max, log.overshoot),
+        'profile_overshoot_p99': _stat(lambda v: np.percentile(v, 99), log.overshoot),
         'cmd_speed_step_max': (float(np.max(np.abs(np.diff(cmd_speed))))
                                if cmd_speed.size > 1 else 0.0),
         'delta_est_err_mean': _stat(np.mean, log.delta_est_err),
@@ -495,7 +518,10 @@ def _advance(steps, plant, contact, counter, line, ring, log, prev_xy, cfg):
         # Racing laps only: the spawn sits on the centreline, so the out-lap
         # measures joining the reference, not holding it.
         if log.lateral is not None and line.crossings:
-            log.lateral_err.append(log.lateral.distance(xy))
+            distance, profile = log.lateral.nearest(xy)
+            log.lateral_err.append(distance)
+            if profile is not None:
+                log.overshoot.append(log.speed[-1] - profile)
         log.distance += math.hypot(xy[0] - prev_xy[0], xy[1] - prev_xy[1])
         if line.update(prev_xy, xy, plant.time) and not cfg.quiet:
             print(f'  lap {line.laps}: {line.lap_times[-1]:.2f} s')
@@ -524,7 +550,11 @@ def run(cfg: HarnessConfig):
     ring = SnapshotRing(cfg.stale_steps, (plant.state.copy(), plant.time))
     log = _Log()
     if core.reference_path is not None:
-        log.lateral = LateralError(core.reference_path)
+        speeds = core.reference_speeds
+        log.lateral = LateralError(
+            core.reference_path,
+            values=speeds if speeds is not None and len(speeds) == len(core.reference_path)
+            else None)
     prev_xy = plant.base_link_pose[:2]
     tick = 0
     next_report = 5.0
@@ -594,6 +624,9 @@ def verdict(r):
                        f"> {MAX_SLEW_BIND_RATE:.0%}")
     if r.get('coast_count', 0):
         reasons.append(f"{r['coast_count']} coast steps in a clean run")
+    if r.get('emergency_bind_rate', 0.0) > MAX_EMERGENCY_BIND_RATE:
+        reasons.append(f"emergency cap bound on {r['emergency_bind_rate']:.1%} of commands "
+                       f"> {MAX_EMERGENCY_BIND_RATE:.0%}")
     return reasons
 
 
@@ -637,6 +670,11 @@ def report(r):
     print(f"  lateral error     mean {r.get('lateral_err_mean', 0.0):.3f}, p95 "
           f"{r.get('lateral_err_p95', 0.0):.3f}, max {r.get('lateral_err_max', 0.0):.3f} m "
           f"from the reference")
+    print(f"  speed caps        emergency bound on "
+          f"{r.get('emergency_bind_rate', 0.0):.2%} of commands "
+          f"(gate <= {MAX_EMERGENCY_BIND_RATE:.0%}); plant over profile max "
+          f"{r.get('profile_overshoot_max', 0.0):+.3f}, p99 "
+          f"{r.get('profile_overshoot_p99', 0.0):+.3f} m/s")
     print(f"  dead time         {r['dead_time_ms_mean']:.0f} ms mean "
           f"(solve wait {r['latency_steps_mean']:.1f} steps; period "
           f"{r['hold_steps_mean']:.1f} steps, max {r['hold_steps_max']})")

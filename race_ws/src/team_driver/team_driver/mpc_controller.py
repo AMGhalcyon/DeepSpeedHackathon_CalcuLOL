@@ -160,6 +160,7 @@ class MPCController:
         # Last full optimised sequence, flattened; the next solve shifts it one
         # step to warm-start SLSQP.
         self._u_prev = np.zeros(self.control_horizon * self.control_dim)
+        self._last_state = None    # the state the last solve planned from
 
         # Reference path (will be set externally)
         self.reference_path = None
@@ -361,6 +362,38 @@ class MPCController:
             path, a_lat_max=a_lat_max, lock_margin=lock_margin,
             a_accel_max=a_accel_max, a_brake_max=a_brake_max, v_max=v_max,
             closed=closed)
+
+    @property
+    def arc_position(self) -> Optional[float]:
+        """[m] Arc position the last solve anchored its reference at, or None.
+
+        It is the arc of the state that solve was given -- the pose the driver
+        planned from -- in `set_reference_path`'s parameterisation.
+        """
+        return self._s_ref
+
+    def reset_tracking(self) -> None:
+        """Forget where the car was and what it planned: the sim was reset.
+
+        The nearest-waypoint search only looks near the last index, so a car
+        respawned elsewhere would otherwise stay localised to its old arc.
+        """
+        self._last_path_index = None
+        self._s_ref = None
+        self._window_s = None
+        self._u_prev = np.zeros(self.control_horizon * self.control_dim)
+        self.prev_control = np.zeros(self.control_dim)
+        self._last_state = None
+
+    def planned_path(self) -> Optional[np.ndarray]:
+        """(N+1, 2) positions the plan being executed drives through, or None.
+
+        The last solve's controls (or, after a fallback, the plan it fell back
+        to) rolled out from the state it planned from.
+        """
+        if self._last_state is None:
+            return None
+        return self._predict_trajectory(self._last_state, self._u_prev)[:, :2].copy()
 
     @property
     def search_window(self) -> int:
@@ -796,6 +829,7 @@ class MPCController:
         self.solve_count += 1
 
         current_state = self._complete_state(current_state)
+        self._last_state = current_state.copy()
 
         # Generate reference trajectory over prediction horizon
         reference_states = []

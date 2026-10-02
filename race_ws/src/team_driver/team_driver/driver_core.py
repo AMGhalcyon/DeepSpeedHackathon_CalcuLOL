@@ -15,11 +15,12 @@ with `info`/`warn`/`error`; the node passes `self.get_logger()` and the harness
 passes whatever it likes (or nothing, for silence).
 """
 
+import functools
 import math
 import os
 import sys
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import numpy as np
 
@@ -28,12 +29,22 @@ if _current_dir not in sys.path:
     sys.path.insert(0, _current_dir)
 try:
     from .mpc_controller import MPCController   # ROS / package import
-    from .vehicle_model import VehicleModel
+    from .vehicle_model import F1TENTH_VEHICLE_PARAMETERS, SpeedLoop, VehicleModel
     from . import raceline
+    from .latch_predictor import (LATCH_TIME_TOL, LatchPredictor, Prediction,
+                                  plant_servo_rate, servo_kp)
+    from .longitudinal import (LIDAR_FORWARD, ClosedPath, bearing_lookahead,
+                               clearance_along_path, front_overhang, path_clearance,
+                               scan_points)
 except ImportError:
     from mpc_controller import MPCController    # standalone `python3 lap_sim.py`
-    from vehicle_model import VehicleModel
+    from vehicle_model import F1TENTH_VEHICLE_PARAMETERS, SpeedLoop, VehicleModel
     import raceline
+    from latch_predictor import (LATCH_TIME_TOL, LatchPredictor, Prediction,
+                                 plant_servo_rate, servo_kp)
+    from longitudinal import (LIDAR_FORWARD, ClosedPath, bearing_lookahead,
+                              clearance_along_path, front_overhang, path_clearance,
+                              scan_points)
 
 
 class _NullLogger:
@@ -58,30 +69,38 @@ class DriverConfig:
     than a silently different car.
     """
 
-    crawl_speed: float = 1.0        # [m/s]
+    crawl_speed: float = 1.0        # [m/s] the emergency cap never asks for less
     max_range: float = 8.0          # [m] clip the scan here
-    v_max: float = 3.0              # [m/s] speed cap on the profile
+    v_max: float = 10.0             # [m/s] caps the profile and emergency bound; should not bind
     # Speed profile (speed_profile.py). `a_lat_max` is a slip budget, not a grip
     # limit: the plant's tyres are linear, so rear slip is a_y / 56.1 rad.
-    a_lat_max: float = 0.8          # [m/s^2] cornering budget
+    # [m/s^2] Cornering budget: ~5 deg of rear slip. Step 4 gate: 10 harness laps,
+    # 0 collisions at stale 9 and 14, best 17.93 s.
+    a_lat_max: float = 5.0
     lock_margin: float = 0.95       # fraction of the steering lock the profile may use
     a_accel_max: float = 9.51       # [m/s^2] acceleration the profile plans (plant: 9.51)
-    a_brake_max: float = 0.8        # [m/s^2] braking the profile plans (plant: 9.51)
-    a_brake: float = 0.8            # [m/s^2] braking budget of the safety layers
-    steer_limit: float = 0.4        # [rad]
+    # [m/s^2] Braking the profile plans, and the most the conditioner passes on
+    # from the MPC (plant: 9.51). The profile and emergency caps may brake harder.
+    a_brake_max: float = 6.0
+    # [m/s^2] Braking the emergency cap assumes, and the rate a coast sheds speed.
+    a_emergency: float = 7.0
+    steer_limit: float = 0.4189     # [rad] the real lock, VehicleParameters.s_max
     # Reference line the MPC tracks: 'centerline' (the shipped CSV) or 'raceline'
     # (minimum curvature, built from the map at startup; see raceline.py).
-    reference: str = 'centerline'
-    raceline_margin: float = 0.10   # [m] clearance beyond the car's half-width kept from walls
-    # [m] Clearance the braking-distance cap keeps in hand. Swept 0.0-0.5 over
-    # 10 harness laps: 0 collisions at every value and at stale 5/9/14, and each
-    # 0.1 m cost ~1 s of lap time, so the smallest value was taken. The cap
-    # still assumes only a_brake (0.8 m/s^2) of braking, far below what the
-    # plant can do, so 0.0 is not zero reserve.
+    reference: str = 'raceline'
+    # [m] Clearance beyond the car's half-width kept from walls. 0.10 was too thin
+    # once the car ran at profile speed (DQ at a_lat_max 5); 0.25 gave 0 collisions
+    # and was faster than 0.20, since nothing brakes the car mid-corner.
+    raceline_margin: float = 0.25
+    # [m] Clearance the emergency cap keeps in hand, beyond the body's own
+    # overhang ahead of the lidar (longitudinal.front_overhang).
     stop_margin: float = 0.0
-    k_steer_derate: float = 2.0     # speed cap in a turn: v_max / (1 + k |steer|)
     coast_steer_rate: float = 1.0   # [rad/s] steering decay toward straight while coasting
-    accel_limit: float = 4.0        # [m/s^2] fastest the speed setpoint may rise
+    accel_limit: float = 4.0        # [m/s^2] most acceleration the conditioner passes on
+    # Plan from where the car will be when the command latches, replaying the
+    # published commands over the dead time (latch_predictor.py); False plans
+    # from the measured, dead-time-old state.
+    predict_latch: bool = True
 
 
 class DriveCommand(NamedTuple):
@@ -104,10 +123,24 @@ class ConditioningStats(NamedTuple):
     steps: int          # commands conditioned (coasts are counted separately)
     slew_binds: int     # of those, commands the slew limiter shortened
     coast_count: int    # commands replaced by `_coast()`
+    emergency_binds: int = 0    # conditioned commands the emergency cap slowed
 
     @property
     def slew_bind_rate(self) -> float:
         return self.slew_binds / self.steps if self.steps else 0.0
+
+    @property
+    def emergency_bind_rate(self) -> float:
+        return self.emergency_binds / self.steps if self.steps else 0.0
+
+
+class Plan(NamedTuple):
+    """What `plan` wants, before the conditioner holds it to what the car can do."""
+
+    steering: float                 # [rad]
+    accel: float                    # [m/s^2] demanded over the command's hold
+    profile_speed: float = math.inf  # [m/s] the profile where the hold ends
+    speed_cap: float = math.inf     # [m/s] emergency bound, at the latch
 
 
 REFERENCES = ('centerline', 'raceline')
@@ -119,16 +152,21 @@ DT_CLAMP_HIGH = 3.0    # x nominal: a dropped scan must not hand over a 1 s dt
 PLANT_STEP_DT = 0.01            # [s] gym_bridge.py sim_timestep; one servo evaluation each
 STEER_CORRECT_MIN_SPEED = 0.8   # [m/s] below this the yaw-rate inversion is ill-conditioned
 STEER_CORRECT_TAU = 0.5         # [s] time constant of the yaw-rate leash (~5 % per 25 ms)
-LATCH_TIME_TOL = 1e-6           # [s] stamps are float sums of 0.01; compare with slack
 # [s] Sim time jumping back further than this is a reset (/initialpose makes
 # the bridge call env.reset(), which zeroes sim_time and re-centres the wheel).
 # Smaller backward steps are an out-of-order stamp and are ignored.
 SIM_RESET_BACKSTEP = 0.1
 RTF_SMOOTHING = 0.05            # EMA weight per control step for the live RTF
-FRONT_HALF_ANGLE = 0.2          # [rad] the sector the braking-distance cap looks down
-# The near end of that sector, not its mean: one long beam down a gap must not
-# lift the cap.
-FRONT_PERCENTILE = 10
+# [m/s] Where the gap-follower heads when there is no reference to track: the
+# old v_max it was tuned at, not today's cap, which should never bind.
+REACTIVE_SPEED = 3.0
+# [m] Corridor kept beyond the stopping distance along the plan, so a wall just
+# past it still shows as the clearance it is rather than as "nothing seen".
+PATH_CAP_SLACK = 1.0
+# The plan's period, learnt from the publish stamps: a solve that overruns the
+# timer stretches it, and the next command then lands later than one period on.
+PUBLISH_INTERVAL_SMOOTHING = 0.2    # EMA weight per published command
+PUBLISH_INTERVAL_MAX = 4.0          # x mpc.dt: a stall must not predict seconds ahead
 # [rad] Largest odometry sideslip handed to the ST model (its state bound,
 # VehicleModel.get_state_bounds); beyond it the car is reversing or spinning.
 MPC_BETA_LIMIT = 0.5
@@ -188,12 +226,13 @@ class SteeringEstimator:
     """
 
     def __init__(self, params=None):
-        p = params if params is not None else VehicleModel().params
+        p = params if params is not None else F1TENTH_VEHICLE_PARAMETERS
+        self._params = p
         self.s_min = float(p.s_min)
         self.s_max = float(p.s_max)
         self.sv_max = float(p.sv_max)
         # action.py:47-48 -- the bridge passes no steer_kp, so the plant derives it.
-        self.kp = 10.0 * self.sv_max / (self.s_max - self.s_min)
+        self.kp = servo_kp(p)
         self.wheelbase = float(p.lf + p.lr)
 
         self.delta_hat = 0.0      # [rad] the car starts on the grid, wheel centred
@@ -275,10 +314,7 @@ class SteeringEstimator:
 
     def _servo_step(self, delta, cmd, h):
         """utils.py pid_steer + steering_constraint, one step of length h."""
-        sv = min(max(self.kp * (cmd - delta), -self.sv_max), self.sv_max)
-        if (delta <= self.s_min and sv <= 0.0) or (delta >= self.s_max and sv >= 0.0):
-            sv = 0.0
-        return delta + sv * h
+        return delta + plant_servo_rate(self._params, self.kp, delta, cmd) * h
 
 
 class LatchClock:
@@ -314,6 +350,24 @@ class LatchClock:
         return t_sim_now + solve_wall_s * rtf
 
 
+@functools.lru_cache(maxsize=4)
+def _built_raceline(centerline_path, margin):
+    """(xy, build seconds) of the raceline for a centreline file and margin.
+
+    Built once per process: the node builds it once anyway, and the harness
+    and the tests construct many cores from the same map.
+    """
+    yaml_path = raceline.find_map_yaml(centerline_path)
+    if yaml_path is None:
+        raise FileNotFoundError(f'no map yaml beside {centerline_path}')
+    centerline_xy = np.atleast_2d(
+        np.loadtxt(centerline_path, delimiter=',', comments='#'))[:, :2]
+    line = raceline.build_raceline(centerline_xy, raceline.load_occupancy(yaml_path),
+                                   margin=margin)
+    line.xy.setflags(write=False)
+    return line.xy, line.build_seconds
+
+
 class DriverCore:
     """The algorithm: reference path, MPC, and the reactive safety layer."""
 
@@ -328,10 +382,10 @@ class DriverCore:
         self.crawl_speed = self.cfg.crawl_speed
         self.max_range = self.cfg.max_range
         self.v_max = self.cfg.v_max
-        self.a_brake = self.cfg.a_brake
+        self.a_brake_max = self.cfg.a_brake_max
+        self.a_emergency = self.cfg.a_emergency
         self.steer_limit = self.cfg.steer_limit
         self.stop_margin = self.cfg.stop_margin
-        self.k_steer_derate = self.cfg.k_steer_derate
         self.coast_steer_rate = self.cfg.coast_steer_rate
         self.accel_limit = self.cfg.accel_limit
 
@@ -342,7 +396,22 @@ class DriverCore:
         self._planned_scan_t = None
         self._last_planned = DriveCommand(0.0, 0.0, 0.0)
         vehicle = getattr(self.mpc_controller, 'vehicle_model', None)
-        self.steering = SteeringEstimator(vehicle.params if vehicle is not None else None)
+        params = vehicle.params if vehicle is not None else F1TENTH_VEHICLE_PARAMETERS
+        self.steering = SteeringEstimator(params)
+        # The plant's speed loop, inverted to send a speed for an acceleration,
+        # and the whole plant, replayed to where the next command will land.
+        self.speed_loop = SpeedLoop.of(params)
+        self.latch_predictor = LatchPredictor(params)
+        self._half_width = float(params.width) / 2.0
+        self._overhang = front_overhang(params)
+        self._plant_a_max = float(params.a_max)
+        # The plant at the latch of the command being planned; None until the
+        # first pose, when the measured speed stands in.
+        self._latch = None
+        # The MPC's arc position and planned path for this cycle's solve; None
+        # when the cycle did not solve (reactive), so no cap reads a stale one.
+        self._solved_arc = None
+        self._planned_path = None
 
         # Latest known pose and speed. Ground truth from the simulator, which
         # the rules allow you to use - so use it.
@@ -363,19 +432,22 @@ class DriverCore:
 
         self.reference_path = None
         self.reference_speeds = None
+        self._reference = None    # ClosedPath over both, for the speed caps
 
         # What actually went on the wire last, and when.
         self._last_cmd = DriveCommand(0.0, 0.0, 0.0)
         self._last_publish_t = None
+        self._publish_interval = None     # [s] smoothed latch-to-latch interval
 
-        # The conditioner's own memory of its last output: the base the rate
-        # limits step from. None until the first command, which starts from the
-        # wheel estimate and the measured speed instead.
+        # The conditioner's own memory of its last steering output: the base the
+        # slew limit steps from. None until the first command, which starts from
+        # the wheel estimate instead. Speed needs no memory: each setpoint is
+        # inverted afresh from the predicted speed.
         self._cond_steer = None
-        self._cond_speed = None
         self._seen_reseeds = 0
         self._cond_steps = 0
         self._slew_binds = 0
+        self._emergency_binds = 0
         self._coast_count = 0
         self._coasting = False
 
@@ -473,15 +545,9 @@ class DriverCore:
         margin asked for.
         """
         try:
-            yaml_path = raceline.find_map_yaml(centerline_path)
-            if yaml_path is None:
-                raise FileNotFoundError(f'no map yaml beside {centerline_path}')
-            line = raceline.build_raceline(
-                centerline_xy, raceline.load_occupancy(yaml_path),
-                margin=self.cfg.raceline_margin)
-            self.log.info(
-                f'raceline: {len(line.xy)} points, built in {line.build_seconds:.2f} s')
-            return line.xy
+            xy, seconds = _built_raceline(centerline_path, float(self.cfg.raceline_margin))
+            self.log.info(f'raceline: {len(xy)} points, built in {seconds:.2f} s')
+            return xy.copy()
         except Exception as e:
             reason = f'build failed: {e}'
 
@@ -527,28 +593,38 @@ class DriverCore:
             self.log.info(
                 f'Loaded {len(centerline_data)} centerline points from {centerline_path}')
 
-            self.reference_path = centerline_data[:, :2]
+            path = centerline_data[:, :2]
             if self.cfg.reference == 'raceline':
-                self.reference_path = self._raceline_reference(
-                    centerline_path, self.reference_path)
+                path = self._raceline_reference(centerline_path, path)
 
             # Curvature-limited speeds, not a flat 3 m/s. The track is ~0.5 m
             # wide and the centerline peaks well above a curvature that 3 m/s
             # can hold, so a constant reference drives straight into the
             # outside wall at the first real corner.
-            self.reference_speeds = self.mpc_controller.speed_profile(
-                path=self.reference_path, v_max=self.v_max,
+            speeds = self.mpc_controller.speed_profile(
+                path=path, v_max=self.v_max,
                 a_lat_max=self.cfg.a_lat_max, lock_margin=self.cfg.lock_margin,
                 a_accel_max=self.cfg.a_accel_max, a_brake_max=self.cfg.a_brake_max)
-            self.log.info(
-                f'Speed profile: {self.reference_speeds.min():.2f}'
-                f'-{self.reference_speeds.max():.2f} m/s')
-
-            self.mpc_controller.set_reference_path(self.reference_path, self.reference_speeds)
+            self.log.info(f'Speed profile: {speeds.min():.2f}-{speeds.max():.2f} m/s')
+            self.set_reference(path, speeds)
 
         except Exception as e:
             self.log.error(f'Error loading reference path: {e}')
             self.reference_path = None
+
+    def set_reference(self, path: np.ndarray, speeds: np.ndarray) -> None:
+        """Track `path` at `speeds`: the MPC's reference, and the speed caps' lookup.
+
+        The lookup is built first, so a mismatched pair changes nothing.
+        """
+        lookup = ClosedPath(path, speeds)
+        self.reference_path = path
+        self.reference_speeds = speeds
+        self._reference = lookup
+        self.mpc_controller.set_reference_path(path, speeds)
+        if not hasattr(self.mpc_controller, 'arc_position'):
+            self.log.warn(f'{type(self.mpc_controller).__name__} reports no arc_position: '
+                          'the profile cap is off and the emergency cap looks straight ahead')
 
     # ------------------------------------------------------------------
     # One control cycle
@@ -578,8 +654,15 @@ class DriverCore:
             # centred, so the old setpoints are not where any limit steps from.
             self._seen_reseeds = self.steering.reseeds
             self._cond_steer = None
-            self._cond_speed = None
             self._coasting = False
+            self.latch_predictor.reset()
+            self._last_publish_t = None
+            self._publish_interval = None
+            # The MPC's arc tracking and plan belong to the old episode too.
+            reset_tracking = getattr(self.mpc_controller, 'reset_tracking', None)
+            if callable(reset_tracking):
+                reset_tracking()
+        self._latch = self._predict_latch(t_pose)
 
         ranges, angles = self.preprocess()
         planned = self.plan(ranges, angles)
@@ -587,95 +670,223 @@ class DriverCore:
         if planned is None:
             self._last_planned = self._coast(dt, 'no usable plan')
         else:
-            steering, speed, speed_cap = planned
-            self._last_planned = self._condition(steering, speed, dt, speed_cap)
+            self._last_planned = self._condition(planned.steering, planned.accel, dt,
+                                                 speed_cap=planned.speed_cap,
+                                                 profile_speed=planned.profile_speed)
         return self._last_planned
 
+    def _measured_state(self):
+        """(x, y, yaw, v, beta, wheel, yaw_rate) as measured, made safe to replay.
+
+        Odometry's beta is atan2(vy, vx) beside a speed that is a magnitude,
+        so reversing reads as beta ~ pi. Past the model's slip bound it is that,
+        or a spin, not a slip the tyre model describes.
+        """
+        def finite(value):
+            return value if math.isfinite(value) else 0.0
+        beta = finite(self.beta)
+        return (self.position[0], self.position[1], self.yaw, finite(self.speed),
+                beta if abs(beta) <= MPC_BETA_LIMIT else 0.0,
+                self.steering.delta_hat, finite(self.yaw_rate))
+
+    def _predict_latch(self, t_pose) -> Optional[Prediction]:
+        """The plant when the command planned now latches; None with no pose.
+
+        The pose is a dead time old. Commands go out on a fixed timer, so this
+        one latches a period after the last one did: the control period, or
+        longer while solves overrun it.
+        """
+        if self.position is None:
+            return None
+        state = self._measured_state()
+        if not self.cfg.predict_latch:
+            return Prediction(state, 0.0)
+        period = max(self.mpc_dt, self._publish_interval or 0.0)
+        t_latch = (self._last_publish_t + period
+                   if self._last_publish_t is not None else None)
+        return self.latch_predictor.predict(state, t_pose, t_latch)
+
+    def _latch_speed(self) -> float:
+        """[m/s] The speed the next command acts from; the measured one if unknown."""
+        v = self._latch.speed if self._latch is not None else self.speed
+        return v if math.isfinite(v) else 0.0
+
+    def _latch_travel(self) -> float:
+        """[m] Distance covered between the pose's stamp and the next latch."""
+        return self._latch.travelled if self._latch is not None else 0.0
+
     def conditioning_stats(self) -> ConditioningStats:
-        """Slew-limiter and coast counts since construction."""
-        return ConditioningStats(self._cond_steps, self._slew_binds, self._coast_count)
+        """Slew-limiter, coast and emergency-cap counts since construction."""
+        return ConditioningStats(self._cond_steps, self._slew_binds, self._coast_count,
+                                 self._emergency_binds)
 
     # ------------------------------------------------------------------
     # Output conditioning: the single path to the wire
     # ------------------------------------------------------------------
-    def _previous_output(self):
-        """(steer, speed) the next command's rate limits step from."""
+    def _previous_steer(self):
+        """[rad] The steering the next command's slew limit steps from."""
         steer = self._cond_steer if self._cond_steer is not None else self.steering.delta_hat
-        speed = self._cond_speed if self._cond_speed is not None else self.speed
         # A NaN here would be stored as the new memory and never wash out.
-        return (steer if math.isfinite(steer) else 0.0,
-                speed if math.isfinite(speed) else 0.0)
+        return steer if math.isfinite(steer) else 0.0
 
     def _issue(self, steer, speed, prev_steer, dt) -> DriveCommand:
         self._cond_steer = steer
-        self._cond_speed = speed
         rate = (steer - prev_steer) / dt if dt > 0.0 else 0.0
         return DriveCommand(steer, speed, rate)
 
-    def _condition(self, raw_steer, raw_speed, dt, speed_cap=math.inf) -> DriveCommand:
+    def _setpoint(self, accel: float) -> float:
+        """[m/s] The /drive speed that makes the plant accelerate at `accel`."""
+        return max(self.speed_loop.command(self._latch_speed(), accel, self.mpc_dt), 0.0)
+
+    def _condition(self, raw_steer: float, accel: float, dt: float, *,
+                   speed_cap: float = math.inf,
+                   profile_speed: float = math.inf) -> DriveCommand:
         """Hold a raw command to what the servo and the speed loop can follow.
 
         The steering step is limited to exactly `sv_max * dt`: at that rate the
         limiter only removes motion the wheel could not have followed, so it
         adds no lag. Tighter would remove motion the wheel could have followed.
-        The speed setpoint is rate-limited because /drive speed feeds a second
-        loop (pid_accl), and a step in it is a step in demanded acceleration.
 
-        `speed_cap` is the braking-distance bound and is applied last, as a
-        hard ceiling. It is a safety bound, so the rate limit must not delay it:
-        clearance can drop in a step (a wall comes into view) while the braking
-        rate limit would take half a second to follow.
+        Speed is handled as the acceleration it is. /drive speed feeds the
+        plant's proportional loop, so the setpoint is inverted from that loop
+        (`SpeedLoop.command`) from the speed the car will have when it latches.
+        The MPC's demand is clamped to [-a_brake_max, accel_limit]; then the
+        hold may end no faster than `profile_speed`, then no faster than
+        `speed_cap`. Those two may brake past the clamp, to the plant's limit:
+        the emergency cap is a safety bound and must not be delayed by it.
+        A NaN cap would be skipped by every comparison below -- failing open --
+        so it coasts instead; +inf is "no cap".
         """
-        if not (math.isfinite(raw_steer) and math.isfinite(raw_speed)):
+        if not (math.isfinite(raw_steer) and math.isfinite(accel)):
             return self._coast(dt, 'non-finite command')
+        if math.isnan(speed_cap) or math.isnan(profile_speed):
+            return self._coast(dt, 'non-finite speed cap')
         self._coasting = False
 
-        prev_steer, prev_speed = self._previous_output()
+        prev_steer = self._previous_steer()
         reach = self.steering.sv_max * dt
         target = float(np.clip(raw_steer, -self.steer_limit, self.steer_limit))
         steer = float(np.clip(target, prev_steer - reach, prev_steer + reach))
         steer = float(np.clip(steer, -self.steer_limit, self.steer_limit))
-        speed = float(np.clip(raw_speed,
-                              prev_speed - self.a_brake * dt,
-                              prev_speed + self.accel_limit * dt))
+
+        v = self._latch_speed()
+        a = min(max(accel, -self.a_brake_max), self.accel_limit)
+        a = min(a, (profile_speed - v) / self.mpc_dt)
+        a_cap = (speed_cap - v) / self.mpc_dt
+        if a_cap < a:
+            a = a_cap
+            self._emergency_binds += 1
+        a = max(a, -self._plant_a_max)
 
         self._cond_steps += 1
         if steer != target:
             self._slew_binds += 1
-        return self._issue(steer, max(min(speed, speed_cap), 0.0), prev_steer, dt)
+        return self._issue(steer, self._setpoint(a), prev_steer, dt)
 
     def _coast(self, dt, why='') -> DriveCommand:
         """Degrade smoothly when there is no usable plan: never snap.
 
         Steering unwinds toward straight at `coast_steer_rate` and speed is shed
-        at `a_brake`. The old fallbacks jumped the wheel to 0.0 from wherever it
-        was, at the moment the controller had admitted it did not know what was
+        at `a_emergency`, so a solver dropout at speed does not coast into a
+        wall. The old fallbacks jumped the wheel to 0.0 from wherever it was, at
+        the moment the controller had admitted it did not know what was
         happening.
         """
-        prev_steer, prev_speed = self._previous_output()
+        prev_steer = self._previous_steer()
         decay = self.coast_steer_rate * dt
         steer = prev_steer - math.copysign(min(abs(prev_steer), decay), prev_steer)
-        speed = max(prev_speed - self.a_brake * dt, 0.0)
 
         self._coast_count += 1
         if not self._coasting:
             self._coasting = True
             self.log.warn(f'Coasting ({why or "no usable command"}); '
                           f'{self._coast_count} coast steps so far')
-        return self._issue(steer, speed, prev_steer, dt)
+        return self._issue(steer, self._setpoint(-self.a_emergency), prev_steer, dt)
 
-    def _speed_cap(self, ranges, angles, steer) -> float:
-        """[m/s] Upper bound on speed from stopping distance and steering.
+    def _speed_cap(self, ranges: np.ndarray, angles: np.ndarray, bearing: float = 0.0,
+                   travelled: float = 0.0) -> float:
+        """[m/s] Emergency bound: the speed the body can still stop from at `a_emergency`.
 
-        A braking-distance bound, so it has no steps: it falls as the clearance
-        falls, and falls at about `a_brake` along the braking curve.
+        Clearance is looked for along `bearing` (the planned path's), measured
+        from the lidar, less the body's overhang ahead of it, less the distance
+        covered since the scan. A braking-distance bound, so it has no steps.
         """
-        front = ranges[np.abs(angles) <= FRONT_HALF_ANGLE]
-        clearance = float(np.percentile(front, FRONT_PERCENTILE)) if front.size else 1.0
-        d_stop = max(clearance - self.stop_margin, 0.0)
-        v_brake = math.sqrt(2.0 * self.a_brake * d_stop)
-        v_turn = self.v_max / (1.0 + self.k_steer_derate * abs(steer))
-        return float(np.clip(min(v_brake, v_turn), self.crawl_speed, self.v_max))
+        clearance = path_clearance(ranges, angles, bearing, self._half_width, self.max_range)
+        return self._braking_bound(clearance - travelled - self._overhang)
+
+    def _path_cap(self, ranges, angles, path) -> float:
+        """[m/s] Emergency bound along the plan being executed.
+
+        The corridor is the MPC's own predicted path, one car wide, from the
+        latch pose -- so it bends with a corner the car is taking, and starts
+        from where the car really points. A wall the plan runs into is in it;
+        the outside wall of a bend the plan follows is not. The scan is from
+        the measured pose, and is placed in the map from there.
+
+        It fails closed: a plan with no extent or no finite points, or a scan
+        that saw nothing because its beams read zero (NaN, or closer than the
+        sensor sees), falls back to the straight corridor, which brakes for
+        zero ranges.
+        """
+        v = self._latch_speed()
+        fallback = self._latch_travel() + v * self.mpc_dt
+        path = np.asarray(path, dtype=np.float64)
+        extent = (float(np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1)))
+                  if len(path) > 1 else 0.0)
+        if not (math.isfinite(self.yaw) and all(math.isfinite(c) for c in self.position)
+                and np.all(np.isfinite(path)) and extent > 1e-6):
+            return self._speed_cap(ranges, angles, 0.0, fallback)
+        lidar = (self.position[0] + LIDAR_FORWARD * math.cos(self.yaw),
+                 self.position[1] + LIDAR_FORWARD * math.sin(self.yaw))
+        points = scan_points(ranges, angles, lidar, self.yaw, self.max_range)
+        if len(points) == 0 and np.any(ranges <= 0.0):
+            return self._speed_cap(ranges, angles, 0.0, fallback)
+        front = LIDAR_FORWARD + self._overhang     # base_link to the bumper
+        hold = v * self.mpc_dt
+        needed = (v * v / (2.0 * self.a_emergency) + front + hold + self.stop_margin
+                  + PATH_CAP_SLACK)
+        clearance = clearance_along_path(points, path, self._half_width, needed)
+        if clearance >= needed:
+            return self.v_max       # nothing within reach of a stop: no bound
+        return self._braking_bound(clearance - front - hold)
+
+    def _braking_bound(self, reach) -> float:
+        """[m/s] The speed the body stops from at `a_emergency` within `reach`."""
+        v_brake = math.sqrt(2.0 * self.a_emergency * max(reach - self.stop_margin, 0.0))
+        return float(np.clip(v_brake, self.crawl_speed, self.v_max))
+
+    def _arc_position(self) -> Optional[float]:
+        """[m] The MPC's arc position for this cycle's pose, or None if it did not solve."""
+        if self._reference is None or self._solved_arc is None:
+            return None
+        return self._solved_arc if math.isfinite(self._solved_arc) else None
+
+    def _reference_bearing(self) -> float:
+        """[rad] Bearing, in the scan's frame, of the reference point ahead; 0 if unknown.
+
+        The scan and the pose are the same instant, so the bearing is taken
+        from that pose, at the lidar.
+        """
+        s = self._arc_position()
+        if (s is None or self.position is None or not math.isfinite(self.yaw)
+                or not all(math.isfinite(c) for c in self.position)):
+            return 0.0
+        target = self._reference.point_at(s + bearing_lookahead(self._latch_speed()))
+        lx = self.position[0] + LIDAR_FORWARD * math.cos(self.yaw)
+        ly = self.position[1] + LIDAR_FORWARD * math.sin(self.yaw)
+        bearing = math.atan2(target[1] - ly, target[0] - lx) - self.yaw
+        return (bearing + math.pi) % (2.0 * math.pi) - math.pi
+
+    def _profile_speed(self) -> float:
+        """[m/s] The profile at the arc position where this command's hold ends.
+
+        The MPC solved from the latch pose, so its arc position is already
+        there; the hold is what is left to go.
+        """
+        s = self._arc_position()
+        if s is None:
+            return math.inf
+        return self._reference.value_at(s + self._latch_speed() * self.mpc_dt)
 
     def note_published(self, cmd: DriveCommand, t_sim=None):
         """Record what actually went on the wire.
@@ -685,8 +896,15 @@ class DriverCore:
         estimate replays the servo from exactly that instant.
         """
         self._last_cmd = cmd
+        last = self._last_publish_t
+        if t_sim is not None and last is not None and t_sim > last:
+            gap = min(t_sim - last, PUBLISH_INTERVAL_MAX * self.mpc_dt)
+            smoothed = self._publish_interval
+            self._publish_interval = (gap if smoothed is None else
+                                      smoothed + PUBLISH_INTERVAL_SMOOTHING * (gap - smoothed))
         self._last_publish_t = t_sim
         self.steering.on_publish(cmd.steering_angle, t_sim)
+        self.latch_predictor.on_publish(cmd.steering_angle, cmd.speed, t_sim)
 
     def preprocess(self):
         """Turn a raw scan into clean ranges plus the angle of each beam.
@@ -705,21 +923,20 @@ class DriverCore:
     def _mpc_state(self):
         """The MPC's initial state, at the length its model takes.
 
-        [x, y, yaw, v, beta, wheel], plus the yaw rate for the ST model.
-        Odometry carries the real sideslip and yaw rate at the CoG, which is
-        what the ST model's beta and r are. The KS model gets beta = 0: it
-        holds beta constant across the horizon, so the measured value would
-        bend every prediction rather than inform it.
+        [x, y, yaw, v, beta, wheel], plus the yaw rate for the ST model, at
+        the instant the command will latch (or as measured, if prediction is
+        off). Odometry carries the real sideslip and yaw rate at the CoG,
+        which is what the ST model's beta and r are. The KS model gets
+        beta = 0: it holds beta constant across the horizon, so the measured
+        value would bend every prediction rather than inform it.
         """
         dynamic = getattr(self.mpc_controller, 'state_dim', 6) == 7
-        # Odometry's beta is atan2(vy, vx) beside a speed that is a magnitude,
-        # so reversing reads as beta ~ pi. Past the model's slip bound it is
-        # that, or a spin, not a slip the tyre model describes.
-        beta = self.beta if dynamic and abs(self.beta) <= MPC_BETA_LIMIT else 0.0
-        state = [self.position[0], self.position[1], self.yaw, self.speed,
-                 beta, self.steering.delta_hat]
+        latch = self._latch if self._latch is not None else Prediction(
+            self._measured_state(), 0.0)
+        x, y, yaw, v, beta, wheel, yaw_rate = latch.state
+        state = [x, y, yaw, v, beta if dynamic else 0.0, wheel]
         if dynamic:
-            state.append(self.yaw_rate)
+            state.append(yaw_rate)
         return np.array(state)
 
     # ==================================================================
@@ -728,11 +945,13 @@ class DriverCore:
     def plan(self, ranges, angles):
         """MPC-based planning function.
 
-        Uses Model Predictive Control to compute optimal steering and speed
-        based on vehicle dynamics, reference path, and current state. Returns
-        (steering, speed, speed_cap) before conditioning, or None when there is
+        Uses Model Predictive Control to compute optimal steering and
+        acceleration based on vehicle dynamics, reference path, and current
+        state. Returns a `Plan` before conditioning, or None when there is
         nothing usable to plan from and the caller should coast.
         """
+        self._solved_arc = None
+        self._planned_path = None
         # 1. Restrict view to forward field of view [-100 deg, +100 deg] (~ -1.75 to +1.75 rad)
         fov_mask = (angles >= -1.75) & (angles <= 1.75)
         fov_ranges = ranges[fov_mask]
@@ -783,7 +1002,8 @@ class DriverCore:
 
         # 4. Reactive steering: steer at the middle of the widest gap. Used as
         #    the fallback if the MPC fails; the MPC keeps its own command memory.
-        reactive_steering = float(np.clip(0.85 * target_angle, -0.4, 0.4))
+        reactive_steering = float(np.clip(0.85 * target_angle,
+                                          -self.steer_limit, self.steer_limit))
 
         # 5. Use MPC when we have both a path and a state. Without a reference
         #    path the MPC has nothing to track and would drive the car to the
@@ -795,15 +1015,14 @@ class DriverCore:
 
                 mpc_control, diagnostics = self.mpc_controller.get_control(
                     current_state)
-
-                steering = float(mpc_control[0])
-                accel = float(mpc_control[1])
+                self._solved_arc = getattr(self.mpc_controller, 'arc_position', None)
+                planner = getattr(self.mpc_controller, 'planned_path', None)
+                self._planned_path = planner() if callable(planner) else None
 
                 # /drive takes a SPEED, not an acceleration -- the simulator
-                # closes that loop itself. The MPC plans in acceleration, so
-                # project one step forward.
-                mpc_speed = max(self.speed + accel * self.dt_measured, 0.0)
-                steering = float(np.clip(steering, -self.steer_limit, self.steer_limit))
+                # closes that loop itself. _condition inverts it.
+                steering = float(np.clip(mpc_control[0], -self.steer_limit, self.steer_limit))
+                accel = float(mpc_control[1])
 
                 if hasattr(self, '_diag_counter'):
                     self._diag_counter += 1
@@ -812,19 +1031,25 @@ class DriverCore:
 
                 if self._diag_counter % 50 == 0:  # Every ~2 s at 40 Hz
                     self.log.info(
-                        f'MPC: steer={steering:.3f}, speed={mpc_speed:.2f} '
-                        f'(cur {self.speed:.2f}), solve={diagnostics["solve_time_ms"]:.1f}ms')
+                        f'MPC: steer={steering:.3f}, accel={accel:.2f} '
+                        f'(v {self.speed:.2f}, at latch {self._latch_speed():.2f}), '
+                        f'solve={diagnostics["solve_time_ms"]:.1f}ms')
 
             except Exception as e:
                 self.log.warn(f'MPC failed: {e}')
                 return None
-
-            # The braking-distance cap below stops the MPC talking the car into
-            # a wall; _condition applies it as a ceiling.
-            speed = mpc_speed
         else:
             # No odometry or no reference path - use reactive
             steering = reactive_steering
-            speed = self.v_max
+            target = min(REACTIVE_SPEED, self.v_max)
+            accel = (target - self._latch_speed()) / self.mpc_dt
 
-        return steering, speed, self._speed_cap(ranges, angles, steering)
+        # The caps stop the MPC talking the car past the profile or into a
+        # wall; _condition applies them as ceilings on where the hold ends, so
+        # the clearance loses the hold's travel as well as the dead time's.
+        if self._planned_path is not None:
+            cap = self._path_cap(ranges, angles, self._planned_path)
+        else:
+            travelled = self._latch_travel() + self._latch_speed() * self.mpc_dt
+            cap = self._speed_cap(ranges, angles, self._reference_bearing(), travelled)
+        return Plan(steering, accel, self._profile_speed(), cap)

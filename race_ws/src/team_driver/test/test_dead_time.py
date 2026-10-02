@@ -5,6 +5,7 @@ import unittest
 import numpy as np
 
 from team_driver.driver_core import DriverConfig, DriverCore, DtTracker
+from team_driver.vehicle_model import SpeedLoop
 
 NOMINAL = 0.025
 
@@ -109,14 +110,19 @@ class DtTrackerTest(unittest.TestCase):
 
 class DriverCoreDeadTimeTest(unittest.TestCase):
 
-    def test_speed_projection_uses_the_measured_dt(self):
+    def test_the_speed_setpoint_inverts_the_plant_loop_over_one_control_period(self):
+        # Step 4: the command is held until the next timer tick, so the
+        # acceleration is inverted through the plant's speed loop over one
+        # control period -- however late the scan it was planned from arrived.
         core, _ = _core(accel=2.0)
         _scan(core, 1.000)
         core.step(t_sim=1.000)
         _scan(core, 1.050)
         cmd = core.step(t_sim=1.050)
-        # v=1.0, a=2.0, measured dt 0.050 -> 1.10, not 1.0 + 2 * 0.025
-        self.assertAlmostEqual(cmd.speed, 1.0 + 2.0 * 0.050, places=6)
+        self.assertAlmostEqual(cmd.speed, SpeedLoop.of().command(1.0, 2.0, NOMINAL), places=12)
+        # By hand: held 2.5 steps at 4.755 /s from 1.0, a setpoint of 1.437
+        # ends the hold at 1.050 = 1.0 + 2.0 * 0.025.
+        self.assertAlmostEqual(cmd.speed, 1.437, places=3)
 
     def test_the_same_scan_stamp_is_not_planned_twice(self):
         core, mpc = _core()

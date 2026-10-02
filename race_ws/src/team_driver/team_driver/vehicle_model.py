@@ -8,7 +8,7 @@ import cmath
 import math
 from dataclasses import dataclass
 import numpy as np
-from typing import Tuple
+from typing import Optional, Tuple
 
 # The judged steering servo over one MPC step, calibrated against GymPlant by
 # least squares (test/test_steering_actuator.py pins it). A 25 ms command on the
@@ -98,6 +98,88 @@ class VehicleParameters:
 
 
 F1TENTH_VEHICLE_PARAMETERS = VehicleParameters()
+
+PLANT_STEP_DT = 0.01      # [s] gym_bridge.py sim_timestep: one speed-loop evaluation each
+PID_ACCL_FORWARD_SCALE = 10.0   # utils.py pid_accl: kp = 10 a_max / v_limit moving forward
+PID_ACCL_REVERSE_SCALE = 2.0    # ... and 2 a_max / v_limit at rest or in reverse
+
+
+@dataclass(frozen=True)
+class SpeedLoop:
+    """The judged speed loop: utils.py `pid_accl`, then `accl_constraints`.
+
+    /drive carries a speed, and the plant turns it into an acceleration with a
+    proportional loop evaluated once per physics step from the pre-step speed:
+    k_accel = 10 a_max / v_max = 4.755 /s when speeding up and
+    k_brake = 10 a_max / -v_min = 19.02 /s when slowing down (pid_accl uses
+    weaker gains at rest and in reverse), then clamped to +-a_max and to
+    a_max v_switch / v above v_switch. test_speed_loop.py pins it to the gym.
+    """
+
+    a_max: float = 9.51
+    v_max: float = 20.0
+    v_min: float = -5.0
+    v_switch: float = 7.319
+    step: float = PLANT_STEP_DT
+
+    def __post_init__(self):
+        if not (self.step > 0.0 and self.a_max > 0.0 and self.v_max > 0.0
+                and self.v_min < 0.0 and self.v_switch > 0.0):
+            raise ValueError(f'not a speed loop the plant could have: {self}')
+
+    @classmethod
+    def of(cls, params: Optional[VehicleParameters] = None) -> 'SpeedLoop':
+        p = params if params is not None else F1TENTH_VEHICLE_PARAMETERS
+        return cls(a_max=float(p.a_max), v_max=float(p.v_max),
+                   v_min=float(p.v_min), v_switch=float(p.v_switch))
+
+    @property
+    def k_accel(self) -> float:
+        """[1/s] Gain while moving forward and speeding up."""
+        return PID_ACCL_FORWARD_SCALE * self.a_max / self.v_max
+
+    @property
+    def k_brake(self) -> float:
+        """[1/s] Gain while moving forward and slowing down."""
+        return PID_ACCL_FORWARD_SCALE * self.a_max / -self.v_min
+
+    def accel_ceiling(self, v: float) -> float:
+        """[m/s^2] Most the plant accelerates at speed v (utils.py upper_accel_limit)."""
+        return self.a_max * self.v_switch / v if v > self.v_switch else self.a_max
+
+    def accel(self, v_cmd: float, v: float) -> float:
+        """[m/s^2] What the plant applies for setpoint `v_cmd` at speed `v`."""
+        error = v_cmd - v
+        if v > 0.0:
+            gain = self.k_accel if error > 0.0 else self.k_brake
+        else:
+            gain = PID_ACCL_REVERSE_SCALE * self.a_max / (self.v_max if error > 0.0
+                                                          else -self.v_min)
+        a = gain * error
+        if (v <= self.v_min and a <= 0.0) or (v >= self.v_max and a >= 0.0):
+            return 0.0
+        return min(max(a, -self.a_max), self.accel_ceiling(v))
+
+    def command(self, v: float, a_des: float, hold: float) -> float:
+        """[m/s] The setpoint that gains the plant `a_des * hold` of speed over `hold`.
+
+        Held for n steps of h, the setpoint error shrinks by (1 - k h) each
+        step, so the setpoint must lead by a_des * hold / (1 - (1 - k h)^n).
+        As the hold shrinks to one step this is v + a_des / k, the plan's
+        inversion; over a real 25 ms hold that would brake ~15 % short. A
+        demand past what the plant can give is cut to it first, so the lead is
+        never bigger than the next command has to take back. The forward gains
+        are used throughout: at rest the plant's weaker gain lasts one step.
+        """
+        a = min(max(a_des, -self.a_max), self.accel_ceiling(max(v, 0.0)))
+        if a == 0.0 or hold <= 0.0:
+            return v
+        kh = (self.k_accel if a > 0.0 else self.k_brake) * self.step
+        n = hold / self.step
+        whole = math.floor(n)
+        left = (1.0 - kh) ** whole
+        closed = 1.0 - left + left * kh * (n - whole)   # a part step closes linearly
+        return v + a * hold / closed
 
 
 def vehicle_dynamics_ks_cog(state, u, params):
@@ -300,10 +382,10 @@ class VehicleModel:
             state_dot = self.dynamics_continuous(state, control)
             return state + state_dot * dt
         x, y, psi, v, beta, r = (float(s) for s in state)
-        return np.array(self._st_step(x, y, psi, v, beta, r,
+        return np.array(self.st_step(x, y, psi, v, beta, r,
                                       float(control[0]), float(control[1]), dt))
 
-    def _st_step(self, x, y, psi, v, beta, r, delta, a, h):
+    def st_step(self, x, y, psi, v, beta, r, delta, a, h):
         """One single-track step of length h, wheel and acceleration held.
 
         Slip and yaw rate advance exactly (`_lateral_zoh`) for the speed at
@@ -376,7 +458,7 @@ class VehicleModel:
             # reason; the start-of-step wheel's lag offsets part of it. Revisit
             # together with latency compensation.
             x, y, psi, v, beta, delta, r = state
-            x, y, psi, v, beta, r = self._st_step(x, y, psi, v, beta, r, delta, a, h)
+            x, y, psi, v, beta, r = self.st_step(x, y, psi, v, beta, r, delta, a, h)
             return (x, y, psi, v, beta, delta + self.servo.move(cmd - delta, h), r)
         x, y, psi, v, beta, delta = state
         wheelbase = self.params.lf + self.params.lr

@@ -167,11 +167,13 @@ class Driver(Node):
             f'delta_hat={self.core.delta_hat:.3f} rad, '
             f'p95|delta_hat - delta_meas|={self.core.steering_residual_summary():.4f} rad, '
             f'rtf={rtf if rtf is not None else float("nan"):.2f}')
-        # Healthy: the limiter almost never binds and coasting never happens.
+        # Healthy: the limiter almost never binds, coasting never happens, and
+        # the emergency cap binds on under 1 % of commands.
         stats = self.core.conditioning_stats()
         self.get_logger().info(
             f'conditioning: slew bound {stats.slew_binds}/{stats.steps} '
-            f'({stats.slew_bind_rate:.1%}), coast steps {stats.coast_count}')
+            f'({stats.slew_bind_rate:.1%}), coast steps {stats.coast_count}, '
+            f'emergency cap {stats.emergency_binds} ({stats.emergency_bind_rate:.1%})')
 
     # ------------------------------------------------------------------
     # Output

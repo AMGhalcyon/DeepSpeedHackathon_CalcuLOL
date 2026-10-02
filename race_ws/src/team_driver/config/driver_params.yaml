@@ -37,28 +37,32 @@ driver:
     odom_topic: "/ego_racecar/odom"
     drive_topic: "/drive"
 
-    crawl_speed: 1.0          # [m/s]; you ask for a speed and the sim holds it
+    crawl_speed: 1.0          # [m/s] the emergency cap never asks for less
     max_range: 8.0            # [m] clip the scan here
-    v_max: 3.0                # [m/s] speed cap on the profile
+    v_max: 10.0               # [m/s] cap on the profile and the emergency bound; should not bind
     # Speed profile (speed_profile.py). a_lat_max is a slip budget, not a grip
     # limit: the plant's tyres are linear, so rear slip is a_y / 56.1 rad.
-    a_lat_max: 0.8            # [m/s^2] cornering budget
+    a_lat_max: 5.0            # [m/s^2] cornering budget (~5 deg of rear slip)
     lock_margin: 0.95         # fraction of the steering lock the profile may use
     a_accel_max: 9.51         # [m/s^2] acceleration the profile plans (plant: 9.51)
-    a_brake_max: 0.8          # [m/s^2] braking the profile plans (plant: 9.51)
-    a_brake: 0.8              # [m/s^2] braking budget of the safety layers
-    steer_limit: 0.4          # [rad]
+    # Braking the profile plans, and the most the conditioner passes on from
+    # the MPC (plant: 9.51). The profile and emergency caps may brake harder.
+    a_brake_max: 6.0          # [m/s^2]
+    a_emergency: 7.0          # [m/s^2] braking the emergency cap assumes; coasting sheds speed at it
+    steer_limit: 0.4189       # [rad] the real lock
     # Reference line the MPC tracks: "centerline" (the shipped CSV) or "raceline"
     # (minimum curvature, built from the map at startup; falls back to
     # config/icra26_raceline.csv if the build fails).
-    reference: "centerline"
-    raceline_margin: 0.10     # [m] clearance beyond the car's half-width kept from walls
+    reference: "raceline"
+    raceline_margin: 0.25     # [m] clearance beyond the car's half-width kept from walls
 
     # Output conditioning (driver_core._condition / _coast)
-    stop_margin: 0.0          # [m] clearance the braking-distance cap keeps in hand
-    k_steer_derate: 2.0       # speed cap in a turn: v_max / (1 + k |steer|)
+    stop_margin: 0.0          # [m] clearance the emergency cap keeps beyond the body's overhang
     coast_steer_rate: 1.0     # [rad/s] steering decay toward straight while coasting
-    accel_limit: 4.0          # [m/s^2] fastest the speed setpoint may rise
+    accel_limit: 4.0          # [m/s^2] most acceleration the conditioner passes on
+    # Plan from where the car will be when the command latches (latch_predictor.py);
+    # false plans from the measured, dead-time-old state.
+    predict_latch: true
 
     # The control timer. Must equal mpc.dt: the model assumes each command is
     # held for exactly one MPC step, and the node refuses to start otherwise.
@@ -68,7 +72,7 @@ driver:
     # the judged dynamic single track (linear tyres), started from odometry's
     # real sideslip and yaw rate; it adds the yaw rate as a seventh state.
     vehicle:
-      model: "KS"
+      model: "ST"
 
     # MPC Controller Parameters
     #
@@ -78,8 +82,8 @@ driver:
     #     horizon  8 ->  30.3 ms mean, 41.0 ms max   (ALREADY OVER BUDGET)
     #     horizon 12 -> 139 ms      horizon 16 -> 239 ms      horizon 32 -> 589 ms
     # Those figures are for 16 free variables. Move blocking (block_map below) cuts
-    # them to 6 while keeping the 200 ms lookahead: measured on the harness, solve
-    # is now ~4.7 ms mean / 6.8 ms p95. Do NOT raise the horizon to buy lookahead:
+    # them to 6 while keeping 8 steps; dt_schedule (below) stretches those to a
+    # 0.5 s lookahead at no extra cost. Do NOT raise the horizon to buy lookahead:
     # the scaling is super-linear. Do NOT go back to 16 variables with the 15 ms
     # solve_budget_ms: a cold solve then never finishes inside the budget, every
     # solve falls back to the (zero) warm start, and the car never moves.
@@ -107,7 +111,7 @@ driver:
       dt: 0.025                         # Time step [s] (40 Hz)
       # Length of each prediction step [s]; the first must equal dt. Longer
       # later steps buy lookahead with no more decision variables.
-      dt_schedule: [0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025]
+      dt_schedule: [0.025, 0.025, 0.05, 0.05, 0.075, 0.075, 0.1, 0.1]
       feedforward: false                # Seed the first steering move from the curvature
       q_pos: 2.0                        # Position tracking weight
       q_yaw: 2.0                        # Yaw tracking weight

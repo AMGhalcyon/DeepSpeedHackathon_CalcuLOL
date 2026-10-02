@@ -65,7 +65,7 @@ def _defaults():
 class DeclarationTableTests(unittest.TestCase):
 
     def test_every_driver_config_field_is_declared_with_the_same_default(self):
-        # stop_margin, k_steer_derate, coast_steer_rate and accel_limit were
+        # stop_margin, coast_steer_rate and accel_limit were
         # core-only: the node could not override them.
         cfg = driver_core.DriverConfig()
         for field in dataclasses.fields(driver_core.DriverConfig):
@@ -214,7 +214,7 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(cfg.stop_margin, 0.2)
         self.assertEqual(cfg.accel_limit, 3.5)
         self.assertEqual(cfg.v_max, 2.5)
-        self.assertEqual(cfg.k_steer_derate, driver_core.DriverConfig().k_steer_derate)
+        self.assertEqual(cfg.a_emergency, driver_core.DriverConfig().a_emergency)
 
     def test_default_driver_config_equals_the_cores_own_default(self):
         self.assertEqual(driver_params.driver_config(_defaults()),

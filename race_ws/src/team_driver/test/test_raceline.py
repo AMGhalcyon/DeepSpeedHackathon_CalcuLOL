@@ -217,8 +217,13 @@ class TestDriverCoreReference(unittest.TestCase):
         core = driver_core.DriverCore(driver_core.DriverConfig(**cfg), logger=log)
         return core, log
 
-    def test_default_reference_is_the_centreline(self):
+    def test_default_reference_is_the_raceline(self):
         core, _ = self._core()
+        self.assertNotEqual(len(core.reference_path), 392)
+        self.assertLess(_length(core.reference_path), 75.0)
+
+    def test_the_centreline_is_still_available(self):
+        core, _ = self._core(reference='centerline')
         self.assertEqual(len(core.reference_path), 392)
 
     def test_raceline_reference_is_shorter_than_the_centreline(self):
@@ -228,8 +233,10 @@ class TestDriverCoreReference(unittest.TestCase):
         self.assertEqual(len(core.mpc_controller.reference_speeds), len(core.reference_path))
 
     def test_failed_build_falls_back_to_the_cached_csv(self):
+        import driver_core
         original = rl.build_raceline
         rl.build_raceline = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom'))
+        driver_core._built_raceline.cache_clear()       # or the memo hides the failure
         try:
             core, log = self._core(reference='raceline')
         finally:
@@ -280,6 +287,7 @@ class TestCachedRaceline(unittest.TestCase):
         log = _Log()
         original = rl.build_raceline
         rl.build_raceline = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom'))
+        driver_core._built_raceline.cache_clear()       # or the memo hides the failure
         try:
             core = driver_core.DriverCore(
                 driver_core.DriverConfig(reference='raceline', raceline_margin=0.30), logger=log)

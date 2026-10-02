@@ -14,11 +14,14 @@ sys.path.insert(
 
 import driver_core  # noqa: E402
 import lap_sim  # noqa: E402
-from vehicle_model import VehicleModel  # noqa: E402
+import longitudinal  # noqa: E402
+from vehicle_model import SpeedLoop, VehicleModel  # noqa: E402
 
 DT = 0.025
 CFG = driver_core.DriverConfig()
-SV_MAX = VehicleModel().params.sv_max
+VP = VehicleModel().params
+SV_MAX = VP.sv_max
+LOOP = SpeedLoop.of(VP)
 SLEW = SV_MAX * DT                      # 0.080 rad per 25 ms control step
 ANGLES = np.linspace(-np.pi / 2, np.pi / 2, 181)
 TOL = 1e-9
@@ -144,19 +147,26 @@ class SlewLimiterTest(unittest.TestCase):
 # ----------------------------------------------------------------------
 # Speed rate limit: no step in the setpoint
 # ----------------------------------------------------------------------
-class SpeedRateLimitTest(unittest.TestCase):
+class SpeedCommandTest(unittest.TestCase):
+    """The MPC's acceleration, clamped, then inverted through the plant's speed loop."""
+
+    def test_a_demand_inside_the_limits_is_inverted_through_the_speed_loop(self):
+        core, _ = _core()
+        core.speed = 3.0
+        cmd = core._condition(0.0, 1.5, DT)
+        self.assertAlmostEqual(cmd.speed, LOOP.command(3.0, 1.5, DT), places=12)
 
     def test_acceleration_demand_is_limited(self):
         core, _ = _core()
         core.speed = 1.0
-        cmd = core._condition(0.0, 3.0, DT)
-        self.assertAlmostEqual(cmd.speed, 1.0 + CFG.accel_limit * DT, places=12)
+        cmd = core._condition(0.0, 50.0, DT)
+        self.assertAlmostEqual(cmd.speed, LOOP.command(1.0, CFG.accel_limit, DT), places=12)
 
-    def test_braking_demand_is_limited_to_the_braking_budget(self):
+    def test_braking_demand_is_limited_to_the_braking_the_profile_plans(self):
         core, _ = _core()
         core.speed = 2.0
-        cmd = core._condition(0.0, 0.0, DT)
-        self.assertAlmostEqual(cmd.speed, 2.0 - CFG.a_brake * DT, places=12)
+        cmd = core._condition(0.0, -50.0, DT)
+        self.assertAlmostEqual(cmd.speed, LOOP.command(2.0, -CFG.a_brake_max, DT), places=12)
 
     def test_speed_is_never_negative(self):
         core, _ = _core()
@@ -164,16 +174,12 @@ class SpeedRateLimitTest(unittest.TestCase):
         cmd = core._condition(0.0, -5.0, DT)
         self.assertEqual(cmd.speed, 0.0)
 
-    def test_published_speed_has_no_discontinuities(self):
+    def test_a_profile_speed_below_the_demand_holds_the_car_to_it(self):
         core, _ = _core()
-        core.speed = 1.0
-        rng = np.random.default_rng(1)
-        bound = max(CFG.accel_limit, CFG.a_brake) * DT + TOL
-        prev = 1.0
-        for raw in rng.uniform(0.0, 5.0, size=300):
-            speed = core._condition(0.0, float(raw), DT).speed
-            self.assertLessEqual(abs(speed - prev), bound)
-            prev = speed
+        core.speed = 2.0
+        cmd = core._condition(0.0, 3.0, DT, profile_speed=2.0)
+        self.assertAlmostEqual(cmd.speed, 2.0, places=12)
+        self.assertEqual(core.conditioning_stats().emergency_binds, 0)
 
 
 # ----------------------------------------------------------------------
@@ -185,7 +191,7 @@ class CoastTest(unittest.TestCase):
         core, _ = _core()
         core.speed = 2.0
         for _ in range(10):
-            core._condition(steer, 2.0, DT)
+            core._condition(steer, 0.0, DT)
         return core
 
     def test_steering_decays_toward_straight_at_the_coast_rate(self):
@@ -203,15 +209,16 @@ class CoastTest(unittest.TestCase):
         self.assertEqual(core._coast(DT).steering_angle, 0.0)
         self.assertEqual(core._coast(DT).steering_angle, 0.0)
 
-    def test_speed_is_shed_at_the_braking_budget_not_snapped(self):
+    def test_speed_is_shed_at_the_emergency_budget_not_snapped(self):
+        # A solver dropout at speed must not coast into a wall.
         core = self._settled(0.0)
         cmd = core._coast(DT)
-        self.assertAlmostEqual(cmd.speed, 2.0 - CFG.a_brake * DT, places=12)
+        self.assertAlmostEqual(cmd.speed, LOOP.command(2.0, -CFG.a_emergency, DT), places=12)
 
     def test_speed_stops_at_zero(self):
         core, _ = _core()
         core.speed = 0.01
-        core._condition(0.0, 0.01, DT)
+        core._condition(0.0, 0.0, DT)
         self.assertEqual(core._coast(DT).speed, 0.0)
 
     def test_coasting_carries_the_steering_velocity(self):
@@ -221,7 +228,7 @@ class CoastTest(unittest.TestCase):
 
     def test_a_non_finite_command_is_coasted_not_published(self):
         core = self._settled(0.2)
-        cmd = core._condition(float('nan'), 2.0, DT)
+        cmd = core._condition(float('nan'), 0.0, DT)
         self.assertAlmostEqual(cmd.steering_angle, 0.2 - CFG.coast_steer_rate * DT, places=12)
         self.assertEqual(core.conditioning_stats().coast_count, 1)
         cmd = core._condition(0.2, float('inf'), DT)
@@ -239,7 +246,7 @@ class FallbackPathTest(unittest.TestCase):
         _feed(core, 5 * DT, angle_min=2.0)          # every beam outside the FOV
         cmd = core.step(t_sim=5 * DT)
         self.assertAlmostEqual(cmd.steering_angle, 0.2 - CFG.coast_steer_rate * DT, places=9)
-        self.assertAlmostEqual(cmd.speed, 2.0 - CFG.a_brake * DT, places=9)
+        self.assertAlmostEqual(cmd.speed, LOOP.command(2.0, -CFG.a_emergency, DT), places=9)
         self.assertEqual(core.conditioning_stats().coast_count, 1)
 
     def test_an_mpc_exception_coasts_instead_of_falling_back_to_the_reactive_command(self):
@@ -247,7 +254,7 @@ class FallbackPathTest(unittest.TestCase):
         mpc.error = RuntimeError('solver blew up')
         cmd = _drive(core, 1, first=5)
         self.assertAlmostEqual(cmd.steering_angle, 0.2 - CFG.coast_steer_rate * DT, places=9)
-        self.assertAlmostEqual(cmd.speed, 2.0 - CFG.a_brake * DT, places=9)
+        self.assertAlmostEqual(cmd.speed, LOOP.command(2.0, -CFG.a_emergency, DT), places=9)
         self.assertEqual(core.conditioning_stats().coast_count, 1)
 
     def test_a_clean_run_never_coasts(self):
@@ -330,69 +337,68 @@ class FallbackPathTest(unittest.TestCase):
 # ----------------------------------------------------------------------
 # Continuous reactive speed cap
 # ----------------------------------------------------------------------
+def _wall(distance):
+    """Ranges to a flat wall `distance` ahead of the lidar, across its path."""
+    with np.errstate(divide='ignore'):
+        r = np.where(np.cos(ANGLES) > 1e-9, distance / np.cos(ANGLES), CFG.max_range)
+    return np.minimum(r, CFG.max_range)
+
+
+def _braking_bound(clearance, stop_margin=CFG.stop_margin):
+    reach = clearance - longitudinal.front_overhang(VP) - stop_margin
+    return math.sqrt(2.0 * CFG.a_emergency * reach)
+
+
 class SpeedCapTest(unittest.TestCase):
 
-    def _cap(self, ranges, steer=0.0):
+    def _cap(self, ranges, **kw):
         core, _ = _core()
-        return core._speed_cap(np.asarray(ranges, dtype=float), ANGLES, steer)
+        return core._speed_cap(np.asarray(ranges, dtype=float), ANGLES, **kw)
 
     def test_the_cap_is_the_braking_distance_bound(self):
-        expected = math.sqrt(2.0 * CFG.a_brake * (2.0 - CFG.stop_margin))
-        self.assertAlmostEqual(self._cap(np.full(181, 2.0)), expected, places=9)
+        self.assertAlmostEqual(self._cap(_wall(2.0)), _braking_bound(2.0), places=9)
 
     def test_a_configured_stop_margin_is_kept_in_hand(self):
         core = driver_core.DriverCore(
             cfg=driver_core.DriverConfig(stop_margin=0.3), mpc_controller=_ScriptedMPC())
-        cap = core._speed_cap(np.full(181, 2.0), ANGLES, 0.0)
-        self.assertAlmostEqual(cap, math.sqrt(2.0 * CFG.a_brake * (2.0 - 0.3)), places=9)
+        cap = core._speed_cap(_wall(2.0), ANGLES)
+        self.assertAlmostEqual(cap, _braking_bound(2.0, stop_margin=0.3), places=9)
 
-    def test_the_cap_follows_the_low_end_of_the_front_sector_not_its_mean(self):
-        ranges = np.full(181, 8.0)
-        front = np.where(np.abs(ANGLES) <= 0.2)[0]
-        ranges[front[:5]] = 2.0                     # ~22 % near; the mean is ~6.7 m
-        expected = math.sqrt(2.0 * CFG.a_brake * (2.0 - CFG.stop_margin))
-        self.assertAlmostEqual(self._cap(ranges), expected, places=9)
-
-    def test_steering_derates_the_cap(self):
-        expected = CFG.v_max / (1.0 + CFG.k_steer_derate * 0.4)
-        self.assertAlmostEqual(self._cap(np.full(181, 8.0), steer=0.4), expected, places=9)
-        self.assertAlmostEqual(self._cap(np.full(181, 8.0), steer=-0.4), expected, places=9)
+    def test_the_cap_follows_the_low_end_of_the_corridor_not_its_mean(self):
+        ranges = _wall(4.0)
+        ranges[int(np.argmin(np.abs(ANGLES)))] = 2.0    # one beam in five; mean ~3.6 m
+        self.assertAlmostEqual(self._cap(ranges), _braking_bound(2.0), places=9)
 
     def test_the_cap_never_asks_for_less_than_crawl_or_more_than_v_max(self):
         self.assertEqual(self._cap(np.zeros(181)), CFG.crawl_speed)
         self.assertEqual(self._cap(np.full(181, 8.0)), CFG.v_max)
 
     def test_the_cap_is_continuous_in_clearance(self):
-        caps = [self._cap(np.full(181, d)) for d in np.arange(0.0, 8.0, 0.01)]
-        self.assertLess(float(np.max(np.abs(np.diff(caps)))), 0.01)
+        caps = [self._cap(_wall(d)) for d in np.arange(0.0, 8.0, 0.01)]
+        self.assertLess(float(np.max(np.abs(np.diff(caps)))), 0.08)
 
-    def test_the_planned_speed_is_held_under_the_cap(self):
-        core, _ = _core(accel=9.5)
-        cmd = _drive(core, 1, v=1.7, ranges=np.full(181, 2.0))
-        expected = math.sqrt(2.0 * CFG.a_brake * (2.0 - CFG.stop_margin))
-        self.assertAlmostEqual(cmd.speed, expected, places=6)
-
-    def test_a_cap_that_drops_is_obeyed_at_once_not_at_the_braking_rate(self):
-        # A wall appears 1.5 m ahead of a car at v_max. The rate limit alone
-        # would let the setpoint fall 0.02 m/s per step; the cap is a safety
-        # ceiling and must not be delayed by it.
+    def test_a_cap_below_the_speed_brakes_at_the_plants_limit_at_once(self):
+        # A wall appears 1.5 m ahead of a car at 6 m/s. The comfort clamp would
+        # brake at a_brake_max; the cap is a safety ceiling and is not delayed
+        # by it.
         core, _ = _core()
-        cmd = _drive(core, 1, v=3.0, ranges=np.full(181, 1.5))
-        expected = math.sqrt(2.0 * CFG.a_brake * (1.5 - CFG.stop_margin))
-        self.assertAlmostEqual(cmd.speed, expected, places=6)
+        cmd = _drive(core, 1, v=6.0, ranges=_wall(1.5))
+        self.assertAlmostEqual(cmd.speed, LOOP.command(6.0, -VP.a_max, DT), places=9)
+        self.assertEqual(core.conditioning_stats().emergency_binds, 1)
 
-    def test_the_condition_step_clamps_to_a_cap_the_rate_limit_would_allow_past(self):
+    def test_the_condition_step_brakes_for_a_cap_past_the_comfort_clamp(self):
         core, _ = _core()
         core.speed = 2.0
-        cmd = core._condition(0.0, 3.0, DT, speed_cap=1.2)
-        self.assertEqual(cmd.speed, 1.2)
+        cmd = core._condition(0.0, 3.0, DT, speed_cap=1.8)
+        self.assertAlmostEqual(cmd.speed, LOOP.command(2.0, (1.8 - 2.0) / DT, DT), places=12)
+        self.assertLess(cmd.speed, LOOP.command(2.0, -CFG.a_brake_max, DT))
 
-    def test_the_next_command_steps_up_from_the_capped_speed(self):
+    def test_a_cap_the_car_will_not_reach_does_not_bind(self):
         core, _ = _core()
         core.speed = 2.0
-        core._condition(0.0, 3.0, DT, speed_cap=1.2)
-        cmd = core._condition(0.0, 3.0, DT)
-        self.assertAlmostEqual(cmd.speed, 1.2 + CFG.accel_limit * DT, places=12)
+        cmd = core._condition(0.0, 3.0, DT, speed_cap=5.0)
+        self.assertAlmostEqual(cmd.speed, LOOP.command(2.0, 3.0, DT), places=12)
+        self.assertEqual(core.conditioning_stats().emergency_binds, 0)
 
 
 # ----------------------------------------------------------------------
@@ -463,16 +469,12 @@ class HarnessMetricsTest(unittest.TestCase):
         cls.result = lap_sim.run(cfg)
 
     def test_the_run_reports_the_conditioning_metrics(self):
-        for key in ('slew_bind_rate', 'coast_count', 'cmd_speed_step_max'):
+        for key in ('slew_bind_rate', 'coast_count', 'cmd_speed_step_max',
+                    'emergency_bind_rate', 'profile_overshoot_max'):
             self.assertIn(key, self.result)
 
     def test_a_clean_start_never_coasts(self):
         self.assertEqual(self.result['coast_count'], 0)
-
-    def test_published_speed_steps_stay_inside_the_rate_limit(self):
-        longest_interval = driver_core.DT_CLAMP_HIGH * DT
-        bound = max(CFG.accel_limit, CFG.a_brake) * longest_interval + TOL
-        self.assertLessEqual(self.result['cmd_speed_step_max'], bound)
 
     def test_a_run_that_takes_no_steps_reports_zeros(self):
         empty = lap_sim.run(lap_sim.HarnessConfig(laps=1, max_time=0.0, quiet=True))
