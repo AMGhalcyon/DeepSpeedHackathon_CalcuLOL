@@ -181,31 +181,33 @@ class Step9TunedWeightsTests(unittest.TestCase):
                 self.assertEqual(params[name], value)
 
 
-STEP5_TUNED = {'a_lat_max': 10.0, 'a_brake_max': 6.0, 'lock_margin': 0.95,
-               'sector_scale': [2.0, 8.5, 0.8, 29.0, 37.0, 0.8, 38.0, 43.5, 0.8]}
+STEP6_TUNED = {'a_lat_max': 11.5, 'a_brake_max': 6.0, 'lock_margin': 0.95,
+               'sector_scale': [2.0, 8.5, 0.85, 11.0, 17.5, 0.8]}
 
 
-class Step5TunedProfileTests(unittest.TestCase):
-    """The Phase 2 Step 5 sweep (lap_sim, 10 laps, raceline margin 0.25).
+class Step6TunedProfileTests(unittest.TestCase):
+    """The Phase 2 Step 6 sweep (lap_sim, 10 laps, reweighted raceline, margin 0.25).
 
-    Uniform budgets: a_lat_max 8 was the fastest clean one (14.85 s); 9 hit the
-    s~33 m hairpin entry every lap, 10+ also s~5 and s~41, 12+ s~14; any
-    a_brake_max 9.5 made it worse (trail-braking yaw). So the budget is 10, held
-    to 8 (scale 0.8) in the three sectors that collided: s 2-8.5 m, the hairpin
-    and its approach 29-37 m, and the lock-bound right 38-43.5 m. 0 collisions
-    in 18 runs: stale 5/9/14 x fixed solve 5/7/12 ms, and 8 measured-solve runs;
-    best 14.07-14.12 s, 10 laps 141.1-141.5 s. a12 with sectors was faster on
-    one setting but collided under measured timing.
+    The curvature-reweighted line (peak kappa 1.005) frees the hairpin and the
+    lock-bound right: a uniform a_lat_max 10 is clean at 13.33 s with no
+    sectors. 10.5+ collides at s~4.6 m (sector A), 11.5+ also at s~14.1 m
+    (sector B); 12.25 at s~66 m, 12.5+ at the hairpin s~33 m. So the budget is
+    11.5, held to 9.8 (scale 0.85) in s 2-8.5 m and to 9.2 (scale 0.8) in
+    s 11-17.5 m. A 12 budget (best 12.63 s) was clean under a fixed solve time
+    but collided at s~66 and the hairpin under measured timing, even with a
+    sector there; lock_margin 0.97 changed nothing. Measured timing at the
+    real 15 ms budget needs at most 3 parallel jobs: 8 push the solve p95 to
+    14-17 ms and collide every config, the plain a_lat_max 10 line included.
     """
 
     def test_the_code_defaults_carry_the_tuned_profile(self):
-        for name, value in STEP5_TUNED.items():
+        for name, value in STEP6_TUNED.items():
             with self.subTest(name=name):
                 self.assertEqual(driver_params.DEFAULTS[name], value)
 
     def test_the_params_file_carries_the_tuned_profile(self):
         params = _node_params()
-        for name, value in STEP5_TUNED.items():
+        for name, value in STEP6_TUNED.items():
             with self.subTest(name=name):
                 self.assertEqual(params[name], value)
 
