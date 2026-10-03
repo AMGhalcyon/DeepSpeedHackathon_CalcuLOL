@@ -413,6 +413,27 @@ class TestDriverCoreReference(unittest.TestCase):
         self.assertIn('cached', log.text('warn').lower() + log.text('error').lower())
         self.assertLess(_length(core.reference_path), 75.0)
 
+    def test_a_uniform_fallback_build_is_not_driven_with_the_tuned_profile(self):
+        # The sectors and a_lat_max are tuned to the reweighted line. If the weighted
+        # solve fails and build_raceline returns the uniform line instead, the driver
+        # must take the cached reweighted line, not run the tuned profile on that one.
+        import driver_core
+        cached_xy, _ = rl.read_cached(
+            os.path.join(_HERE, os.pardir, 'config', 'icra26_raceline.csv'))
+        uniform_stand_in = rl.Raceline(xy=cached_xy * 2.0, sealed=None,
+                                       build_seconds=0.0, reweighted=False)
+        original = rl.build_raceline
+        rl.build_raceline = lambda *a, **k: uniform_stand_in
+        driver_core._built_raceline.cache_clear()       # or the memo hides the failure
+        try:
+            core, log = self._core(reference='raceline')
+        finally:
+            rl.build_raceline = original
+            driver_core._built_raceline.cache_clear()   # do not leak the stand-in
+        self.assertLess(_length(core.reference_path), 75.0,
+                        'drove the uniform line the tuned profile does not fit')
+        self.assertIn('uniform', log.text('warn').lower() + log.text('error').lower())
+
     def test_unknown_reference_is_refused(self):
         import driver_params
         values = dict(driver_params.DEFAULTS)

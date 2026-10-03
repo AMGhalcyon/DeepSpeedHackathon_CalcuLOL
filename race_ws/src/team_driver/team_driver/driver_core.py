@@ -371,6 +371,10 @@ def _built_raceline(centerline_path, margin):
 
     Built once per process: the node builds it once anyway, and the harness
     and the tests construct many cores from the same map.
+
+    Raises if the weighted solve fell back to the uniform line: the sectors and
+    `a_lat_max` are tuned to the reweighted geometry, and the caller's cached
+    CSV is that line.
     """
     yaml_path = raceline.find_map_yaml(centerline_path)
     if yaml_path is None:
@@ -379,6 +383,9 @@ def _built_raceline(centerline_path, margin):
         np.loadtxt(centerline_path, delimiter=',', comments='#'))[:, :2]
     line = raceline.build_raceline(centerline_xy, raceline.load_occupancy(yaml_path),
                                    margin=margin)
+    if not line.reweighted:
+        raise RuntimeError('the weighted solve fell back to the uniform line, '
+                           'which the tuned speed profile does not fit')
     line.xy.setflags(write=False)
     return line.xy, line.build_seconds
 
