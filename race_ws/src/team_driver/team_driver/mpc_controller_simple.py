@@ -70,12 +70,13 @@ class SimpleMPCController:
         print(f"  Control horizon: {self.control_horizon}")
         print(f"  DT: {self.dt}s ({1/dt:.1f} Hz)")
 
-    def set_reference_path(self, path, speeds=None):
+    def set_reference_path(self, path, speeds=None, brake_limit=None):
         """Set reference path for tracking.
 
         Args:
             path: List of [x, y] waypoints
             speeds: Optional list of target speeds
+            brake_limit: Accepted for DriverCore's call; unused here
         """
         self.reference_path = path
         self.reference_speeds = speeds

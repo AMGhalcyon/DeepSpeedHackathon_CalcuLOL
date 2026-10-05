@@ -106,7 +106,10 @@ class DriverConfig:
     # overhang ahead of the lidar (longitudinal.front_overhang).
     stop_margin: float = 0.0
     coast_steer_rate: float = 1.0   # [rad/s] steering decay toward straight while coasting
-    accel_limit: float = 4.0        # [m/s^2] most acceleration the conditioner passes on
+    # [m/s^2] Most acceleration the conditioner passes on. The MPC's reference window
+    # assumes the plant ceiling (a_max 9.51), so keep this at it: lower, and the
+    # reference outruns what the conditioner lets through.
+    accel_limit: float = 9.51
     # Plan from where the car will be when the command latches, replaying the
     # published commands over the dead time (latch_predictor.py); False plans
     # from the measured, dead-time-old state.
@@ -669,7 +672,7 @@ class DriverCore:
         self.reference_path = path
         self.reference_speeds = speeds
         self._reference = lookup
-        self.mpc_controller.set_reference_path(path, speeds)
+        self.mpc_controller.set_reference_path(path, speeds, self.a_brake_max)
         if not hasattr(self.mpc_controller, 'arc_position'):
             self.log.warn(f'{type(self.mpc_controller).__name__} reports no arc_position: '
                           'the profile cap is off and the emergency cap looks straight ahead')

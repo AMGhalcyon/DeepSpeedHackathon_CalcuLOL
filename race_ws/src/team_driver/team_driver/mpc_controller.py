@@ -16,10 +16,10 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 try:
-    from .vehicle_model import ST_SWITCH_SPEED, VehicleModel   # ROS / package import
+    from .vehicle_model import ST_SWITCH_SPEED, SpeedLoop, VehicleModel   # ROS / package import
     from . import speed_profile as _speed_profile
 except ImportError:
-    from vehicle_model import ST_SWITCH_SPEED, VehicleModel    # standalone `python3 mpc_controller.py`
+    from vehicle_model import ST_SWITCH_SPEED, SpeedLoop, VehicleModel    # standalone `python3 mpc_controller.py`
     import speed_profile as _speed_profile
 
 # scipy's SLSQP status for "iteration limit reached". The iterate is still a
@@ -165,6 +165,10 @@ class MPCController:
         # Reference path (will be set externally)
         self.reference_path = None
         self.reference_speeds = None
+        # [m/s^2] Deceleration the reference window assumes the car can hold
+        # (set_reference_path); None paces the window at the car's own speed.
+        self.brake_limit = None
+        self._speed_loop = SpeedLoop.of(self.vehicle_model.params)
         self._mean_waypoint_spacing = 0.2  # overwritten by set_reference_path
         self._last_path_index = None
         self._last_heading = 0.0
@@ -267,15 +271,20 @@ class MPCController:
         index = np.searchsorted(starts, due, side='right') - 1
         return np.minimum(index, len(dt_schedule) - 1)
 
-    def set_reference_path(self, path: np.ndarray, speeds: np.ndarray = None):
+    def set_reference_path(self, path: np.ndarray, speeds: np.ndarray = None,
+                           brake_limit: float = None):
         """Set reference path for tracking.
 
         Args:
             path: Array of shape (N, 2) with [x, y] waypoints
             speeds: Optional array of shape (N,) with target speeds
+            brake_limit: [m/s^2] Deceleration the car is held to. Given, the
+                reference window is paced by speeds the plant can reach
+                (`_reachable_arc`); None keeps the car's-own-speed pace.
         """
         self.reference_path = path
         self.reference_speeds = speeds
+        self.brake_limit = brake_limit
 
         # If no speeds provided, compute based on curvature or use constant
         if speeds is None and path is not None:
@@ -530,6 +539,26 @@ class MPCController:
         candidates.sort()
         return candidates[0][1]
 
+    def _reachable_arc(self, s0: float, v0: float, offsets: np.ndarray) -> np.ndarray:
+        """Arc positions of the window if the car chases the profile at its limits.
+
+        The speed follows the profile at `s`, but moves up by at most the
+        plant's acceleration ceiling (power-limited above ST_SWITCH_SPEED) and
+        down by at most `brake_limit`; each step covers its mean speed.
+        """
+        arc, L, profile = self._path_arc, self._path_len, self.reference_speeds
+        s = np.empty(len(offsets))
+        s[0] = s0
+        v = v0
+        for k in range(1, len(offsets)):
+            h = float(offsets[k] - offsets[k - 1])
+            target = float(np.interp(s[k - 1] % L, arc, profile, period=L))
+            v_next = min(max(target, v - self.brake_limit * h),
+                         v + self._speed_loop.accel_ceiling(v) * h)
+            s[k] = s[k - 1] + 0.5 * (v + v_next) * h
+            v = v_next
+        return s
+
     def _reference_window(self, s_start: float, count: int,
                           car_speed: float = None) -> np.ndarray:
         """Resample `count` reference states marching forward along the path.
@@ -540,7 +569,12 @@ class MPCController:
         v*dt (about 0.075 m at 3 m/s) -- the reference would run away from the
         car roughly 2.5x too fast. We advance by distance instead.
 
-        That distance is the *car's*, floored at `ref_speed`. Spacing by the
+        With a `brake_limit` the distance is instead what the plant can reach
+        (`_reachable_arc`). Pacing at the car's own speed puts the horizon
+        behind where an accelerating car will be, and q_pos (4x q_vel) then
+        penalises the acceleration the profile asks for.
+
+        Otherwise that distance is the *car's*, floored at `ref_speed`. Spacing by the
         profile mean instead (the old behaviour) put the horizon at a distance
         set by the track rather than by the car: on the fast half it ran ahead
         of anything the car could reach, and at a slow corner it reached
@@ -572,7 +606,12 @@ class MPCController:
         # with a dt_schedule is a cumulative time, not k * dt.
         offsets = (self._t_offsets if count == len(self._t_offsets)
                    else self._time_offsets(count))
-        s = (s_start % L) + offsets * pace
+        if (self.brake_limit is not None and car_speed is not None
+                and self.reference_speeds is not None
+                and len(self.reference_speeds) == n):
+            s = self._reachable_arc(s_start % L, pace, offsets)
+        else:
+            s = (s_start % L) + offsets * pace
         self._window_s = s
 
         # The path array stores a single lap and no closing waypoint, so

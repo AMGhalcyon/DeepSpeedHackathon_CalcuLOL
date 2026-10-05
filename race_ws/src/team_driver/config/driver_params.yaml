@@ -67,7 +67,7 @@ driver:
     # Output conditioning (driver_core._condition / _coast)
     stop_margin: 0.0          # [m] clearance the emergency cap keeps beyond the body's overhang
     coast_steer_rate: 1.0     # [rad/s] steering decay toward straight while coasting
-    accel_limit: 4.0          # [m/s^2] most acceleration the conditioner passes on
+    accel_limit: 9.51         # [m/s^2] most acceleration the conditioner passes on
     # Plan from where the car will be when the command latches (latch_predictor.py);
     # false plans from the measured, dead-time-old state.
     predict_latch: true
