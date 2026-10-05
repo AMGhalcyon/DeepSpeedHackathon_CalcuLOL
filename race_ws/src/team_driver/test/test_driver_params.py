@@ -181,33 +181,36 @@ class Step9TunedWeightsTests(unittest.TestCase):
                 self.assertEqual(params[name], value)
 
 
-STEP6_TUNED = {'a_lat_max': 11.5, 'a_brake_max': 6.0, 'lock_margin': 0.95,
-               'sector_scale': [2.0, 8.5, 0.85, 11.0, 17.5, 0.8]}
+STEP7_TUNED = {'a_lat_max': 18.0, 'a_brake_max': 6.0, 'accel_limit': 9.51,
+               'lock_margin': 0.95,
+               'sector_scale': [2.0, 8.5, 0.6, 11.0, 17.5, 0.7,
+                                50.0, 57.0, 0.85, 62.0, 68.0, 0.75]}
 
 
-class Step6TunedProfileTests(unittest.TestCase):
-    """The Phase 2 Step 6 sweep (lap_sim, 10 laps, reweighted raceline, margin 0.25).
+class Step7TunedProfileTests(unittest.TestCase):
+    """The sub-11 Step 3 sweep, with the reachable-pace reference window.
 
-    The curvature-reweighted line (peak kappa 1.005) frees the hairpin and the
-    lock-bound right: a uniform a_lat_max 10 is clean at 13.33 s with no
-    sectors. 10.5+ collides at s~4.6 m (sector A), 11.5+ also at s~14.1 m
-    (sector B); 12.25 at s~66 m, 12.5+ at the hairpin s~33 m. So the budget is
-    11.5, held to 9.8 (scale 0.85) in s 2-8.5 m and to 9.2 (scale 0.8) in
-    s 11-17.5 m. A 12 budget (best 12.63 s) was clean under a fixed solve time
-    but collided at s~66 and the hairpin under measured timing, even with a
-    sector there; lock_margin 0.97 changed nothing. Measured timing at the
-    real 15 ms budget needs at most 3 parallel jobs: 8 push the solve p95 to
-    14-17 ms and collide every config, the plain a_lat_max 10 line included.
+    Pacing the MPC's window by reachable speeds (test_reference_pace.py) and
+    lifting accel_limit to the plant's 9.51 took the Step 6 profile from 12.90
+    to 12.55 s and made far higher slip budgets usable. a_brake_max stays 6:
+    harder braking unloads the rear and spins the car at high a_lat.
+    Uniform a_lat 18 collides at s~4.8, 14.1, 54.2 and 66.3, so each gets a
+    narrow sector (approach plus corner). The s 62-68 left-hander is trail-
+    braked: at scale 0.8 it was clean under fixed solve times but collided at
+    s~66.0 under measured timing; 0.75 is clean. Grid at 0.75: stale 5/9/14 x
+    fixed 5/7/12 ms and 8 measured-timing runs (<= 3 jobs), 5 laps each, all
+    0 collisions, best 11.03 s. a17 with (0.62, 0.75, 0.9, 0.8) is the
+    fallback: equally clean, 11.15 s.
     """
 
     def test_the_code_defaults_carry_the_tuned_profile(self):
-        for name, value in STEP6_TUNED.items():
+        for name, value in STEP7_TUNED.items():
             with self.subTest(name=name):
                 self.assertEqual(driver_params.DEFAULTS[name], value)
 
     def test_the_params_file_carries_the_tuned_profile(self):
         params = _node_params()
-        for name, value in STEP6_TUNED.items():
+        for name, value in STEP7_TUNED.items():
             with self.subTest(name=name):
                 self.assertEqual(params[name], value)
 

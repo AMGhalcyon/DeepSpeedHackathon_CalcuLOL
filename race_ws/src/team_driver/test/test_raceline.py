@@ -375,7 +375,7 @@ class TestDriverCoreReference(unittest.TestCase):
 
     def test_sector_scale_slows_the_profile_only_inside_its_sector(self):
         import speed_profile as sp
-        base, _ = self._core(a_lat_max=8.0)
+        base, _ = self._core(a_lat_max=8.0, sector_scale=(0.0, 1.0, 1.0))  # sectors off
         backed_off, _ = self._core(a_lat_max=8.0, sector_scale=(30.0, 36.0, 0.5))
         path = base.reference_path
         s = np.concatenate([[0.0], np.cumsum(sp.segment_lengths(path, True)[:-1])])

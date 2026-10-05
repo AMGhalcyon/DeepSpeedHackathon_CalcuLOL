@@ -42,7 +42,7 @@ driver:
     v_max: 10.0               # [m/s] cap on the profile and the emergency bound; should not bind
     # Speed profile (speed_profile.py). a_lat_max is a slip budget, not a grip
     # limit: the plant's tyres are linear, so rear slip is a_y / 56.1 rad.
-    a_lat_max: 11.5           # [m/s^2] cornering budget (~12 deg of rear slip)
+    a_lat_max: 18.0           # [m/s^2] cornering budget, held lower in sector_scale
     lock_margin: 0.95         # fraction of the steering lock the profile may use
     a_accel_max: 9.51         # [m/s^2] acceleration the profile plans (plant: 9.51)
     # Braking the profile plans, and the most the conditioner passes on from
@@ -50,12 +50,15 @@ driver:
     a_brake_max: 6.0          # [m/s^2]
     # Sectors where the slip budget is lowered: flat (s_start, s_end, scale)
     # triples, s [m] along the raceline from its first point, scale in (0, 1].
-    # Step 6: held to 9.8 and 9.2 m/s^2 where a uniform 11.5 collided on the
-    # reweighted line (s~4.6, s~14.1). Never empty: ROS
-    # would type an empty list as bytes and refuse a list of doubles; to turn the
-    # sectors off, use [0.0, 1.0, 1.0]. Tuned on the raceline at raceline_margin 0.25;
-    # on the centreline the lap gets a uniform a_lat_max x the lowest scale.
-    sector_scale: [2.0, 8.5, 0.85, 11.0, 17.5, 0.8]
+    # Step 7: one narrow sector per spot where a uniform 18 collided (s~4.8, 14.1,
+    # 54.2, 66.3); s 62-68 at 0.8 collided under measured timing, 0.75 is clean.
+    # Never empty: ROS would type an empty list as bytes and refuse a list of
+    # doubles; to turn the sectors off, use [0.0, 1.0, 1.0]. Tuned on the raceline
+    # at raceline_margin 0.25; on the centreline the lap gets a uniform a_lat_max x
+    # the lowest scale (10.8 m/s^2: clean in lap_sim, 14.22 s).
+    # Fallback if it ever collides: a_lat_max 17 with
+    # [2.0, 8.5, 0.62, 11.0, 17.5, 0.75, 50.0, 57.0, 0.9, 62.0, 68.0, 0.8] (11.15 s).
+    sector_scale: [2.0, 8.5, 0.6, 11.0, 17.5, 0.7, 50.0, 57.0, 0.85, 62.0, 68.0, 0.75]
     a_emergency: 7.0          # [m/s^2] braking the emergency cap assumes; coasting sheds speed at it
     steer_limit: 0.4189       # [rad] the real lock
     # Reference line the MPC tracks: "centerline" (the shipped CSV) or "raceline"

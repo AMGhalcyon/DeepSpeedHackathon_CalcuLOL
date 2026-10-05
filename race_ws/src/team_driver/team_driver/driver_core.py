@@ -76,10 +76,10 @@ class DriverConfig:
     v_max: float = 10.0             # [m/s] caps the profile and emergency bound; should not bind
     # Speed profile (speed_profile.py). `a_lat_max` is a slip budget, not a grip
     # limit: the plant's tyres are linear, so rear slip is a_y / 56.1 rad.
-    # [m/s^2] Cornering budget: ~12 deg of rear slip, held lower in `sector_scale`.
-    # Step 6, on the curvature-reweighted line: 0 collisions in the harness at stale
-    # 5/9/14, best ~12.9 s. 12 was faster but collided under measured solve timing.
-    a_lat_max: float = 11.5
+    # [m/s^2] Cornering budget: ~18 deg of rear slip, held lower in `sector_scale`.
+    # Step 7 (sub-11 Step 3), with the reachable-pace reference window: 0 collisions
+    # across stale 5/9/14 x fixed 5/7/12 ms and 8 measured-timing runs, best 11.03 s.
+    a_lat_max: float = 18.0
     lock_margin: float = 0.95       # fraction of the steering lock the profile may use
     a_accel_max: float = 9.51       # [m/s^2] acceleration the profile plans (plant: 9.51)
     # [m/s^2] Braking the profile plans, and the most the conditioner passes on
@@ -89,9 +89,11 @@ class DriverConfig:
     # s the arc length from the reference's first waypoint, scale in (0, 1].
     # Flat because ROS parameters are flat lists (speed_profile.sector_triples);
     # never empty, or rclpy types it as a byte array: (0, 1, 1) turns it off.
-    # Step 6: the two sectors where a uniform 11.5 collided on the reweighted line
-    # (s~4.6 and s~14.1). Off the raceline, see _slip_budget_for.
-    sector_scale: tuple[float, ...] = (2.0, 8.5, 0.85, 11.0, 17.5, 0.8)
+    # Step 7: one narrow sector per spot where a uniform 18 collided (s~4.8, 14.1,
+    # 54.2, 66.3). s 62-68 is trail-braked: 0.8 collided under measured timing.
+    # Off the raceline, see _slip_budget_for.
+    sector_scale: tuple[float, ...] = (2.0, 8.5, 0.6, 11.0, 17.5, 0.7,
+                                       50.0, 57.0, 0.85, 62.0, 68.0, 0.75)
     # [m/s^2] Braking the emergency cap assumes, and the rate a coast sheds speed.
     a_emergency: float = 7.0
     steer_limit: float = 0.4189     # [rad] the real lock, VehicleParameters.s_max
