@@ -181,14 +181,24 @@ class Step9TunedWeightsTests(unittest.TestCase):
                 self.assertEqual(params[name], value)
 
 
-STEP7_TUNED = {'a_lat_max': 18.0, 'a_brake_max': 6.0, 'accel_limit': 9.51,
+STEP8_TUNED = {'a_lat_max': 18.0, 'a_brake_max': 6.0, 'accel_limit': 9.51,
                'lock_margin': 0.95,
-               'sector_scale': [2.0, 8.5, 0.6, 11.0, 17.5, 0.7,
-                                50.0, 57.0, 0.85, 62.0, 68.0, 0.75]}
+               'sector_scale': [2.0, 8.5, 0.6, 11.0, 17.5, 0.7, 36.0, 43.0, 0.85,
+                                50.0, 57.0, 0.8, 62.0, 68.0, 0.75]}
 
 
-class Step7TunedProfileTests(unittest.TestCase):
-    """The sub-11 Step 3 sweep, with the reachable-pace reference window.
+class Step8TunedProfileTests(unittest.TestCase):
+    """Step 7's profile, re-tuned to the offline min-time line (sub-11 Step 4).
+
+    The min-time line (raceline.py --refine) carries more speed through the
+    s 36-42 left-right and tightens into the right-hander, so uniform 18 there
+    collided at s~41 (fixed timing, every lap): it gets a sector at 0.85 (0.9
+    still collided under measured timing). The s 50-57 corner, sharper on the new
+    line, collided at s~54 at stale 14 under measured timing at 0.85; 0.8 is clean.
+    The sectors are arc positions on the min-time CSV.
+
+    Step 7, on the minimum-curvature line: the sub-11 Step 3 sweep, with the
+    reachable-pace reference window.
 
     Pacing the MPC's window by reachable speeds (test_reference_pace.py) and
     lifting accel_limit to the plant's 9.51 took the Step 6 profile from 12.90
@@ -204,13 +214,13 @@ class Step7TunedProfileTests(unittest.TestCase):
     """
 
     def test_the_code_defaults_carry_the_tuned_profile(self):
-        for name, value in STEP7_TUNED.items():
+        for name, value in STEP8_TUNED.items():
             with self.subTest(name=name):
                 self.assertEqual(driver_params.DEFAULTS[name], value)
 
     def test_the_params_file_carries_the_tuned_profile(self):
         params = _node_params()
-        for name, value in STEP7_TUNED.items():
+        for name, value in STEP8_TUNED.items():
             with self.subTest(name=name):
                 self.assertEqual(params[name], value)
 

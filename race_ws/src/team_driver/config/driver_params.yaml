@@ -52,18 +52,20 @@ driver:
     # triples, s [m] along the raceline from its first point, scale in (0, 1].
     # Step 7: one narrow sector per spot where a uniform 18 collided (s~4.8, 14.1,
     # 54.2, 66.3); s 62-68 at 0.8 collided under measured timing, 0.75 is clean.
+    # Step 8, on the offline min-time line (config/icra26_raceline.csv): s 36-43
+    # added at 0.85 (0.9 collided at s~41), s 50-57 down to 0.8 (s~54 at stale 14).
     # Never empty: ROS would type an empty list as bytes and refuse a list of
-    # doubles; to turn the sectors off, use [0.0, 1.0, 1.0]. Tuned on the raceline
+    # doubles; to turn the sectors off, use [0.0, 1.0, 1.0]. Tuned on that line
     # at raceline_margin 0.25; on the centreline the lap gets a uniform a_lat_max x
     # the lowest scale (10.8 m/s^2: clean in lap_sim, 14.22 s).
-    # Fallback if it ever collides: a_lat_max 17 with
-    # [2.0, 8.5, 0.62, 11.0, 17.5, 0.75, 50.0, 57.0, 0.9, 62.0, 68.0, 0.8] (11.15 s).
-    sector_scale: [2.0, 8.5, 0.6, 11.0, 17.5, 0.7, 50.0, 57.0, 0.85, 62.0, 68.0, 0.75]
+    # Fallback if it ever collides: s 36-43 at 0.8 as well (10.86 s, clean at
+    # stale 5/9/14 measured), or the Step 7 line and profile (git 7489614, 11.03 s).
+    sector_scale: [2.0, 8.5, 0.6, 11.0, 17.5, 0.7, 36.0, 43.0, 0.85, 50.0, 57.0, 0.8, 62.0, 68.0, 0.75]
     a_emergency: 7.0          # [m/s^2] braking the emergency cap assumes; coasting sheds speed at it
     steer_limit: 0.4189       # [rad] the real lock
-    # Reference line the MPC tracks: "centerline" (the shipped CSV) or "raceline"
-    # (minimum curvature, built from the map at startup; falls back to
-    # config/icra26_raceline.csv if the build fails).
+    # Reference line the MPC tracks: "centerline" (the shipped CSV) or "raceline":
+    # the offline min-time line in config/icra26_raceline.csv, once it checks out
+    # against the map; else minimum curvature, built from the map at startup.
     reference: "raceline"
     raceline_margin: 0.25     # [m] clearance beyond the car's half-width kept from walls
 

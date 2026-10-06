@@ -145,6 +145,47 @@ class TestSyntheticTrack(unittest.TestCase):
         np.testing.assert_allclose(ax, (np.roll(vx, -1) ** 2 - vx ** 2) / (2 * ds), atol=1e-6)
 
 
+class TestMinTimeRefinement(unittest.TestCase):
+    """`refine_min_time` on a synthetic track: faster, and never closer to a wall."""
+
+    PROFILE = dict(a_lat_max=5.0, lock_margin=0.95, a_accel_max=9.51, a_brake_max=6.0,
+                   v_max=10.0, sector_scale=())
+
+    @classmethod
+    def setUpClass(cls):
+        center = _rounded_rectangle(8.0, 5.0, 1.2)
+        grid = _track_grid(center, half_width=0.8)
+        cls.base = rl.build_raceline(center, grid, margin=MARGIN, half_width=HALF_WIDTH)
+        cls.required = HALF_WIDTH + MARGIN
+        cls.refined = rl.refine_min_time(cls.base.xy, cls.base.sealed, cls.required,
+                                         profile=cls.PROFILE, control_points=12, rounds=1)
+
+    def _lap(self, xy):
+        return sp.ideal_lap_time(xy, sp.speed_profile(xy, **self.PROFILE))
+
+    def test_refined_line_is_faster_at_the_profile_it_was_refined_for(self):
+        self.assertLess(self._lap(self.refined), self._lap(self.base.xy))
+
+    def test_refined_line_keeps_the_required_clearance(self):
+        clearance = rl.wall_clearance(self.base.sealed, self.refined)
+        self.assertGreaterEqual(float(clearance.min()), self.required - rl.CLEARANCE_EPS)
+
+    def test_refined_line_is_delivered_at_the_output_spacing(self):
+        np.testing.assert_allclose(sp.segment_lengths(self.refined, True),
+                                   rl.OUTPUT_SPACING, rtol=0.05)
+
+    def test_a_refinement_that_is_not_faster_is_refused(self):
+        # Zero rounds leaves the line as it came: nothing gained, nothing to ship.
+        with self.assertRaises(rl.RacelineError):
+            rl.refine_min_time(self.base.xy, self.base.sealed, self.required,
+                               profile=self.PROFILE, rounds=0)
+
+    def test_a_line_that_cannot_keep_the_clearance_is_refused(self):
+        with self.assertRaises(rl.RacelineError):
+            rl.refine_min_time(self.base.xy, self.base.sealed, 0.9, profile=self.PROFILE,
+                               control_points=12, rounds=1, max_iter=2)
+
+
 class TestWeightedSolve(unittest.TestCase):
     """Per-row weights on the second differences of `_min_curvature_offsets`."""
 
@@ -283,6 +324,52 @@ class TestIcra26Reweighted(unittest.TestCase):
 
 
 @unittest.skipUnless(os.path.exists(MAP_YAML), 'maps/icra26.yaml not found')
+class TestIcra26MinTime(unittest.TestCase):
+    """The shipped line: the reweighted QP line, refined for lap time (~60 s)."""
+
+    CACHE = os.path.join(_HERE, os.pardir, 'config', 'icra26_raceline.csv')
+    REQUIRED_GAIN = 0.3            # [s] of ideal lap at the profile it was refined for
+
+    @classmethod
+    def setUpClass(cls):
+        grid = rl.load_occupancy(MAP_YAML)
+        center = lap_floor.load_path(lap_floor.default_centerline_path())
+        cls.qp = rl.build_raceline(center, grid, margin=SHIPPED_MARGIN, half_width=HALF_WIDTH)
+        cls.refined = rl.refine_min_time(cls.qp.xy, cls.qp.sealed, HALF_WIDTH + SHIPPED_MARGIN)
+
+    @staticmethod
+    def _lap(xy):
+        return sp.ideal_lap_time(xy, sp.speed_profile(xy, **rl.REFINE_PROFILE))
+
+    def test_ideal_lap_improves_by_at_least_0p3_s(self):
+        self.assertLess(self._lap(self.refined), self._lap(self.qp.xy) - self.REQUIRED_GAIN)
+
+    def test_clearance_is_at_least_the_required_distance(self):
+        clearance = rl.wall_clearance(self.qp.sealed, self.refined)
+        self.assertGreaterEqual(float(clearance.min()),
+                                HALF_WIDTH + SHIPPED_MARGIN - rl.CLEARANCE_EPS)
+
+    def test_peak_smoothed_curvature_is_below_full_lock(self):
+        self.assertLess(float(sp.closed_curvature(self.refined).max()), FULL_LOCK_KAPPA)
+
+    def test_shipped_csv_is_a_reproducible_min_time_line(self):
+        # Not point for point: BLAS threading moves the QP line by ~1e-6 m and the
+        # finite-difference search amplifies that to ~9 cm and ~0.04 s of ideal lap
+        # (OMP_NUM_THREADS=1 reproduces the CSV to its 4 decimals). The driver drives
+        # the CSV itself, so what must reproduce is the line's quality: method,
+        # margin, clearance, the 0.3 s gain, and an ideal lap a fresh run agrees with.
+        xy, margin = rl.read_cached(self.CACHE)
+        self.assertEqual(margin, SHIPPED_MARGIN)
+        self.assertEqual(rl.cached_method(self.CACHE), rl.MIN_TIME_METHOD)
+        self.assertGreaterEqual(float(rl.wall_clearance(self.qp.sealed, xy).min()),
+                                HALF_WIDTH + SHIPPED_MARGIN - rl.CLEARANCE_EPS)
+        self.assertLess(self._lap(xy), self._lap(self.qp.xy) - self.REQUIRED_GAIN)
+        self.assertAlmostEqual(self._lap(xy), self._lap(self.refined), delta=0.05,
+                               msg='config/icra26_raceline.csv is stale: rerun '
+                                   'OMP_NUM_THREADS=1 raceline.py --refine --write')
+
+
+@unittest.skipUnless(os.path.exists(MAP_YAML), 'maps/icra26.yaml not found')
 class TestIcra26(unittest.TestCase):
 
     @classmethod
@@ -358,10 +445,46 @@ class TestDriverCoreReference(unittest.TestCase):
         core = driver_core.DriverCore(driver_core.DriverConfig(**cfg), logger=log)
         return core, log
 
+    CACHE = os.path.join(_HERE, os.pardir, 'config', 'icra26_raceline.csv')
+
+    def setUp(self):
+        import driver_core
+        driver_core._built_raceline.cache_clear()
+        driver_core._offline_min_time_line.cache_clear()
+        self.addCleanup(driver_core._offline_min_time_line.cache_clear)
+        self.addCleanup(driver_core._built_raceline.cache_clear)
+
     def test_default_reference_is_the_raceline(self):
         core, _ = self._core()
         self.assertNotEqual(len(core.reference_path), 392)
         self.assertLess(_length(core.reference_path), 75.0)
+
+    def test_the_offline_min_time_line_is_driven_first(self):
+        core, log = self._core()
+        xy, _ = rl.read_cached(self.CACHE)
+        np.testing.assert_array_equal(core.reference_path, xy)
+        self.assertIn('min-time', log.text('info'))
+
+    def test_a_csv_that_is_not_min_time_is_left_to_the_runtime_build(self):
+        with mock.patch.object(rl, 'cached_method', return_value=rl.MIN_CURVATURE_METHOD):
+            core, log = self._core()
+        self.assertIn('built in', log.text('info'))
+        self.assertIn('min-curvature', log.text('warn'))
+
+    def test_a_min_time_line_closer_to_a_wall_than_the_margin_is_not_driven(self):
+        with mock.patch.object(rl, 'wall_clearance', return_value=np.zeros(3)):
+            core, log = self._core()
+        self.assertIn('built in', log.text('info'))
+        self.assertIn('clearance', log.text('warn'))
+
+    def test_a_min_time_line_that_failed_its_map_check_is_not_the_last_resort(self):
+        # The build failing too must not send the car back to the line it just refused.
+        boom = RuntimeError('boom')
+        with mock.patch.object(rl, 'wall_clearance', return_value=np.zeros(3)), \
+                mock.patch.object(rl, 'build_raceline', side_effect=boom):
+            core, log = self._core()
+        self.assertEqual(len(core.reference_path), 392)
+        self.assertIn('map check', log.text('error'))
 
     def test_the_centreline_is_still_available(self):
         core, _ = self._core(reference='centerline')
@@ -401,8 +524,15 @@ class TestDriverCoreReference(unittest.TestCase):
         _, log = self._core(a_lat_max=8.0, sector_scale=(500.0, 510.0, 0.5))
         self.assertIn('500', log.text('warn'))
 
+    def _not_min_time(self):
+        """The CSV read as a plain min-curvature line, so the runtime build goes first."""
+        patcher = mock.patch.object(rl, 'cached_method', return_value=rl.MIN_CURVATURE_METHOD)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_failed_build_falls_back_to_the_cached_csv(self):
         import driver_core
+        self._not_min_time()
         original = rl.build_raceline
         rl.build_raceline = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom'))
         driver_core._built_raceline.cache_clear()       # or the memo hides the failure
@@ -418,6 +548,7 @@ class TestDriverCoreReference(unittest.TestCase):
         # solve fails and build_raceline returns the uniform line instead, the driver
         # must take the cached reweighted line, not run the tuned profile on that one.
         import driver_core
+        self._not_min_time()
         cached_xy, _ = rl.read_cached(
             os.path.join(_HERE, os.pardir, 'config', 'icra26_raceline.csv'))
         uniform_stand_in = rl.Raceline(xy=cached_xy * 2.0, sealed=None,
@@ -446,15 +577,6 @@ class TestDriverCoreReference(unittest.TestCase):
 class TestCachedRaceline(unittest.TestCase):
 
     CACHE = os.path.join(_HERE, os.pardir, 'config', 'icra26_raceline.csv')
-
-    def test_cache_matches_a_fresh_build_at_its_own_margin(self):
-        xy, margin = rl.read_cached(self.CACHE)
-        grid = rl.load_occupancy(MAP_YAML)
-        center = lap_floor.load_path(lap_floor.default_centerline_path())
-        fresh = rl.build_raceline(center, grid, margin=margin).xy
-        self.assertEqual(xy.shape, fresh.shape)
-        self.assertLess(float(np.abs(xy - fresh).max()), 1e-3,
-                        'config/icra26_raceline.csv is stale: rerun raceline.py --write')
 
     def test_unusable_caches_are_refused(self):
         import tempfile
@@ -497,6 +619,29 @@ class TestCachedRaceline(unittest.TestCase):
                 status = rl.main(['--margin', '0.25', '--write', target])
             self.assertNotEqual(status, 0)
             self.assertFalse(os.path.exists(target), 'a uniform line was cached')
+
+    def test_write_records_how_the_line_was_made(self):
+        import tempfile
+        xy, _ = rl.read_cached(self.CACHE)
+        line = rl.Raceline(xy=xy, sealed=rl.load_occupancy(MAP_YAML), build_seconds=0.0,
+                           reweighted=True)
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.object(rl, 'build_raceline', return_value=line), \
+                mock.patch.object(rl, 'refine_min_time', side_effect=lambda xy, *a, **k: xy):
+            cases = (([], rl.MIN_CURVATURE_METHOD), (['--refine'], rl.MIN_TIME_METHOD))
+            for flags, method in cases:
+                target = os.path.join(folder, f'{method}.csv')
+                with self.subTest(method=method):
+                    self.assertEqual(rl.main(['--margin', '0.25', '--write', target] + flags), 0)
+                    self.assertEqual(rl.cached_method(target), method)
+                    self.assertEqual(rl.read_cached(target)[1], 0.25)
+
+    def test_a_csv_without_a_method_header_is_min_curvature(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile('w', suffix='.csv', delete=False) as handle:
+            handle.write('# margin_m: 0.25\n' + ''.join(f'{i},0\n' for i in range(60)))
+        self.addCleanup(os.unlink, handle.name)
+        self.assertEqual(rl.cached_method(handle.name), rl.MIN_CURVATURE_METHOD)
 
     def test_negative_or_nan_margin_is_refused(self):
         import driver_params

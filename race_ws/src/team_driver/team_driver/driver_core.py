@@ -91,9 +91,10 @@ class DriverConfig:
     # never empty, or rclpy types it as a byte array: (0, 1, 1) turns it off.
     # Step 7: one narrow sector per spot where a uniform 18 collided (s~4.8, 14.1,
     # 54.2, 66.3). s 62-68 is trail-braked: 0.8 collided under measured timing.
-    # Off the raceline, see _slip_budget_for.
-    sector_scale: tuple[float, ...] = (2.0, 8.5, 0.6, 11.0, 17.5, 0.7,
-                                       50.0, 57.0, 0.85, 62.0, 68.0, 0.75)
+    # Step 8, on the offline min-time line: s 36-43 added (s~41 collided), s 50-57
+    # down to 0.8 (s~54 collided at stale 14). Off the raceline, see _slip_budget_for.
+    sector_scale: tuple[float, ...] = (2.0, 8.5, 0.6, 11.0, 17.5, 0.7, 36.0, 43.0, 0.85,
+                                       50.0, 57.0, 0.8, 62.0, 68.0, 0.75)
     # [m/s^2] Braking the emergency cap assumes, and the rate a coast sheds speed.
     a_emergency: float = 7.0
     steer_limit: float = 0.4189     # [rad] the real lock, VehicleParameters.s_max
@@ -395,6 +396,29 @@ def _built_raceline(centerline_path, margin):
     return line.xy, line.build_seconds
 
 
+@functools.lru_cache(maxsize=4)
+def _offline_min_time_line(csv_path, centerline_path, required):
+    """xy of the min-time line cached in `csv_path`, checked against the map.
+
+    Raises unless the CSV says it is the `raceline.py --refine` line and every
+    point keeps `required` from the sealed walls of the map beside the centreline:
+    shipped data is only trusted as far as the map it is driven on agrees.
+    """
+    method = raceline.cached_method(csv_path)
+    if method != raceline.MIN_TIME_METHOD:
+        raise ValueError(f'{csv_path} holds the {method} line')
+    xy, _ = raceline.read_cached(csv_path)
+    yaml_path = raceline.find_map_yaml(centerline_path)
+    if yaml_path is None:
+        raise FileNotFoundError(f'no map yaml beside {centerline_path}')
+    sealed = raceline.seal_cones(raceline.load_occupancy(yaml_path))
+    closest = float(raceline.wall_clearance(sealed, xy).min())
+    if closest < required - raceline.CLEARANCE_EPS:
+        raise ValueError(f'clearance {closest:.3f} m on the map, {required:.3f} m required')
+    xy.setflags(write=False)
+    return xy
+
+
 class DriverCore:
     """The algorithm: reference path, MPC, and the reactive safety layer."""
 
@@ -564,13 +588,27 @@ class DriverCore:
         return candidates
 
     def _raceline_reference(self, centerline_path, centerline_xy):
-        """The runtime raceline, else the cached one, else the centreline.
+        """The offline min-time line, else the runtime raceline, else the cached
+        one, else the centreline.
 
-        Built from the map at startup, which is what rule 41 rewards. The cache
-        is the same line, generated offline by `raceline.py --write`; it is used
-        only when the build fails, and only if it was built with at least the
-        margin asked for.
+        The min-time line (`raceline.py --refine --write`) takes ~60 s to compute,
+        past the startup budget, so it ships as the cached CSV and is driven first
+        once it checks out against the map. Otherwise the minimum-curvature line is
+        built from the map at startup, and the CSV is used only when that build
+        fails, and only if it was built with at least the margin asked for.
         """
+        cached = next((p for p in self._cached_raceline_candidates() if os.path.exists(p)), None)
+        rejected = None
+        if cached is not None:
+            try:
+                xy = _offline_min_time_line(
+                    cached, centerline_path, raceline.HALF_WIDTH + float(self.cfg.raceline_margin))
+                self.log.info(f'raceline: offline min-time line {cached}, {len(xy)} points')
+                return xy.copy()
+            except Exception as e:
+                rejected = e
+                self.log.warn(f'raceline: not driving the offline min-time line ({e}); '
+                              'building from the map')
         try:
             xy, seconds = _built_raceline(centerline_path, float(self.cfg.raceline_margin))
             self.log.info(f'raceline: {len(xy)} points, built in {seconds:.2f} s')
@@ -578,7 +616,6 @@ class DriverCore:
         except Exception as e:
             reason = f'build failed: {e}'
 
-        cached = next((p for p in self._cached_raceline_candidates() if os.path.exists(p)), None)
         if cached is None:
             self.log.error(f'raceline: {reason}; no cached raceline found, '
                            'using the centreline')
@@ -593,6 +630,10 @@ class DriverCore:
             self.log.error(f'raceline: {reason}; the cached raceline keeps {margin} m of '
                            f'margin, less than the {self.cfg.raceline_margin} m asked for, '
                            'using the centreline')
+            return centerline_xy
+        if rejected is not None and raceline.cached_method(cached) == raceline.MIN_TIME_METHOD:
+            self.log.error(f'raceline: {reason}; the cached raceline failed its map check '
+                           f'({rejected}), using the centreline')
             return centerline_xy
         self.log.warn(f'raceline: {reason}; using the cached raceline {cached} '
                       f'(margin {margin} m)')
