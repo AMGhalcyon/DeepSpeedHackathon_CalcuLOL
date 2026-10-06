@@ -364,7 +364,8 @@ class TestIcra26MinTime(unittest.TestCase):
         self.assertGreaterEqual(float(rl.wall_clearance(self.qp.sealed, xy).min()),
                                 HALF_WIDTH + SHIPPED_MARGIN - rl.CLEARANCE_EPS)
         self.assertLess(self._lap(xy), self._lap(self.qp.xy) - self.REQUIRED_GAIN)
-        self.assertAlmostEqual(self._lap(xy), self._lap(self.refined), delta=0.05,
+        # delta is 2.5x the ~0.04 s BLAS drift above: a stale CSV misses by far more.
+        self.assertAlmostEqual(self._lap(xy), self._lap(self.refined), delta=0.1,
                                msg='config/icra26_raceline.csv is stale: rerun '
                                    'OMP_NUM_THREADS=1 raceline.py --refine --write')
 

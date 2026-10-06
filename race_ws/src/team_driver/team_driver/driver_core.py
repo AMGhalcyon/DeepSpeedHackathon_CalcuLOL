@@ -99,7 +99,8 @@ class DriverConfig:
     a_emergency: float = 7.0
     steer_limit: float = 0.4189     # [rad] the real lock, VehicleParameters.s_max
     # Reference line the MPC tracks: 'centerline' (the shipped CSV) or 'raceline'
-    # (minimum curvature, built from the map at startup; see raceline.py).
+    # (the shipped offline min-time line when it checks out against the map, else
+    # minimum curvature built from the map at startup; see raceline.py).
     reference: str = 'raceline'
     # [m] Clearance beyond the car's half-width kept from walls. 0.10 was too thin
     # once the car ran at profile speed (DQ at a_lat_max 5); 0.25 gave 0 collisions
@@ -608,7 +609,8 @@ class DriverCore:
             except Exception as e:
                 rejected = e
                 self.log.warn(f'raceline: not driving the offline min-time line ({e}); '
-                              'building from the map')
+                              'building from the map; the sector profile was tuned on the '
+                              'min-time line, so expect a slower, untested lap')
         try:
             xy, seconds = _built_raceline(centerline_path, float(self.cfg.raceline_margin))
             self.log.info(f'raceline: {len(xy)} points, built in {seconds:.2f} s')
