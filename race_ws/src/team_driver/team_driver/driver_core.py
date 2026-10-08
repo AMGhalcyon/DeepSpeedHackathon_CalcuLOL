@@ -31,7 +31,7 @@ try:
     from .mpc_controller import MPCController   # ROS / package import
     from .vehicle_model import F1TENTH_VEHICLE_PARAMETERS, SpeedLoop, VehicleModel
     from . import raceline
-    from .speed_profile import sector_triples, slip_budget
+    from .speed_profile import check_gg_floor, sector_triples, slip_budget
     from .latch_predictor import (LATCH_TIME_TOL, LatchPredictor, Prediction,
                                   plant_servo_rate, servo_kp)
     from .longitudinal import (LIDAR_FORWARD, ClosedPath, bearing_lookahead,
@@ -41,7 +41,7 @@ except ImportError:
     from mpc_controller import MPCController    # standalone `python3 lap_sim.py`
     from vehicle_model import F1TENTH_VEHICLE_PARAMETERS, SpeedLoop, VehicleModel
     import raceline
-    from speed_profile import sector_triples, slip_budget
+    from speed_profile import check_gg_floor, sector_triples, slip_budget
     from latch_predictor import (LATCH_TIME_TOL, LatchPredictor, Prediction,
                                  plant_servo_rate, servo_kp)
     from longitudinal import (LIDAR_FORWARD, ClosedPath, bearing_lookahead,
@@ -95,6 +95,12 @@ class DriverConfig:
     # down to 0.8 (s~54 collided at stale 14). Off the raceline, see _slip_budget_for.
     sector_scale: tuple[float, ...] = (2.0, 8.5, 0.6, 11.0, 17.5, 0.7, 36.0, 43.0, 0.85,
                                        50.0, 57.0, 0.8, 62.0, 68.0, 0.75)
+    # Combined-accel limit on the profile's braking (speed_profile.gg_decel): the
+    # deceleration taken into a corner shrinks with the share of the slip budget the
+    # corner already uses, because braking unloads the rear axle and the plant's yaw
+    # goes unstable (sub-10 Step 1). Off reproduces the plain profile bit for bit.
+    gg_brake: bool = False
+    gg_floor: float = 0.1           # share of a_brake_max braking always keeps, in (0, 1]
     # [m/s^2] Braking the emergency cap assumes, and the rate a coast sheds speed.
     a_emergency: float = 7.0
     steer_limit: float = 0.4189     # [rad] the real lock, VehicleParameters.s_max
@@ -123,6 +129,7 @@ class DriverConfig:
         # Here, not only in driver_params.validate(): a bad list raised later, inside
         # the reference loader, would quietly drop the car to the reactive controller.
         sector_triples(self.sector_scale)
+        check_gg_floor(self.gg_floor)
 
 
 class DriveCommand(NamedTuple):
@@ -678,7 +685,8 @@ class DriverCore:
                 path=path, v_max=self.v_max,
                 a_lat_max=a_lat_max, lock_margin=self.cfg.lock_margin,
                 a_accel_max=self.cfg.a_accel_max, a_brake_max=self.cfg.a_brake_max,
-                sector_scale=sectors)
+                sector_scale=sectors,
+                gg_brake=self.cfg.gg_brake, gg_floor=self.cfg.gg_floor)
             self.log.info(f'Speed profile: {speeds.min():.2f}-{speeds.max():.2f} m/s')
             self.set_reference(path, speeds)
 

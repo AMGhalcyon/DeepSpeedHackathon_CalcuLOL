@@ -29,11 +29,11 @@ if _current_dir not in sys.path:
     sys.path.insert(0, _current_dir)
 try:
     from .driver_core import DriverConfig, REFERENCES   # ROS / package import
-    from .speed_profile import sector_triples
+    from .speed_profile import check_gg_floor, sector_triples
     from .vehicle_model import MODEL_TYPES, ServoModel, VehicleModel
 except ImportError:
     from driver_core import DriverConfig, REFERENCES    # standalone / tests
-    from speed_profile import sector_triples
+    from speed_profile import check_gg_floor, sector_triples
     from vehicle_model import MODEL_TYPES, ServoModel, VehicleModel
 
 PARAMS_SOURCE_DEFAULT = 'CODE_DEFAULTS'
@@ -151,6 +151,7 @@ def validate(values: Mapping[str, Any]) -> None:
         raise ValueError(f"crawl_speed {values['crawl_speed']} must not exceed "
                          f"v_max {values['v_max']}")
     sector_triples(values['sector_scale'])   # raises ValueError naming the sector
+    check_gg_floor(values['gg_floor'])
 
 
 def _validate_schedule(schedule: list, horizon: int, period: float) -> None:

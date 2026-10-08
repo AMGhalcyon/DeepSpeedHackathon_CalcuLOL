@@ -10,9 +10,11 @@ wrapped round the lap so the corner at the finish line is braked for.
 
 `a_lat_max` is a *slip budget*, not a grip limit. The judged plant is the
 single-track model with linear tyres (`single_track.py`): force grows with slip
-angle and never peaks, so there is no friction circle and braking does not eat
-into cornering. The practical limit is how much rear slip the car may carry,
-alpha_r = a_y / (mu * C_Sr * g) = a_y / 56.1 rad.
+angle and never peaks, so there is no friction circle. The practical limit is
+how much rear slip the car may carry, alpha_r = a_y / (mu * C_Sr * g) = a_y / 56.1
+rad. Braking does eat into it, though: load transfer unloads the rear axle and
+the yaw dynamics go unstable (above ~6 m/s at -6 m/s^2), so `gg_brake` optionally
+limits the deceleration into a corner by an ellipse (see `gg_decel`).
 
 `v_lock` is the steering lock. The plant's steady turn needs
 delta = L * kappa + K * v^2 * kappa, with the understeer gradient
@@ -22,6 +24,7 @@ delta = lock_margin * s_max gives `lock_speed`. It only binds in hairpins.
 Every plant constant comes from `VehicleParameters`; none is a tunable.
 """
 
+import math
 import os
 import sys
 from collections.abc import Sequence
@@ -43,6 +46,9 @@ KAPPA_FLOOR = 1e-6                # [1/m] a straight, for the divisions below
 CURVATURE_SMOOTH = 9              # [points] centred moving average, as MPCController
 POWER_SPEED_FLOOR = 0.1           # [m/s] keeps 9.51 * 7.319 / v finite at a standstill
 PASS_LAPS = 2                     # a wrapped pass needs two laps to settle
+GG_EXPONENT = 2.0                 # shape of the braking/cornering ellipse
+GG_ITERATIONS = 3                 # fixed-point passes: the share depends on the entry speed
+GG_FLOOR = 0.1                    # default share of the ellipse braking may always use
 
 WHEELBASE = _VP.lf + _VP.lr
 UNDERSTEER_GRADIENT = (1.0 / (_VP.mu * GRAVITY)) * (1.0 / _VP.C_Sf - 1.0 / _VP.C_Sr)
@@ -113,14 +119,51 @@ def _accel_limit(v: float, a_accel_max: float) -> float:
     return min(a_accel_max, _VP.a_max * _VP.v_switch / max(v, POWER_SPEED_FLOOR))
 
 
-def _brake_pass(v: np.ndarray, ds: np.ndarray, a_brake: float, closed: bool) -> None:
-    """Lower `v` in place so each point can be braked to from the one before it."""
+def check_gg_floor(floor: float) -> None:
+    """Raise ValueError unless `floor` is in (0, 1]; also refuses NaN."""
+    if not (isinstance(floor, (int, float)) and 0.0 < floor <= 1.0):
+        raise ValueError(f'gg_floor {floor!r} must be in (0, 1]')
+
+
+def gg_decel(v, kappa, budget, a_brake: float, floor: float):
+    """[m/s^2] Braking left at speed `v` where the corner already uses its slip budget.
+
+    The judged plant's yaw dynamics go unstable under braking (load transfer
+    unloads the rear axle), so deceleration and cornering share one ellipse:
+
+        a = a_brake * max(floor, 1 - r^2)^(1/2),   r = min(v^2 kappa / budget, 1)
+
+    A straight keeps all of `a_brake`; a corner held at its budget keeps only
+    `sqrt(floor)` of it. Works on scalars and arrays.
+    """
+    r = np.minimum(np.asarray(v) ** 2 * np.abs(kappa) / budget, 1.0)
+    return a_brake * np.maximum(floor, 1.0 - r ** GG_EXPONENT) ** (1.0 / GG_EXPONENT)
+
+
+def _gg_rate(v_next: float, ds: float, a_brake: float, kappa: float, budget: float,
+             floor: float) -> float:
+    """[m/s^2] Braking into a point, from the share of the ellipse its entry speed uses."""
+    a = a_brake
+    for _ in range(GG_ITERATIONS):
+        v_here = math.sqrt(v_next ** 2 + 2.0 * a * ds)
+        a = float(gg_decel(v_here, kappa, budget, a_brake, floor))
+    return a
+
+
+def _brake_pass(v: np.ndarray, ds: np.ndarray, a_brake: float, closed: bool,
+                gg: Optional[tuple] = None) -> None:
+    """Lower `v` in place so each point can be braked to from the one before it.
+
+    `gg` is (kappa, budget, floor) per point to brake inside the ellipse of
+    `gg_decel`; None brakes at `a_brake` everywhere.
+    """
     n = len(v)
     first = n - 1 if closed else n - 2
     for step in range(PASS_LAPS * n if closed else n - 1):
         i = (first - step) % n
         j = (i + 1) % n
-        v[i] = min(v[i], np.sqrt(v[j] ** 2 + 2.0 * a_brake * ds[i]))
+        a = a_brake if gg is None else _gg_rate(v[j], ds[i], a_brake, gg[0][i], gg[1][i], gg[2])
+        v[i] = min(v[i], np.sqrt(v[j] ** 2 + 2.0 * a * ds[i]))
 
 
 def _accel_pass(v: np.ndarray, ds: np.ndarray, a_accel_max: float, closed: bool) -> None:
@@ -179,7 +222,8 @@ def speed_profile(path: np.ndarray, *, a_lat_max: float, lock_margin: float,
                   a_accel_max: float, a_brake_max: float, v_max: float,
                   kappa: Optional[np.ndarray] = None, closed: bool = True,
                   v_start: float = 0.0,
-                  sector_scale: Sequence[Sequence[float]] = ()) -> np.ndarray:
+                  sector_scale: Sequence[Sequence[float]] = (),
+                  gg_brake: bool = False, gg_floor: float = GG_FLOOR) -> np.ndarray:
     """Speed per waypoint, shape (N,).
 
     Args:
@@ -194,7 +238,12 @@ def speed_profile(path: np.ndarray, *, a_lat_max: float, lock_margin: float,
         v_start: speed at point 0 of an open path (a standing start).
         sector_scale: (s_start, s_end, scale) sectors that lower `a_lat_max`
             (see `slip_budget`); empty keeps it uniform.
+        gg_brake: brake inside the ellipse of `gg_decel`, so the deceleration
+            into a corner shrinks with the slip budget the corner already uses.
+            Off reproduces the plain profile bit for bit.
+        gg_floor: share of `a_brake_max` braking may always keep, in (0, 1].
     """
+    check_gg_floor(gg_floor)
     pts = np.asarray(path, dtype=np.float64)[:, :2]
     n = len(pts)
     if n < 3:
@@ -209,7 +258,7 @@ def speed_profile(path: np.ndarray, *, a_lat_max: float, lock_margin: float,
         v[0] = min(v[0], v_start)
 
     ds = segment_lengths(pts, closed)
-    _brake_pass(v, ds, a_brake_max, closed)
+    _brake_pass(v, ds, a_brake_max, closed, (k, budget, gg_floor) if gg_brake else None)
     _accel_pass(v, ds, a_accel_max, closed)
     return v
 

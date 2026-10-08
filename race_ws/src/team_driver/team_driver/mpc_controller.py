@@ -348,7 +348,9 @@ class MPCController:
                       a_lat_max: float = 0.8, lock_margin: float = 0.95,
                       a_accel_max: float = 9.51, a_brake_max: float = 0.8,
                       closed: bool = True,
-                      sector_scale: Sequence[Sequence[float]] = ()) -> np.ndarray:
+                      sector_scale: Sequence[Sequence[float]] = (),
+                      gg_brake: bool = False,
+                      gg_floor: float = _speed_profile.GG_FLOOR) -> np.ndarray:
         """Closed-loop speed profile for the lap; see `speed_profile.py`.
 
         The reference used to demand an instant jump to corner speed, so the car
@@ -363,6 +365,8 @@ class MPCController:
             closed: The path is a lap (last point joins the first).
             sector_scale: (s_start, s_end, scale) sectors that lower the slip
                 budget (`speed_profile.slip_budget`).
+            gg_brake, gg_floor: brake inside the combined-accel ellipse
+                (`speed_profile.gg_decel`); off by default.
         Returns:
             Speed per waypoint, shape (N,).
         """
@@ -373,7 +377,8 @@ class MPCController:
         return _speed_profile.speed_profile(
             path, a_lat_max=a_lat_max, lock_margin=lock_margin,
             a_accel_max=a_accel_max, a_brake_max=a_brake_max, v_max=v_max,
-            closed=closed, sector_scale=sector_scale)
+            closed=closed, sector_scale=sector_scale,
+            gg_brake=gg_brake, gg_floor=gg_floor)
 
     @property
     def arc_position(self) -> Optional[float]:

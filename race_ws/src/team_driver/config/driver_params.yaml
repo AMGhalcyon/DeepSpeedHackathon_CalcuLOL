@@ -61,6 +61,13 @@ driver:
     # Fallback if it ever collides: s 36-43 at 0.8 as well (10.86 s, clean at
     # stale 5/9/14 measured), or the Step 7 line and profile (git 7489614, 11.03 s).
     sector_scale: [2.0, 8.5, 0.6, 11.0, 17.5, 0.7, 36.0, 43.0, 0.85, 50.0, 57.0, 0.8, 62.0, 68.0, 0.75]
+    # Combined-accel limit on the profile's braking (speed_profile.gg_decel): the
+    # deceleration into a corner shrinks with the share of a_lat_max the corner already
+    # uses, a_brake_max * max(gg_floor, 1 - r^2)^(1/2). Braking unloads the rear axle
+    # and the plant's yaw goes unstable, which is what crashed every uniform budget
+    # above 18 (sub-10 Step 1). Off reproduces the plain profile bit for bit.
+    gg_brake: false
+    gg_floor: 0.1             # share of a_brake_max braking always keeps, in (0, 1]
     a_emergency: 7.0          # [m/s^2] braking the emergency cap assumes; coasting sheds speed at it
     steer_limit: 0.4189       # [rad] the real lock
     # Reference line the MPC tracks: "centerline" (the shipped CSV) or "raceline":

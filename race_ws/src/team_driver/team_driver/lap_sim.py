@@ -159,6 +159,7 @@ def driver_config(cfg):
 
 
 _DRIVER_FIELDS = {f.name: f for f in dataclasses.fields(DriverConfig)}
+BOOL_WORDS = {'true': True, '1': True, 'false': False, '0': False}
 
 
 def parse_driver_override(text):
@@ -170,6 +171,10 @@ def parse_driver_override(text):
         raise argparse.ArgumentTypeError(
             f'{key!r} is not a DriverConfig field; choose from {", ".join(_DRIVER_FIELDS)}')
     default = _DRIVER_FIELDS[key].default
+    if isinstance(default, bool):
+        if raw.lower() not in BOOL_WORDS:
+            raise argparse.ArgumentTypeError(f'{key}: {raw!r} is not true or false')
+        return key, BOOL_WORDS[raw.lower()]
     if isinstance(default, str):
         if key == 'reference' and raw not in REFERENCES:
             raise argparse.ArgumentTypeError(f'reference must be one of {REFERENCES}')

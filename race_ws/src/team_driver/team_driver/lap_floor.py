@@ -64,7 +64,8 @@ def load_path(csv_path: str) -> np.ndarray:
 def floor_table(path: np.ndarray, a_lat_values: Sequence[float] = DEFAULT_A_LAT, *,
                 lock_margin: float = DEFAULT_LOCK_MARGIN, v_max: float = DEFAULT_V_MAX,
                 a_accel_max: float = DEFAULT_A_ACCEL,
-                a_brake_max: float = DEFAULT_A_BRAKE) -> list[FloorRow]:
+                a_brake_max: float = DEFAULT_A_BRAKE, gg_brake: bool = False,
+                gg_floor: float = sp.GG_FLOOR) -> list[FloorRow]:
     """One `FloorRow` per slip budget, on a closed `path`."""
     kappa = sp.closed_curvature(path)
     lock = sp.lock_speed(kappa, lock_margin)
@@ -73,7 +74,8 @@ def floor_table(path: np.ndarray, a_lat_values: Sequence[float] = DEFAULT_A_LAT,
     for a_lat in a_lat_values:
         v = sp.speed_profile(path, a_lat_max=a_lat, lock_margin=lock_margin,
                              a_accel_max=a_accel_max, a_brake_max=a_brake_max,
-                             v_max=v_max, kappa=kappa)
+                             v_max=v_max, kappa=kappa, gg_brake=gg_brake,
+                             gg_floor=gg_floor)
         lap = sp.ideal_lap_time(path, v)
         slip_limit = np.sqrt(a_lat / np.maximum(kappa, sp.KAPPA_FLOOR))
         rows.append(FloorRow(
@@ -106,11 +108,16 @@ def main(argv: Sequence[str] = None) -> int:
     parser.add_argument('--v-max', type=float, default=DEFAULT_V_MAX)
     parser.add_argument('--a-accel', type=float, default=DEFAULT_A_ACCEL)
     parser.add_argument('--a-brake', type=float, default=DEFAULT_A_BRAKE)
+    parser.add_argument('--gg', action='store_true',
+                        help='brake inside the combined-accel ellipse (speed_profile.gg_decel)')
+    parser.add_argument('--gg-floor', type=float, default=sp.GG_FLOOR,
+                        help='share of --a-brake braking always keeps, in (0, 1]')
     args = parser.parse_args(argv)
 
     path = load_path(args.path or default_centerline_path())
     rows = floor_table(path, args.a_lat, lock_margin=args.lock_margin, v_max=args.v_max,
-                       a_accel_max=args.a_accel, a_brake_max=args.a_brake)
+                       a_accel_max=args.a_accel, a_brake_max=args.a_brake,
+                       gg_brake=args.gg, gg_floor=args.gg_floor)
     length = float(np.sum(sp.segment_lengths(path, True)))
     print(format_table(rows, length))
     return 0
