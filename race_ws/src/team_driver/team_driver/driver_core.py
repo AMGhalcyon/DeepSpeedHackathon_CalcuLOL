@@ -103,6 +103,11 @@ class DriverConfig:
     gg_floor: float = 0.1           # share of a_brake_max braking always keeps, in (0, 1]
     # [m/s^2] Braking the emergency cap assumes, and the rate a coast sheds speed.
     a_emergency: float = 7.0
+    # Continue the emergency cap's corridor past the MPC's 0.5 s plan along the
+    # reference (offset kept), not straight: straight, it ran into the outside
+    # wall of each corner the plan had not reached, and braked the car there at
+    # up to -10.6 m/s^2 where the profile asked -2 (sub-10 Step 3).
+    cap_follows_reference: bool = False
     steer_limit: float = 0.4189     # [rad] the real lock, VehicleParameters.s_max
     # Reference line the MPC tracks: 'centerline' (the shipped CSV) or 'raceline'
     # (the shipped offline min-time line when it checks out against the map, else
@@ -192,6 +197,17 @@ REACTIVE_SPEED = 3.0
 # [m] Corridor kept beyond the stopping distance along the plan, so a wall just
 # past it still shows as the clearance it is rather than as "nothing seen".
 PATH_CAP_SLACK = 1.0
+# [m] Point spacing of the corridor continued along the reference past the plan
+# (cap_follows_reference): a 0.005 m sagitta on the tightest corner (kappa 1.05).
+CAP_CONTINUATION_SPACING = 0.2
+# The continuation is where the car goes only while it is following the
+# reference. Judged on the car, not the plan's end: move blocking holds the
+# plan's last move for 0.4 s, so at a corner entry the plan runs on straight,
+# up to 1.4 m and 0.8 rad off the line, while the car turns in on it (lateral
+# error <= 0.22 m). Past these the car is sliding or off line (a24 spins): the
+# corridor stays straight, failing closed. Clean laps at a22 never reach them.
+CAP_CONTINUATION_MAX_OFFSET = 0.5     # [m] car to the reference at its arc position
+CAP_CONTINUATION_MAX_HEADING = 0.3    # [rad] car's velocity heading to the reference's
 # The plan's period, learnt from the publish stamps: a solve that overruns the
 # timer stretches it, and the next command then lands later than one period on.
 PUBLISH_INTERVAL_SMOOTHING = 0.2    # EMA weight per published command
@@ -949,10 +965,62 @@ class DriverCore:
         hold = v * self.mpc_dt
         needed = (v * v / (2.0 * self.a_emergency) + front + hold + self.stop_margin
                   + PATH_CAP_SLACK)
-        clearance = clearance_along_path(points, path, self._half_width, needed)
+        path, hop = self._continued_plan(path, needed)
+        clearance = clearance_along_path(points, path, self._half_width, needed + hop)
+        if clearance > extent:      # past the plan: the hop back to the line is no travel
+            clearance = max(clearance - hop, extent)
         if clearance >= needed:
             return self.v_max       # nothing within reach of a stop: no bound
         return self._braking_bound(clearance - front - hold)
+
+    def _continued_plan(self, path: np.ndarray, length: float) -> tuple[np.ndarray, float]:
+        """(`path` continued along the reference to `length` of travel, hop) if shorter.
+
+        The plan starts at the MPC's arc position `s` for the latch pose, so the
+        continuation picks the reference up at `s` plus the plan's extent,
+        shifted by the car's own offset from the line. A plan that ran on
+        straight (move blocking) ends off the line; `hop` [m] is how much longer
+        than one spacing the segment back to it is -- arc along the corridor
+        that is not travel. With `cap_follows_reference` off, no arc position,
+        or a car off the line or heading away from it, the plan is returned as
+        it is, hop 0, and `clearance_along_path` continues it straight.
+        """
+        if not self.cfg.cap_follows_reference:
+            return path, 0.0
+        s = self._arc_position()
+        if s is None:
+            return path, 0.0
+        extent = float(np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1)))
+        if extent >= length:
+            return path, 0.0
+        offset = self._offset_from_reference(s)
+        if offset is None:
+            return path, 0.0
+        count = math.ceil((length - extent) / CAP_CONTINUATION_SPACING)
+        tail = self._reference.points_at(
+            s + extent + CAP_CONTINUATION_SPACING * np.arange(1, count + 1)) + offset
+        hop = max(float(np.linalg.norm(tail[0] - path[-1])) - CAP_CONTINUATION_SPACING, 0.0)
+        return np.vstack([path, tail]), hop
+
+    def _offset_from_reference(self, s: float) -> Optional[np.ndarray]:
+        """[m] The latch pose less the reference at `s`; None if the car is not following it.
+
+        Following it: within CAP_CONTINUATION_MAX_OFFSET of the line, its
+        velocity (yaw plus sideslip) within CAP_CONTINUATION_MAX_HEADING of
+        the reference's direction there.
+        """
+        latch = self._latch if self._latch is not None else Prediction(
+            self._measured_state(), 0.0)
+        x, y, yaw, _v, beta, _wheel, _r = latch.state
+        anchor = self._reference.point_at(s)
+        tangent = self._reference.point_at(s + CAP_CONTINUATION_SPACING) - anchor
+        offset = np.array([x, y]) - anchor
+        heading = yaw + beta - math.atan2(tangent[1], tangent[0])
+        heading = (heading + math.pi) % (2.0 * math.pi) - math.pi
+        if (np.linalg.norm(offset) > CAP_CONTINUATION_MAX_OFFSET
+                or abs(heading) > CAP_CONTINUATION_MAX_HEADING):
+            return None
+        return offset
 
     def _braking_bound(self, reach) -> float:
         """[m/s] The speed the body stops from at `a_emergency` within `reach`."""

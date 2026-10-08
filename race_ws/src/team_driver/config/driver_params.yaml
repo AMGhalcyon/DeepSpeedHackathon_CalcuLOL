@@ -69,6 +69,9 @@ driver:
     gg_brake: false
     gg_floor: 0.1             # share of a_brake_max braking always keeps, in (0, 1]
     a_emergency: 7.0          # [m/s^2] braking the emergency cap assumes; coasting sheds speed at it
+    # Continue the emergency cap's corridor past the MPC's 0.5 s plan along the
+    # reference, not straight into the outside wall of the next corner (sub-10 Step 3).
+    cap_follows_reference: false
     steer_limit: 0.4189       # [rad] the real lock
     # Reference line the MPC tracks: "centerline" (the shipped CSV) or "raceline":
     # the offline min-time line in config/icra26_raceline.csv, once it checks out

@@ -172,6 +172,15 @@ class ClosedPath:
         s = self._wrap(s)
         return np.array([np.interp(s, self._arc, self._x), np.interp(s, self._arc, self._y)])
 
+    def points_at(self, s: np.ndarray) -> np.ndarray:
+        """(n, 2) points at arc positions `s`, each wrapped onto the lap."""
+        s = np.asarray(s, dtype=np.float64)
+        if not np.all(np.isfinite(s)):
+            raise ValueError('non-finite arc positions')
+        s = s % self.length
+        return np.column_stack([np.interp(s, self._arc, self._x),
+                                np.interp(s, self._arc, self._y)])
+
     def value_at(self, s: float) -> float:
         """The value at arc position `s`, interpolated and wrapped onto the lap."""
         if self._values is None:
