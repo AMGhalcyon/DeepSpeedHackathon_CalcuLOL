@@ -181,46 +181,39 @@ class Step9TunedWeightsTests(unittest.TestCase):
                 self.assertEqual(params[name], value)
 
 
-STEP8_TUNED = {'a_lat_max': 18.0, 'a_brake_max': 6.0, 'accel_limit': 9.51,
-               'lock_margin': 0.95,
-               'sector_scale': [2.0, 8.5, 0.6, 11.0, 17.5, 0.7, 36.0, 43.0, 0.85,
-                                50.0, 57.0, 0.8, 62.0, 68.0, 0.75]}
+SUB10_TUNED = {'a_lat_max': 21.0, 'a_brake_max': 6.0, 'accel_limit': 9.51,
+               'lock_margin': 0.95, 'gg_brake': True, 'gg_floor': 0.1,
+               'cap_follows_reference': True,
+               'sector_scale': [43.0, 47.0, 0.85, 3.0, 7.0, 0.95]}
 
 
-class Step8TunedProfileTests(unittest.TestCase):
-    """Step 7's profile, re-tuned to the offline min-time line (sub-11 Step 4).
+class Sub10TunedProfileTests(unittest.TestCase):
+    """The sub-10 profile (Steps 1-4), on the min-time line re-refined at the g-g a22 profile.
 
-    The min-time line (raceline.py --refine) carries more speed through the
-    s 36-42 left-right and tightens into the right-hander, so uniform 18 there
-    collided at s~41 (fixed timing, every lap): it gets a sector at 0.85 (0.9
-    still collided under measured timing). The s 50-57 corner, sharper on the new
-    line, collided at s~54 at stale 14 under measured timing at 0.85; 0.8 is clean.
+    Step 1: the crashes above a_lat 18 are braking-induced yaw instability, not
+    steering lock. Step 2 limits braking by the share of the slip budget a corner
+    already uses (gg_brake), which replaces the hand-tuned sectors. Step 3 stops the
+    emergency cap braking at corner entries for walls the car is turning away from
+    (cap_follows_reference). Step 4 re-refines the line at that profile and finds
+    two spots left: s~45.3, the chicane-exit tracking transient (43-47 at 0.85), and
+    s~4.8-5.2, the first corner on the new line (3-7 at 0.95; 0.9 let a22 hit s 54).
     The sectors are arc positions on the min-time CSV.
 
-    Step 7, on the minimum-curvature line: the sub-11 Step 3 sweep, with the
-    reachable-pace reference window.
-
-    Pacing the MPC's window by reachable speeds (test_reference_pace.py) and
-    lifting accel_limit to the plant's 9.51 took the Step 6 profile from 12.90
-    to 12.55 s and made far higher slip budgets usable. a_brake_max stays 6:
-    harder braking unloads the rear and spins the car at high a_lat.
-    Uniform a_lat 18 collides at s~4.8, 14.1, 54.2 and 66.3, so each gets a
-    narrow sector (approach plus corner). The s 62-68 left-hander is trail-
-    braked: at scale 0.8 it was clean under fixed solve times but collided at
-    s~66.0 under measured timing; 0.75 is clean. Grid at 0.75: stale 5/9/14 x
-    fixed 5/7/12 ms and 8 measured-timing runs (<= 3 jobs), 5 laps each, all
-    0 collisions, best 11.03 s. a17 with (0.62, 0.75, 0.9, 0.8) is the
-    fallback: equally clean, 11.15 s.
+    Grid at a_lat 21, a_brake_max 6: stale 5/9/14 x fixed 5/7/12 ms (5 laps), a
+    10-lap run, 5 measured-timing runs (<= 3 jobs) and the centreline fallback, all
+    16 clean, best 9.82 s; 0 collisions in 24 runs under 12-job host load. The fastest
+    clean budget, a22 (9.71 s with 3-7 at 0.85), hit s 54 in 2 of 18 loaded runs, and
+    a23 collides there on 15 of 16 grid runs, so the pin backs off to 21.
     """
 
     def test_the_code_defaults_carry_the_tuned_profile(self):
-        for name, value in STEP8_TUNED.items():
+        for name, value in SUB10_TUNED.items():
             with self.subTest(name=name):
                 self.assertEqual(driver_params.DEFAULTS[name], value)
 
     def test_the_params_file_carries_the_tuned_profile(self):
         params = _node_params()
-        for name, value in STEP8_TUNED.items():
+        for name, value in SUB10_TUNED.items():
             with self.subTest(name=name):
                 self.assertEqual(params[name], value)
 

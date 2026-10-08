@@ -328,7 +328,9 @@ class TestIcra26MinTime(unittest.TestCase):
     """The shipped line: the reweighted QP line, refined for lap time (~60 s)."""
 
     CACHE = os.path.join(_HERE, os.pardir, 'config', 'icra26_raceline.csv')
-    REQUIRED_GAIN = 0.3            # [s] of ideal lap at the profile it was refined for
+    # [s] of ideal lap at the profile it was refined for. 0.3 at the old a18 profile; the
+    # g-g a22 profile leaves the QP line less to give (9.852 -> 9.655 s, 0.195 s).
+    REQUIRED_GAIN = 0.15
 
     @classmethod
     def setUpClass(cls):
@@ -341,7 +343,7 @@ class TestIcra26MinTime(unittest.TestCase):
     def _lap(xy):
         return sp.ideal_lap_time(xy, sp.speed_profile(xy, **rl.REFINE_PROFILE))
 
-    def test_ideal_lap_improves_by_at_least_0p3_s(self):
+    def test_ideal_lap_improves_by_at_least_the_required_gain(self):
         self.assertLess(self._lap(self.refined), self._lap(self.qp.xy) - self.REQUIRED_GAIN)
 
     def test_clearance_is_at_least_the_required_distance(self):
@@ -357,7 +359,7 @@ class TestIcra26MinTime(unittest.TestCase):
         # finite-difference search amplifies that to ~9 cm and ~0.04 s of ideal lap
         # (OMP_NUM_THREADS=1 reproduces the CSV to its 4 decimals). The driver drives
         # the CSV itself, so what must reproduce is the line's quality: method,
-        # margin, clearance, the 0.3 s gain, and an ideal lap a fresh run agrees with.
+        # margin, clearance, the required gain, and an ideal lap a fresh run agrees with.
         xy, margin = rl.read_cached(self.CACHE)
         self.assertEqual(margin, SHIPPED_MARGIN)
         self.assertEqual(rl.cached_method(self.CACHE), rl.MIN_TIME_METHOD)
@@ -517,7 +519,8 @@ class TestDriverCoreReference(unittest.TestCase):
         core, log = self._core(reference='centerline', a_lat_max=10.0,
                                sector_scale=(30.0, 36.0, 0.8, 38.0, 43.0, 0.5))
         uniform = sp.speed_profile(core.reference_path, a_lat_max=5.0, lock_margin=0.95,
-                                   a_accel_max=9.51, a_brake_max=6.0, v_max=10.0)
+                                   a_accel_max=9.51, a_brake_max=6.0, v_max=10.0,
+                                   gg_brake=core.cfg.gg_brake, gg_floor=core.cfg.gg_floor)
         np.testing.assert_allclose(core.reference_speeds, uniform)
         self.assertIn('sector', log.text('warn'))
 

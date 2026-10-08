@@ -27,6 +27,7 @@ from test_step4_safety import (ANGLE_MIN, ANGLE_INC, ANGLES, CFG, _cast,  # noqa
                                _core_on, _hairpin, _lidar_scan)
 
 ON = driver_core.DriverConfig(cap_follows_reference=True)
+OFF = driver_core.DriverConfig(cap_follows_reference=False)
 SHORT_PLAN = _hairpin()[:3]          # 0.1 m of the straight: the bend is past its end
 V = 6.0
 
@@ -58,7 +59,7 @@ def _step(cfg, ranges, arc_of=lambda _s: 0.0, plan=SHORT_PLAN):
 class CorridorTest(unittest.TestCase):
 
     def test_off_a_short_plan_is_continued_straight_into_the_outside_wall(self):
-        cmd, binds = _step(CFG, _outside_wall())
+        cmd, binds = _step(OFF, _outside_wall())
         self.assertLess(cmd.speed, V)
         self.assertEqual(binds, 1)
 
@@ -69,7 +70,7 @@ class CorridorTest(unittest.TestCase):
 
     def test_on_a_wall_in_the_bends_own_path_still_caps_the_car(self):
         # The straight corridor never sees this wall; the bent one must.
-        _, binds_off = _step(CFG, _wall_across_the_bend())
+        _, binds_off = _step(OFF, _wall_across_the_bend())
         cmd, binds_on = _step(ON, _wall_across_the_bend())
         self.assertEqual(binds_off, 0)
         self.assertEqual(binds_on, 1)
@@ -181,7 +182,7 @@ class ContinuedPlanTest(unittest.TestCase):
 
     def test_off_the_plan_is_left_alone(self):
         core, ref = self._circle_core(0.0)
-        core.cfg = CFG
+        core.cfg = OFF
         plan = np.array([ref.point_at(0.0), ref.point_at(0.5)])
         np.testing.assert_array_equal(_continued(core, plan, 3.0), plan)
 
@@ -228,9 +229,10 @@ class PointsAtTest(unittest.TestCase):
 
 class DefaultsTest(unittest.TestCase):
 
-    def test_the_cap_follows_the_reference_only_when_asked(self):
-        self.assertIs(driver_core.DriverConfig().cap_follows_reference, False)
-        self.assertIs(driver_params.DEFAULTS['cap_follows_reference'], False)
+    def test_the_pinned_defaults_follow_the_reference(self):
+        # On since sub-10 Step 4; the flag stays so the old corridor is one switch away.
+        self.assertIs(driver_core.DriverConfig().cap_follows_reference, True)
+        self.assertIs(driver_params.DEFAULTS['cap_follows_reference'], True)
 
 
 if __name__ == '__main__':

@@ -80,12 +80,12 @@ REFINE_FD_STEP = 1e-3         # [m] finite-difference step of the lap-time gradi
 REFINE_BOUND_SLACK = 0.02     # [m] past `required` for the control points' box bounds
 REFINE_PENALTY = 1e3          # [s/m^2] on the squared clearance shortfall between them
 REFINE_PENALTY_SLACK = 0.005  # [m] past `required` where that penalty starts
-# The profile the shipped line is refined against: the Step 3 tune (a_lat 18 and its
-# four sectors). Fixed here, not read from the driver's config, so the CSV stays
-# reproducible from the map when the driver's sectors are later re-tuned to this line.
-REFINE_PROFILE = dict(a_lat_max=18.0, lock_margin=0.95, a_accel_max=9.51, a_brake_max=6.0,
-                      v_max=10.0, sector_scale=((2.0, 8.5, 0.6), (11.0, 17.5, 0.7),
-                                                (50.0, 57.0, 0.85), (62.0, 68.0, 0.75)))
+# The profile the shipped line is refined against: the sub-10 tune (a_lat 22 with the
+# g-g brake limit, and its one kink sector). Fixed here, not read from the driver's
+# config, so the CSV stays reproducible from the map when the driver's sectors are
+# later re-tuned to this line.
+REFINE_PROFILE = dict(a_lat_max=22.0, lock_margin=0.95, a_accel_max=9.51, a_brake_max=6.0,
+                      v_max=10.0, sector_scale=((43.0, 47.0, 0.85),), gg_brake=True)
 MIN_CURVATURE_METHOD = 'min-curvature'
 MIN_TIME_METHOD = 'min-time'
 

@@ -42,7 +42,13 @@ driver:
     v_max: 10.0               # [m/s] cap on the profile and the emergency bound; should not bind
     # Speed profile (speed_profile.py). a_lat_max is a slip budget, not a grip
     # limit: the plant's tyres are linear, so rear slip is a_y / 56.1 rad.
-    a_lat_max: 18.0           # [m/s^2] cornering budget, held lower in sector_scale
+    # Sub-10 Step 4, on the min-time line refined at the g-g a22 profile, g-g brake
+    # and the capped emergency corridor on. 21 is one step under the fastest clean
+    # budget: a22 is clean on the whole grid (9.71 s) but hit s 54 in 2 of 18 runs
+    # under 12-job host load; a23 hits s 54 on 15 of 16 grid runs. 21: 16/16 clean
+    # (fixed 5/7/12 ms x stale 5/9/14, 10 laps, 5 measured, centreline), best 9.82 s,
+    # 0 collisions in 24 runs under that load.
+    a_lat_max: 21.0           # [m/s^2] cornering budget, held lower in sector_scale
     lock_margin: 0.95         # fraction of the steering lock the profile may use
     a_accel_max: 9.51         # [m/s^2] acceleration the profile plans (plant: 9.51)
     # Braking the profile plans, and the most the conditioner passes on from
@@ -50,28 +56,28 @@ driver:
     a_brake_max: 6.0          # [m/s^2]
     # Sectors where the slip budget is lowered: flat (s_start, s_end, scale)
     # triples, s [m] along the raceline from its first point, scale in (0, 1].
-    # Step 7: one narrow sector per spot where a uniform 18 collided (s~4.8, 14.1,
-    # 54.2, 66.3); s 62-68 at 0.8 collided under measured timing, 0.75 is clean.
-    # Step 8, on the offline min-time line (config/icra26_raceline.csv): s 36-43
-    # added at 0.85 (0.9 collided at s~41), s 50-57 down to 0.8 (s~54 at stale 14).
+    # Sub-10 Step 4, on the re-refined min-time line (config/icra26_raceline.csv):
+    # s 43-47 at 0.85 for the chicane-exit tracking transient (s~45.3 collides without
+    # it), s 3-7 at 0.95 for the first corner (s~4.8-5.2 collided on the new line).
+    # The g-g brake limit covers the braking-yaw sites the older sectors patched.
     # Never empty: ROS would type an empty list as bytes and refuse a list of
     # doubles; to turn the sectors off, use [0.0, 1.0, 1.0]. Tuned on that line
     # at raceline_margin 0.25; on the centreline the lap gets a uniform a_lat_max x
-    # the lowest scale (10.8 m/s^2: clean in lap_sim, 14.22 s).
-    # Fallback if it ever collides: s 36-43 at 0.8 as well (10.86 s, clean at
-    # stale 5/9/14 measured), or the Step 7 line and profile (git 7489614, 11.03 s).
-    sector_scale: [2.0, 8.5, 0.6, 11.0, 17.5, 0.7, 36.0, 43.0, 0.85, 50.0, 57.0, 0.8, 62.0, 68.0, 0.75]
+    # the lowest scale (17.85 m/s^2: clean in lap_sim, 12.20 s).
+    # Fallbacks, all 16/16 clean: a22 with 3-7 at 0.85 (9.71 s; 2 of 18 loaded runs
+    # hit s 54), or the previous line and profile (git 42cb78f, 10.81 s).
+    sector_scale: [43.0, 47.0, 0.85, 3.0, 7.0, 0.95]
     # Combined-accel limit on the profile's braking (speed_profile.gg_decel): the
     # deceleration into a corner shrinks with the share of a_lat_max the corner already
     # uses, a_brake_max * max(gg_floor, 1 - r^2)^(1/2). Braking unloads the rear axle
     # and the plant's yaw goes unstable, which is what crashed every uniform budget
     # above 18 (sub-10 Step 1). Off reproduces the plain profile bit for bit.
-    gg_brake: false
+    gg_brake: true
     gg_floor: 0.1             # share of a_brake_max braking always keeps, in (0, 1]
     a_emergency: 7.0          # [m/s^2] braking the emergency cap assumes; coasting sheds speed at it
     # Continue the emergency cap's corridor past the MPC's 0.5 s plan along the
     # reference, not straight into the outside wall of the next corner (sub-10 Step 3).
-    cap_follows_reference: false
+    cap_follows_reference: true
     steer_limit: 0.4189       # [rad] the real lock
     # Reference line the MPC tracks: "centerline" (the shipped CSV) or "raceline":
     # the offline min-time line in config/icra26_raceline.csv, once it checks out

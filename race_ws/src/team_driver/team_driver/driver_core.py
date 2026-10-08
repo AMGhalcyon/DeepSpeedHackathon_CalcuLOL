@@ -77,9 +77,13 @@ class DriverConfig:
     # Speed profile (speed_profile.py). `a_lat_max` is a slip budget, not a grip
     # limit: the plant's tyres are linear, so rear slip is a_y / 56.1 rad.
     # [m/s^2] Cornering budget: ~18 deg of rear slip, held lower in `sector_scale`.
-    # Step 7 (sub-11 Step 3), with the reachable-pace reference window: 0 collisions
-    # across stale 5/9/14 x fixed 5/7/12 ms and 8 measured-timing runs, best 11.03 s.
-    a_lat_max: float = 18.0
+    # Sub-10 Step 4, on the min-time line refined at the g-g a22 profile with the
+    # g-g brake limit and the capped emergency corridor on: 21, one step under the
+    # fastest clean budget. 16/16 clean (fixed 5/7/12 ms x stale 5/9/14, 10 laps,
+    # 5 measured runs, centreline), best 9.82 s; 0 collisions in 24 runs under
+    # 12-job host load. a22 is clean on the same grid (9.71 s) but hit s 54 in 2 of
+    # 18 loaded runs, a23 on 15 of 16 grid runs.
+    a_lat_max: float = 21.0
     lock_margin: float = 0.95       # fraction of the steering lock the profile may use
     a_accel_max: float = 9.51       # [m/s^2] acceleration the profile plans (plant: 9.51)
     # [m/s^2] Braking the profile plans, and the most the conditioner passes on
@@ -89,17 +93,17 @@ class DriverConfig:
     # s the arc length from the reference's first waypoint, scale in (0, 1].
     # Flat because ROS parameters are flat lists (speed_profile.sector_triples);
     # never empty, or rclpy types it as a byte array: (0, 1, 1) turns it off.
-    # Step 7: one narrow sector per spot where a uniform 18 collided (s~4.8, 14.1,
-    # 54.2, 66.3). s 62-68 is trail-braked: 0.8 collided under measured timing.
-    # Step 8, on the offline min-time line: s 36-43 added (s~41 collided), s 50-57
-    # down to 0.8 (s~54 collided at stale 14). Off the raceline, see _slip_budget_for.
-    sector_scale: tuple[float, ...] = (2.0, 8.5, 0.6, 11.0, 17.5, 0.7, 36.0, 43.0, 0.85,
-                                       50.0, 57.0, 0.8, 62.0, 68.0, 0.75)
+    # Sub-10 Step 4, on the re-refined min-time line: 43-47 @0.85 for the chicane-exit
+    # tracking transient (s~45.3 collides without it), 3-7 @0.95 for the first corner
+    # (s~4.8-5.2 collided on the new line). The older sectors are gone: the g-g brake
+    # limit covers the braking-yaw sites they patched. Off the raceline, see
+    # _slip_budget_for.
+    sector_scale: tuple[float, ...] = (43.0, 47.0, 0.85, 3.0, 7.0, 0.95)
     # Combined-accel limit on the profile's braking (speed_profile.gg_decel): the
     # deceleration taken into a corner shrinks with the share of the slip budget the
     # corner already uses, because braking unloads the rear axle and the plant's yaw
     # goes unstable (sub-10 Step 1). Off reproduces the plain profile bit for bit.
-    gg_brake: bool = False
+    gg_brake: bool = True
     gg_floor: float = 0.1           # share of a_brake_max braking always keeps, in (0, 1]
     # [m/s^2] Braking the emergency cap assumes, and the rate a coast sheds speed.
     a_emergency: float = 7.0
@@ -107,7 +111,7 @@ class DriverConfig:
     # reference (offset kept), not straight: straight, it ran into the outside
     # wall of each corner the plan had not reached, and braked the car there at
     # up to -10.6 m/s^2 where the profile asked -2 (sub-10 Step 3).
-    cap_follows_reference: bool = False
+    cap_follows_reference: bool = True
     steer_limit: float = 0.4189     # [rad] the real lock, VehicleParameters.s_max
     # Reference line the MPC tracks: 'centerline' (the shipped CSV) or 'raceline'
     # (the shipped offline min-time line when it checks out against the map, else
