@@ -111,7 +111,7 @@ def main(argv: Sequence[str] = None) -> int:
     parser.add_argument('--gg', action='store_true',
                         help='brake inside the combined-accel ellipse (speed_profile.gg_decel)')
     parser.add_argument('--gg-floor', type=float, default=sp.GG_FLOOR,
-                        help='share of --a-brake braking always keeps, in (0, 1]')
+                        help='braking never drops below --a-brake*sqrt(this), in (0, 1]')
     args = parser.parse_args(argv)
 
     path = load_path(args.path or default_centerline_path())

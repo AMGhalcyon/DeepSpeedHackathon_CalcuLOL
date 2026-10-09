@@ -73,7 +73,7 @@ driver:
     # and the plant's yaw goes unstable, which is what crashed every uniform budget
     # above 18 (sub-10 Step 1). Off reproduces the plain profile bit for bit.
     gg_brake: true
-    gg_floor: 0.1             # share of a_brake_max braking always keeps, in (0, 1]
+    gg_floor: 0.1             # braking never drops below a_brake_max*sqrt(gg_floor), in (0, 1]
     a_emergency: 7.0          # [m/s^2] braking the emergency cap assumes; coasting sheds speed at it
     # Continue the emergency cap's corridor past the MPC's 0.5 s plan along the
     # reference, not straight into the outside wall of the next corner (sub-10 Step 3).

@@ -76,7 +76,7 @@ class DriverConfig:
     v_max: float = 10.0             # [m/s] caps the profile and emergency bound; should not bind
     # Speed profile (speed_profile.py). `a_lat_max` is a slip budget, not a grip
     # limit: the plant's tyres are linear, so rear slip is a_y / 56.1 rad.
-    # [m/s^2] Cornering budget: ~18 deg of rear slip, held lower in `sector_scale`.
+    # [m/s^2] Cornering budget: ~21 deg of rear slip, held lower in `sector_scale`.
     # Sub-10 Step 4, on the min-time line refined at the g-g a22 profile with the
     # g-g brake limit and the capped emergency corridor on: 21, one step under the
     # fastest clean budget. 16/16 clean (fixed 5/7/12 ms x stale 5/9/14, 10 laps,
@@ -104,7 +104,7 @@ class DriverConfig:
     # corner already uses, because braking unloads the rear axle and the plant's yaw
     # goes unstable (sub-10 Step 1). Off reproduces the plain profile bit for bit.
     gg_brake: bool = True
-    gg_floor: float = 0.1           # share of a_brake_max braking always keeps, in (0, 1]
+    gg_floor: float = 0.1           # braking never drops below a_brake_max*sqrt(gg_floor), in (0, 1]
     # [m/s^2] Braking the emergency cap assumes, and the rate a coast sheds speed.
     a_emergency: float = 7.0
     # Continue the emergency cap's corridor past the MPC's 0.5 s plan along the

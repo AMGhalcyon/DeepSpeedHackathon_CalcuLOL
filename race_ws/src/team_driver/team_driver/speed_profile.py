@@ -241,7 +241,7 @@ def speed_profile(path: np.ndarray, *, a_lat_max: float, lock_margin: float,
         gg_brake: brake inside the ellipse of `gg_decel`, so the deceleration
             into a corner shrinks with the slip budget the corner already uses.
             Off reproduces the plain profile bit for bit.
-        gg_floor: share of `a_brake_max` braking may always keep, in (0, 1].
+        gg_floor: braking never drops below `a_brake_max` * sqrt(gg_floor), in (0, 1].
     """
     check_gg_floor(gg_floor)
     pts = np.asarray(path, dtype=np.float64)[:, :2]
