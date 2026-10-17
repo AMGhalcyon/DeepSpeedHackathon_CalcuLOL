@@ -31,7 +31,8 @@ try:
     from .mpc_controller import MPCController   # ROS / package import
     from .vehicle_model import F1TENTH_VEHICLE_PARAMETERS, SpeedLoop, VehicleModel
     from . import raceline
-    from .speed_profile import check_gg_floor, sector_triples, slip_budget
+    from .speed_profile import (check_curvature_smooth, check_gg_exponent, check_gg_floor,
+                                sector_triples, slip_budget)
     from .latch_predictor import (LATCH_TIME_TOL, LatchPredictor, Prediction,
                                   plant_servo_rate, servo_kp)
     from .longitudinal import (LIDAR_FORWARD, ClosedPath, bearing_lookahead,
@@ -41,7 +42,8 @@ except ImportError:
     from mpc_controller import MPCController    # standalone `python3 lap_sim.py`
     from vehicle_model import F1TENTH_VEHICLE_PARAMETERS, SpeedLoop, VehicleModel
     import raceline
-    from speed_profile import check_gg_floor, sector_triples, slip_budget
+    from speed_profile import (check_curvature_smooth, check_gg_exponent, check_gg_floor,
+                               sector_triples, slip_budget)
     from latch_predictor import (LATCH_TIME_TOL, LatchPredictor, Prediction,
                                  plant_servo_rate, servo_kp)
     from longitudinal import (LIDAR_FORWARD, ClosedPath, bearing_lookahead,
@@ -123,6 +125,24 @@ class DriverConfig:
     # goes unstable (sub-10 Step 1). Off reproduces the plain profile bit for bit.
     gg_brake: bool = True
     gg_floor: float = 0.1           # braking never drops below a_brake_max*sqrt(gg_floor), in (0, 1]
+    # Shape of that ellipse, 1 - r^p: 2 is the ellipse; higher keeps more braking at
+    # part of the budget (3: 8.929 -> 8.813 s ideal on the a27 profile).
+    gg_exponent: float = 2.0
+    # [points] The profile's curvature moving average (odd); the MPC's own is not
+    # touched. Wider rounds the curvature peaks (13: 8.809 s ideal; 5: 9.201 s).
+    curvature_smooth: int = 9
+    # Cautious out lap and warm-up lap. Neither is timed, but their collisions count
+    # toward the disqualification (docs/06-rules.md, rule 18), and the first lap
+    # from the standing start hit at s~16 in 3 of 13 judged warm-ups (0 of 130 timed
+    # laps). Until the car has crossed the start line `warmup_crossings` times and
+    # then reached arc `warmup_end_s` [m], the profile also takes
+    # `warmup_sector_scale` (scales in (0, 1]: the warm-up only backs off), and
+    # every acceleration limit -- the profile's, the MPC's, the conditioner's -- is
+    # scaled by `warmup_accel_scale`. 0 crossings is off: the race car from the grid.
+    warmup_crossings: int = 0
+    warmup_end_s: float = 0.0
+    warmup_sector_scale: tuple[float, ...] = (0.0, 1.0, 1.0)
+    warmup_accel_scale: float = 1.0
     # [m/s^2] Braking the emergency cap assumes, and the rate a coast sheds speed.
     a_emergency: float = 7.0
     # Continue the emergency cap's corridor past the MPC's 0.5 s plan along the
@@ -157,6 +177,21 @@ class DriverConfig:
         # the reference loader, would quietly drop the car to the reactive controller.
         sector_triples(self.sector_scale)
         check_gg_floor(self.gg_floor)
+        check_gg_exponent(self.gg_exponent)
+        check_curvature_smooth(self.curvature_smooth)
+        check_warmup(self.warmup_crossings, self.warmup_end_s, self.warmup_sector_scale,
+                     self.warmup_accel_scale)
+
+
+def check_warmup(crossings, end_s, sector_scale, accel_scale) -> None:
+    """Raise ValueError unless the warm-up settings make sense (see DriverConfig)."""
+    if isinstance(crossings, bool) or not isinstance(crossings, int) or crossings < 0:
+        raise ValueError(f'warmup_crossings {crossings!r} must be a whole number >= 0')
+    if not (isinstance(end_s, (int, float)) and math.isfinite(end_s) and end_s >= 0.0):
+        raise ValueError(f'warmup_end_s {end_s!r} must be a finite arc >= 0 m')
+    if not (isinstance(accel_scale, (int, float)) and 0.0 < accel_scale <= 1.0):
+        raise ValueError(f'warmup_accel_scale {accel_scale!r} must be in (0, 1]')
+    sector_triples(sector_scale, max_scale=1.0)
 
 
 class DriveCommand(NamedTuple):
@@ -491,6 +526,9 @@ class DriverCore:
             low = np.array(self.mpc_controller.control_min, dtype=float)
             low[1] = -self.a_brake_max
             self.mpc_controller.control_min = low
+        # The MPC's acceleration bound, which the warm-up scales and then restores.
+        self._mpc_accel_max = (float(self.mpc_controller.control_max[1])
+                               if hasattr(self.mpc_controller, 'control_max') else None)
         self.mpc_dt = self.mpc_controller.dt
         self._dt = DtTracker(self.mpc_dt)
         self._planned_scan_t = None
@@ -550,6 +588,15 @@ class DriverCore:
         self._emergency_binds = 0
         self._coast_count = 0
         self._coasting = False
+
+        # Warm-up mode (DriverConfig.warmup_*): the race profile it hands over to,
+        # the profile it drives until then (None when off), and the crossing count.
+        self._race_speeds = None
+        self._warm_speeds = None
+        self._warm = False
+        self._warmup_left = 0       # start-line crossings still to come
+        self._wrap_debt = 0         # backward crossings a forward one must undo first
+        self._prev_arc = None
 
         self._load_reference_path()
 
@@ -716,44 +763,59 @@ class DriverCore:
             if self.cfg.reference == 'raceline':
                 path = self._raceline_reference(centerline_path, centerline_xy)
             on_raceline = path is not centerline_xy
-            a_lat_max, sectors = self._slip_budget_for(path, on_raceline=on_raceline)
 
             # Curvature-limited speeds, not a flat 3 m/s. The track is ~0.5 m
             # wide and the centerline peaks well above a curvature that 3 m/s
             # can hold, so a constant reference drives straight into the
             # outside wall at the first real corner.
-            speeds = self.mpc_controller.speed_profile(
-                path=path, v_max=self.v_max,
-                a_lat_max=a_lat_max, lock_margin=self.cfg.lock_margin,
-                a_accel_max=self.cfg.a_accel_max, a_brake_max=self.cfg.a_brake_max,
-                sector_scale=sectors,
-                gg_brake=self.cfg.gg_brake, gg_floor=self.cfg.gg_floor)
+            speeds = self._profile(path, on_raceline, self.cfg.sector_scale,
+                                   self.cfg.a_accel_max)
             self.log.info(f'Speed profile: {speeds.min():.2f}-{speeds.max():.2f} m/s')
             self.set_reference(path, speeds)
+            if self.cfg.warmup_crossings > 0:
+                self._warm_speeds = self._profile(
+                    path, on_raceline, self.cfg.sector_scale + self.cfg.warmup_sector_scale,
+                    self.cfg.a_accel_max * self.cfg.warmup_accel_scale)
+                self.log.info(f'Warm-up profile: {self._warm_speeds.min():.2f}-'
+                              f'{self._warm_speeds.max():.2f} m/s until '
+                              f'{self.cfg.warmup_crossings} crossing(s) and s '
+                              f'{self.cfg.warmup_end_s:.1f} m')
+                self._restart_warmup()
 
         except Exception as e:
             self.log.error(f'Error loading reference path: {e}')
             self.reference_path = None
 
-    def _slip_budget_for(self, path, on_raceline):
+    def _profile(self, path, on_raceline, flat_sectors, a_accel_max):
+        """The speed profile of `path` with these sectors and this acceleration."""
+        a_lat_max, sectors = self._slip_budget_for(path, on_raceline, flat_sectors)
+        return self.mpc_controller.speed_profile(
+            path=path, v_max=self.v_max,
+            a_lat_max=a_lat_max, lock_margin=self.cfg.lock_margin,
+            a_accel_max=a_accel_max, a_brake_max=self.cfg.a_brake_max,
+            sector_scale=sectors,
+            gg_brake=self.cfg.gg_brake, gg_floor=self.cfg.gg_floor,
+            gg_exponent=self.cfg.gg_exponent, curvature_smooth=self.cfg.curvature_smooth)
+
+    def _slip_budget_for(self, path, on_raceline, flat_sectors):
         """(a_lat_max, sectors) for the profile of `path`.
 
         The sectors are arc positions on the raceline. On the centreline they would
         land on the wrong corners, so there the whole lap gets the lowest budget
-        any sector allows instead.
+        any sector allows instead, and never more than `a_lat_max`.
         """
-        sectors = sector_triples(self.cfg.sector_scale)
+        sectors = sector_triples(flat_sectors)
         if not sectors:
             return self.cfg.a_lat_max, ()
         if not on_raceline:
-            a_lat = self.cfg.a_lat_max * min(scale for _, _, scale in sectors)
+            a_lat = self.cfg.a_lat_max * min(1.0, *(scale for _, _, scale in sectors))
             self.log.warn(f'sector_scale is tuned to the raceline; on the centreline the '
                           f'slip budget is a uniform {a_lat:.2f} m/s^2')
             return a_lat, ()
         for sector in sectors:
-            lowered = int(np.count_nonzero(slip_budget(path, 1.0, [sector]) < 1.0))
-            if lowered == 0:
-                self.log.warn(f'sector_scale {sector} lowers no waypoint of the '
+            changed = int(np.count_nonzero(slip_budget(path, 1.0, [sector]) != 1.0))
+            if changed == 0:
+                self.log.warn(f'sector_scale {sector} changes no waypoint of the '
                               f'{len(path)}-point raceline')
         return self.cfg.a_lat_max, sectors
 
@@ -770,6 +832,71 @@ class DriverCore:
         if not hasattr(self.mpc_controller, 'arc_position'):
             self.log.warn(f'{type(self.mpc_controller).__name__} reports no arc_position: '
                           'the profile cap is off and the emergency cap looks straight ahead')
+        # These are the race speeds now; any warm-up belonged to the old reference.
+        self._race_speeds = speeds
+        self._warm_speeds = None
+        if self._warm:
+            self._set_warm(False)
+
+    @property
+    def race_speeds(self) -> Optional[np.ndarray]:
+        """The race profile, which the warm-up profile hands over to."""
+        return self._race_speeds
+
+    @property
+    def warming_up(self) -> bool:
+        """True while the warm-up profile and acceleration are in force."""
+        return self._warm
+
+    def _set_warm(self, warm: bool) -> None:
+        """Drive the warm-up profile and acceleration, or hand over to the race ones.
+
+        The MPC reads its reference speeds and bounds afresh on every solve, so
+        swapping them keeps its arc tracking, where `set_reference` would reset it.
+        """
+        self._warm = warm
+        speeds = self._warm_speeds if warm else self._race_speeds
+        scale = self.cfg.warmup_accel_scale if warm else 1.0
+        self.reference_speeds = speeds
+        self._reference = ClosedPath(self.reference_path, speeds)
+        self.mpc_controller.reference_speeds = speeds
+        self.accel_limit = self.cfg.accel_limit * scale
+        if self._mpc_accel_max is not None:
+            # A new array: the bounds may be shared with the vehicle model.
+            high = np.array(self.mpc_controller.control_max, dtype=float)
+            high[1] = self._mpc_accel_max * scale
+            self.mpc_controller.control_max = high
+
+    def _restart_warmup(self) -> None:
+        """Drive the warm-up from the grid (again, after a sim reset), when it is on."""
+        if self._warm_speeds is None:
+            return
+        self._warmup_left = self.cfg.warmup_crossings
+        self._wrap_debt = 0
+        self._prev_arc = None
+        self._set_warm(True)
+
+    def _note_arc(self, arc) -> None:
+        """Count start-line crossings from the MPC's arc; end the warm-up when due.
+
+        The arc wraps from the lap length to 0 at the line, so a jump of more than
+        half a lap is a crossing. A backward one (jitter on the line, a reverse)
+        must be undone by a forward one before a crossing counts, as f110_env does.
+        """
+        if not self._warm or arc is None or not math.isfinite(arc):
+            return
+        prev, self._prev_arc = self._prev_arc, arc
+        half_lap = 0.5 * self._reference.length
+        if prev is not None and prev - arc > half_lap:
+            if self._wrap_debt:
+                self._wrap_debt -= 1
+            else:
+                self._warmup_left = max(self._warmup_left - 1, 0)
+        elif prev is not None and arc - prev > half_lap:
+            self._wrap_debt += 1
+        if self._warmup_left == 0 and arc >= self.cfg.warmup_end_s:
+            self._set_warm(False)
+            self.log.info(f'Warm-up done at s {arc:.1f} m: race profile from here')
 
     # ------------------------------------------------------------------
     # One control cycle
@@ -807,6 +934,8 @@ class DriverCore:
             reset_tracking = getattr(self.mpc_controller, 'reset_tracking', None)
             if callable(reset_tracking):
                 reset_tracking()
+            # Back on the grid: the out lap and warm-up come round again.
+            self._restart_warmup()
         self._latch = self._predict_latch(t_pose)
 
         ranges, angles = self.preprocess()
@@ -1214,6 +1343,7 @@ class DriverCore:
                 mpc_control, diagnostics = self.mpc_controller.get_control(
                     current_state)
                 self._solved_arc = getattr(self.mpc_controller, 'arc_position', None)
+                self._note_arc(self._solved_arc)
                 planner = getattr(self.mpc_controller, 'planned_path', None)
                 self._planned_path = planner() if callable(planner) else None
 

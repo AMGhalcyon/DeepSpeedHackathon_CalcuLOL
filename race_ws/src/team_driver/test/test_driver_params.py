@@ -268,8 +268,8 @@ class ValidateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r'sector'):
             driver_params.validate(values)
 
-    def test_a_sector_scale_above_one_is_refused(self):
-        values = {**_defaults(), 'sector_scale': [29.0, 37.0, 1.5]}
+    def test_a_sector_scale_above_the_max_is_refused(self):
+        values = {**_defaults(), 'sector_scale': [29.0, 37.0, 1.6]}
         with self.assertRaisesRegex(ValueError, r'sector'):
             driver_params.validate(values)
 

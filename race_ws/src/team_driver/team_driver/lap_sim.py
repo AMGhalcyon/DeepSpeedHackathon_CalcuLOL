@@ -187,6 +187,11 @@ def parse_driver_override(text):
         except ValueError as err:
             raise argparse.ArgumentTypeError(f'{key}: {err}') from None
         return key, flat
+    if isinstance(default, int):
+        try:
+            return key, int(raw)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f'{key}: {raw!r} is not a whole number') from None
     try:
         value = float(raw)
     except ValueError:
@@ -588,7 +593,8 @@ def run(cfg: HarnessConfig):
     ring = SnapshotRing(cfg.stale_steps, (plant.state.copy(), plant.time))
     log = _Log()
     if core.reference_path is not None:
-        speeds = core.reference_speeds
+        # The race profile: a warm-up profile, if on, is swapped out after the warm-up.
+        speeds = core.race_speeds
         log.lateral = LateralError(
             core.reference_path,
             values=speeds if speeds is not None and len(speeds) == len(core.reference_path)

@@ -87,7 +87,30 @@ REFINE_PENALTY_SLACK = 0.005  # [m] past `required` where that penalty starts
 # as is; re-refining at its profile is untried.
 REFINE_PROFILE = dict(a_lat_max=22.0, lock_margin=0.95, a_accel_max=9.51, a_brake_max=6.0,
                       v_max=10.0, sector_scale=((43.0, 47.0, 0.85),), gg_brake=True)
+PROFILE_KEYS = frozenset(('a_lat_max', 'lock_margin', 'a_accel_max', 'a_brake_max', 'v_max',
+                          'gg_exponent', 'curvature_smooth',
+                          'sector_scale', 'gg_brake', 'gg_floor'))
 MIN_CURVATURE_METHOD = 'min-curvature'
+
+
+def load_profile_json(path: str) -> dict:
+    """`speed_profile` keyword arguments from a JSON object, over `REFINE_PROFILE`.
+
+    Keys it does not give keep their `REFINE_PROFILE` value. `sector_scale` is a
+    list of [s_start, s_end, scale] triples. Raises ValueError on anything else.
+    """
+    import json
+    with open(path) as handle:
+        given = json.load(handle)
+    if not isinstance(given, dict):
+        raise ValueError(f'{path}: expected a JSON object of speed_profile arguments')
+    unknown = set(given) - PROFILE_KEYS
+    if unknown:
+        raise ValueError(f'{path}: unknown keys {sorted(unknown)}; use {sorted(PROFILE_KEYS)}')
+    profile = {**REFINE_PROFILE, **given}
+    profile['sector_scale'] = sp.sector_triples(
+        [float(x) for triple in profile['sector_scale'] for x in triple])
+    return profile
 MIN_TIME_METHOD = 'min-time'
 
 
@@ -564,7 +587,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument('--refine', action='store_true',
                         help=f'refine the line for lap time at REFINE_PROFILE (~60 s); the '
                              f'driver drives a {MIN_TIME_METHOD} CSV before its runtime build')
+    parser.add_argument('--profile-json', metavar='JSON',
+                        help='refine at this profile instead of REFINE_PROFILE: a JSON object '
+                             'of speed_profile arguments (see load_profile_json)')
     args = parser.parse_args(argv)
+    profile = load_profile_json(args.profile_json) if args.profile_json else REFINE_PROFILE
 
     try:
         from . import lap_floor
@@ -587,10 +614,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     xy, method = line.xy, MIN_CURVATURE_METHOD
     if args.refine:
         started = time.perf_counter()
-        xy, method = refine_min_time(xy, line.sealed, HALF_WIDTH + args.margin), MIN_TIME_METHOD
-        ideal = [sp.ideal_lap_time(p, sp.speed_profile(p, **REFINE_PROFILE)) for p in (line.xy, xy)]
-        print(f'refined in {time.perf_counter() - started:.1f} s; ideal lap at REFINE_PROFILE '
-              f'{ideal[0]:.3f} -> {ideal[1]:.3f} s')
+        xy, method = (refine_min_time(xy, line.sealed, HALF_WIDTH + args.margin,
+                                      profile=profile), MIN_TIME_METHOD)
+        ideal = [sp.ideal_lap_time(p, sp.speed_profile(p, **profile)) for p in (line.xy, xy)]
+        print(f'refined in {time.perf_counter() - started:.1f} s; ideal lap at '
+              f'{args.profile_json or "REFINE_PROFILE"} {ideal[0]:.3f} -> {ideal[1]:.3f} s')
     clearance = wall_clearance(line.sealed, xy)
     print(f'min wall clearance {clearance.min():.3f} m (required {HALF_WIDTH + args.margin:.3f})')
     for name, path in (('centreline', center), ('raceline', xy)):

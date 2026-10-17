@@ -79,6 +79,17 @@ driver:
     # above 18 (sub-10 Step 1). Off reproduces the plain profile bit for bit.
     gg_brake: true
     gg_floor: 0.1             # braking never drops below a_brake_max*sqrt(gg_floor), in (0, 1]
+    gg_exponent: 2.0          # shape of that ellipse, 1 - r^p; 2 is the ellipse
+    curvature_smooth: 9       # [points] the profile's curvature moving average (odd); not the MPC's
+    # Cautious out lap and warm-up lap (neither timed; their collisions still count
+    # toward the DQ). Until warmup_crossings start-line crossings and then arc
+    # warmup_end_s [m], the profile also takes warmup_sector_scale (scales in
+    # (0, 1]) and every acceleration limit is scaled by warmup_accel_scale.
+    # 0 crossings is off. Never-empty list: [0.0, 1.0, 1.0] is no sector.
+    warmup_crossings: 0
+    warmup_end_s: 0.0
+    warmup_sector_scale: [0.0, 1.0, 1.0]
+    warmup_accel_scale: 1.0
     a_emergency: 7.0          # [m/s^2] braking the emergency cap assumes; coasting sheds speed at it
     # Continue the emergency cap's corridor past the MPC's 0.5 s plan along the
     # reference, not straight into the outside wall of the next corner (sub-10 Step 3).

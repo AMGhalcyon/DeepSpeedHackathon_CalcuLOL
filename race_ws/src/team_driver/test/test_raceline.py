@@ -654,5 +654,34 @@ class TestCachedRaceline(unittest.TestCase):
                 driver_params.validate({**driver_params.DEFAULTS, 'raceline_margin': bad})
 
 
+class TestProfileJson(unittest.TestCase):
+    """`--refine --profile-json`: refine a candidate line at any profile, not only REFINE_PROFILE."""
+
+    def _load(self, text):
+        import tempfile
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as handle:
+            handle.write(text)
+        self.addCleanup(os.remove, handle.name)
+        return rl.load_profile_json(handle.name)
+
+    def test_a_profile_json_becomes_speed_profile_kwargs(self):
+        kw = self._load('{"a_lat_max": 27.0, "lock_margin": 0.95, "a_accel_max": 9.51, '
+                        '"a_brake_max": 6.0, "v_max": 12.0, "gg_brake": true, '
+                        '"sector_scale": [[43.0, 47.0, 0.85], [12, 18, 1.1]]}')
+        self.assertEqual(kw['sector_scale'], ((43.0, 47.0, 0.85), (12.0, 18.0, 1.1)))
+        path = np.column_stack([np.cos(np.linspace(0, 2 * np.pi, 200, endpoint=False)),
+                                np.sin(np.linspace(0, 2 * np.pi, 200, endpoint=False))]) * 5
+        self.assertEqual(len(sp.speed_profile(path, **kw)), 200)
+
+    def test_the_default_profile_is_unchanged(self):
+        self.assertEqual(rl.REFINE_PROFILE['a_lat_max'], 22.0)
+
+    def test_an_unknown_key_or_a_bad_sector_is_refused(self):
+        for text in ('{"a_lat": 27.0}', '{"a_lat_max": 27.0, "sector_scale": [[1, 2, 3.0]]}',
+                     '[27.0]'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self._load(text)
+
+
 if __name__ == '__main__':
     unittest.main()
