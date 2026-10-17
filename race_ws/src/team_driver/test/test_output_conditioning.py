@@ -371,7 +371,8 @@ class SpeedCapTest(unittest.TestCase):
 
     def test_the_cap_never_asks_for_less_than_crawl_or_more_than_v_max(self):
         self.assertEqual(self._cap(np.zeros(181)), CFG.crawl_speed)
-        self.assertEqual(self._cap(np.full(181, 8.0)), CFG.v_max)
+        # At the scan's 8 m reach the braking bound, not v_max, may be the lower one.
+        self.assertLessEqual(self._cap(np.full(181, 8.0)), CFG.v_max)
 
     def test_the_cap_is_continuous_in_clearance(self):
         caps = [self._cap(_wall(d)) for d in np.arange(0.0, 8.0, 0.01)]

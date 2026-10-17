@@ -73,22 +73,40 @@ class DriverConfig:
 
     crawl_speed: float = 1.0        # [m/s] the emergency cap never asks for less
     max_range: float = 8.0          # [m] clip the scan here
-    v_max: float = 10.0             # [m/s] caps the profile and emergency bound; should not bind
+    # [m/s] Caps the profile and emergency bound. 12 binds only at the end of the
+    # longest straight (the plant's power limit tops out near 12.1); it is worth
+    # 0.14 s/lap at a_lat 25 over 10 (lap_floor), and nothing above 12.
+    v_max: float = 12.0
     # Speed profile (speed_profile.py). `a_lat_max` is a slip budget, not a grip
     # limit: the plant's tyres are linear, so rear slip is a_y / 56.1 rad.
-    # [m/s^2] Cornering budget: ~21 deg of rear slip, held lower in `sector_scale`.
-    # Sub-10 Step 4, on the min-time line refined at the g-g a22 profile with the
-    # g-g brake limit and the capped emergency corridor on: 21, one step under the
-    # fastest clean budget. 16/16 clean (fixed 5/7/12 ms x stale 5/9/14, 10 laps,
-    # 5 measured runs, centreline), best 9.82 s; 0 collisions in 24 runs under
-    # 12-job host load. a22 is clean on the same grid (9.71 s) but hit s 54 in 2 of
-    # 18 loaded runs, a23 on 15 of 16 grid runs.
-    a_lat_max: float = 21.0
+    # [m/s^2] Cornering budget: ~27 deg of rear slip, held lower in `sector_scale`.
+    # Sub-9 Step 2, with the MPC owning the braking (mpc_full_brake, profile_brake_cap
+    # 3, beta_limit 1.0), v_max 12, on the sub-10 min-time line: 27 is 8.79 s and clean
+    # on fixed 5/7/12 ms x stale 5/9/14, 10 laps, 5 measured runs, 24 runs under
+    # 12-job host load and the centreline (10.97 s). a28 at v_max 12 hit the chicane
+    # exit (s 45.4) on 1 of 3 cells; a30 on all. The old controller spun above 22.
+    a_lat_max: float = 27.0
     lock_margin: float = 0.95       # fraction of the steering lock the profile may use
     a_accel_max: float = 9.51       # [m/s^2] acceleration the profile plans (plant: 9.51)
     # [m/s^2] Braking the profile plans, and the most the conditioner passes on
     # from the MPC (plant: 9.51). The profile and emergency caps may brake harder.
     a_brake_max: float = 6.0
+    # Let the MPC plan braking to a_brake_max, not its old -0.3 a_max floor. At
+    # that floor every budget above 22 spun under braking: the MPC sat saturated
+    # while the profile override braked -5 to -7.8 m/s^2 past it, a deceleration
+    # (and rear unloading) its prediction never saw (sub-9 Step 1). False is the old car.
+    mpc_full_brake: bool = True
+    # [m/s^2] Most braking the profile override may ask beyond the MPC's own. 9.51
+    # (the plant's limit) is no cap, the old car; 0 leaves the braking to the MPC,
+    # and the profile then only stops acceleration above it. The emergency cap is
+    # not held by this. With the MPC braking: 3 is clean to a27; 6 still spins a23;
+    # 0 and 1.5 are clean to a26 but 0 loses the chicane exit (s 45.4) from a27.
+    profile_brake_cap: float = 3.0
+    # [rad] Measured sideslip past this reads 0 to the MPC (reversing or a spin,
+    # not a slip the tyre model describes). 0.5 is the ST model's state bound and
+    # the old car; from a25 the car slides past it in a corner, the MPC loses its
+    # slip state and the emergency cap ends a spin (s~16). 1.0 keeps it.
+    beta_limit: float = 1.0
     # Where the slip budget is lowered: flat (s_start [m], s_end [m], scale) triples,
     # s the arc length from the reference's first waypoint, scale in (0, 1].
     # Flat because ROS parameters are flat lists (speed_profile.sector_triples);
@@ -196,7 +214,7 @@ STEER_CORRECT_TAU = 0.5         # [s] time constant of the yaw-rate leash (~5 % 
 SIM_RESET_BACKSTEP = 0.1
 RTF_SMOOTHING = 0.05            # EMA weight per control step for the live RTF
 # [m/s] Where the gap-follower heads when there is no reference to track: the
-# old v_max it was tuned at, not today's cap, which should never bind.
+# old v_max it was tuned at, not today's racing cap.
 REACTIVE_SPEED = 3.0
 # [m] Corridor kept beyond the stopping distance along the plan, so a wall just
 # past it still shows as the clearance it is rather than as "nothing seen".
@@ -216,9 +234,6 @@ CAP_CONTINUATION_MAX_HEADING = 0.3    # [rad] car's velocity heading to the refe
 # timer stretches it, and the next command then lands later than one period on.
 PUBLISH_INTERVAL_SMOOTHING = 0.2    # EMA weight per published command
 PUBLISH_INTERVAL_MAX = 4.0          # x mpc.dt: a stall must not predict seconds ahead
-# [rad] Largest odometry sideslip handed to the ST model (its state bound,
-# VehicleModel.get_state_bounds); beyond it the car is reversing or spinning.
-MPC_BETA_LIMIT = 0.5
 
 
 class DtTracker:
@@ -470,6 +485,12 @@ class DriverCore:
 
         self.mpc_controller = (mpc_controller if mpc_controller is not None
                                else MPCController(vehicle_model=VehicleModel()))
+        # Only a planner has bounds to lower; scripted test controllers have none.
+        if self.cfg.mpc_full_brake and hasattr(self.mpc_controller, 'control_min'):
+            # A new array: the bounds may be shared with the vehicle model.
+            low = np.array(self.mpc_controller.control_min, dtype=float)
+            low[1] = -self.a_brake_max
+            self.mpc_controller.control_min = low
         self.mpc_dt = self.mpc_controller.dt
         self._dt = DtTracker(self.mpc_dt)
         self._planned_scan_t = None
@@ -810,7 +831,7 @@ class DriverCore:
             return value if math.isfinite(value) else 0.0
         beta = finite(self.beta)
         return (self.position[0], self.position[1], self.yaw, finite(self.speed),
-                beta if abs(beta) <= MPC_BETA_LIMIT else 0.0,
+                beta if abs(beta) <= self.cfg.beta_limit else 0.0,
                 self.steering.delta_hat, finite(self.yaw_rate))
 
     def _predict_latch(self, t_pose) -> Optional[Prediction]:
@@ -875,9 +896,10 @@ class DriverCore:
         plant's proportional loop, so the setpoint is inverted from that loop
         (`SpeedLoop.command`) from the speed the car will have when it latches.
         The MPC's demand is clamped to [-a_brake_max, accel_limit]; then the
-        hold may end no faster than `profile_speed`, then no faster than
-        `speed_cap`. Those two may brake past the clamp, to the plant's limit:
-        the emergency cap is a safety bound and must not be delayed by it.
+        hold may end no faster than `profile_speed`, braking at most
+        `profile_brake_cap` for it, then no faster than `speed_cap`. The
+        emergency cap may brake past everything, to the plant's limit: it is a
+        safety bound and must not be delayed.
         A NaN cap would be skipped by every comparison below -- failing open --
         so it coasts instead; +inf is "no cap".
         """
@@ -895,7 +917,7 @@ class DriverCore:
 
         v = self._latch_speed()
         a = min(max(accel, -self.a_brake_max), self.accel_limit)
-        a = min(a, (profile_speed - v) / self.mpc_dt)
+        a = min(a, max((profile_speed - v) / self.mpc_dt, -self.cfg.profile_brake_cap))
         a_cap = (speed_cap - v) / self.mpc_dt
         if a_cap < a:
             a = a_cap

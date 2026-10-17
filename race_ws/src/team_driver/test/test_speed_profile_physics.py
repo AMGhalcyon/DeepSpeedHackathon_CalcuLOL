@@ -133,12 +133,12 @@ class TestOffIsToday(unittest.TestCase):
                     sp.speed_profile(path, **JUDGED, a_lat_max=20.0))
 
     def test_the_shipped_floor_is_the_pinned_config(self):
-        # The driver's defaults (sub-10 Step 4) on the CSV they were tuned to.
+        # The driver's defaults (sub-9 Step 2) on the CSV they were tuned to.
         path = lap_floor.load_path(RACELINE_CSV)
         cfg = driver_core.DriverConfig()
         floor = _floor(path, cfg.a_lat_max, sp.sector_triples(cfg.sector_scale),
-                       gg_brake=cfg.gg_brake, gg_floor=cfg.gg_floor)
-        self.assertAlmostEqual(floor, 9.848, delta=FLOOR_TOLERANCE)
+                       gg_brake=cfg.gg_brake, gg_floor=cfg.gg_floor, v_max=cfg.v_max)
+        self.assertAlmostEqual(floor, 8.929, delta=FLOOR_TOLERANCE)
 
 
 class TestGgBrakePass(unittest.TestCase):

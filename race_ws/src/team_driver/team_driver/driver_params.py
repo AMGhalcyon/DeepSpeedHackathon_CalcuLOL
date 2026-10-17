@@ -42,7 +42,7 @@ MPC_PREFIX = 'mpc.'
 JUDGED_HORIZON = 8
 # The speed path divides by or takes roots of these; zero or less is a crash.
 POSITIVE_PARAMS = ('a_emergency', 'a_brake_max', 'a_accel_max', 'accel_limit', 'a_lat_max',
-                   'crawl_speed', 'v_max', 'max_range', 'steer_limit')
+                   'crawl_speed', 'v_max', 'max_range', 'steer_limit', 'beta_limit')
 
 
 @dataclass(frozen=True)
@@ -147,6 +147,9 @@ def validate(values: Mapping[str, Any]) -> None:
         value = values[name]
         if not (isinstance(value, (int, float)) and math.isfinite(value) and value > 0.0):
             raise ValueError(f'{name} {value!r} must be a positive number')
+    cap = values['profile_brake_cap']
+    if not (isinstance(cap, (int, float)) and math.isfinite(cap) and cap >= 0.0):
+        raise ValueError(f'profile_brake_cap {cap!r} must be a number >= 0')
     if values['crawl_speed'] > values['v_max']:
         raise ValueError(f"crawl_speed {values['crawl_speed']} must not exceed "
                          f"v_max {values['v_max']}")

@@ -181,7 +181,7 @@ class Step9TunedWeightsTests(unittest.TestCase):
                 self.assertEqual(params[name], value)
 
 
-SUB10_TUNED = {'a_lat_max': 21.0, 'a_brake_max': 6.0, 'accel_limit': 9.51,
+SUB10_TUNED = {'a_brake_max': 6.0, 'accel_limit': 9.51,
                'lock_margin': 0.95, 'gg_brake': True, 'gg_floor': 0.1,
                'cap_follows_reference': True,
                'sector_scale': [43.0, 47.0, 0.85, 3.0, 7.0, 0.95]}
@@ -214,6 +214,32 @@ class Sub10TunedProfileTests(unittest.TestCase):
     def test_the_params_file_carries_the_tuned_profile(self):
         params = _node_params()
         for name, value in SUB10_TUNED.items():
+            with self.subTest(name=name):
+                self.assertEqual(params[name], value)
+
+
+SUB9_TUNED = {'a_lat_max': 27.0, 'v_max': 12.0, 'mpc_full_brake': True,
+              'profile_brake_cap': 3.0, 'beta_limit': 1.0}
+
+
+class Sub9TunedProfileTests(unittest.TestCase):
+    """The sub-9 pin (Step 2): the MPC owns the braking, so the budget rises 21 -> 27.
+
+    Every crash above a_lat 22 was a braking-yaw spin with the MPC saturated at its
+    -0.3 a_max floor while the profile override braked past it. With the MPC braking
+    to a_brake_max, the override held to 3 m/s^2 and the slip state kept to 1 rad,
+    a27 at v_max 12 is 8.79 s and clean on fixed 5/7/12 ms x stale 5/9/14, 10 laps,
+    5 measured runs, 24 runs under 12-job host load, and the centreline.
+    """
+
+    def test_the_code_defaults_carry_the_sub9_pin(self):
+        for name, value in SUB9_TUNED.items():
+            with self.subTest(name=name):
+                self.assertEqual(driver_params.DEFAULTS[name], value)
+
+    def test_the_params_file_carries_the_sub9_pin(self):
+        params = _node_params()
+        for name, value in SUB9_TUNED.items():
             with self.subTest(name=name):
                 self.assertEqual(params[name], value)
 

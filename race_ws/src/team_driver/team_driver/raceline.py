@@ -83,7 +83,8 @@ REFINE_PENALTY_SLACK = 0.005  # [m] past `required` where that penalty starts
 # The profile the shipped line is refined against: the sub-10 tune (a_lat 22 with the
 # g-g brake limit, and its one kink sector). Fixed here, not read from the driver's
 # config, so the CSV stays reproducible from the map when the driver's sectors are
-# later re-tuned to this line.
+# later re-tuned to this line. The sub-9 driver (a27, v_max 12) runs this a22 line
+# as is; re-refining at its profile is untried.
 REFINE_PROFILE = dict(a_lat_max=22.0, lock_margin=0.95, a_accel_max=9.51, a_brake_max=6.0,
                       v_max=10.0, sector_scale=((43.0, 47.0, 0.85),), gg_brake=True)
 MIN_CURVATURE_METHOD = 'min-curvature'
