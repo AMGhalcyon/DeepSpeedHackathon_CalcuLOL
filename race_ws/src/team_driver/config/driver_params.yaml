@@ -92,6 +92,13 @@ driver:
     warmup_end_s: 71.0
     warmup_sector_scale: [0.0, 71.0, 0.75]
     warmup_accel_scale: 1.0
+    # Back off a wall the car is pinned against (phase-2 judged r1: pinned at full
+    # lock and full throttle after one hit, 11 collisions, DQ). Pinned = under 0.3 m/s
+    # while asking to move, for unstick_after [s]; then reverse straight at
+    # unstick_speed [m/s] for unstick_reverse_s [s]. 0 is off.
+    unstick_after: 0.5
+    unstick_reverse_s: 0.6
+    unstick_speed: 1.0
     a_emergency: 7.0          # [m/s^2] braking the emergency cap assumes; coasting sheds speed at it
     # Continue the emergency cap's corridor past the MPC's 0.5 s plan along the
     # reference, not straight into the outside wall of the next corner (sub-10 Step 3).

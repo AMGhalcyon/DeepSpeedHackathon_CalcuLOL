@@ -147,6 +147,15 @@ class DriverConfig:
     warmup_end_s: float = 71.0
     warmup_sector_scale: tuple[float, ...] = (0.0, 71.0, 0.75)
     warmup_accel_scale: float = 1.0
+    # Back off a wall the car is pinned against. The judged sim pins a car that
+    # pushes into a wall: phase-2 r1 sat at v ~0 at full lock and full throttle
+    # forward for 4 s after one hit (11 collisions, DQ), because nothing here ever
+    # asks for reverse. Stuck = under UNSTICK_SPEED while the last command asked to
+    # move, for `unstick_after` [s]; then reverse straight at `unstick_speed` [m/s]
+    # for `unstick_reverse_s` [s], and drive again. 0 is off.
+    unstick_after: float = 0.5
+    unstick_reverse_s: float = 0.6
+    unstick_speed: float = 1.0
     # [m/s^2] Braking the emergency cap assumes, and the rate a coast sheds speed.
     a_emergency: float = 7.0
     # Continue the emergency cap's corridor past the MPC's 0.5 s plan along the
@@ -185,6 +194,19 @@ class DriverConfig:
         check_curvature_smooth(self.curvature_smooth)
         check_warmup(self.warmup_crossings, self.warmup_end_s, self.warmup_sector_scale,
                      self.warmup_accel_scale)
+        check_unstick(self.unstick_after, self.unstick_reverse_s, self.unstick_speed)
+
+
+def check_unstick(after, reverse_s, speed) -> None:
+    """Raise ValueError unless the unstick settings make sense (see DriverConfig)."""
+    def number(x):
+        return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    if not (number(after) and after >= 0.0):
+        raise ValueError(f'unstick_after {after!r} must be a time >= 0 s (0 is off)')
+    if not (number(reverse_s) and reverse_s > 0.0):
+        raise ValueError(f'unstick_reverse_s {reverse_s!r} must be a time > 0 s')
+    if not (number(speed) and speed > 0.0):
+        raise ValueError(f'unstick_speed {speed!r} must be a speed > 0 m/s')
 
 
 def check_warmup(crossings, end_s, sector_scale, accel_scale) -> None:
@@ -252,6 +274,8 @@ STEER_CORRECT_TAU = 0.5         # [s] time constant of the yaw-rate leash (~5 % 
 # Smaller backward steps are an out-of-order stamp and are ignored.
 SIM_RESET_BACKSTEP = 0.1
 RTF_SMOOTHING = 0.05            # EMA weight per control step for the live RTF
+UNSTICK_SPEED = 0.3             # [m/s] slower than this, while asking to move, is pinned
+UNSTICK_PUSH = 0.05             # [m/s] a /drive speed above this is asking to move
 # [m/s] Where the gap-follower heads when there is no reference to track: the
 # old v_max it was tuned at, not today's racing cap.
 REACTIVE_SPEED = 3.0
@@ -602,6 +626,11 @@ class DriverCore:
         self._wrap_debt = 0         # backward crossings a forward one must undo first
         self._prev_arc = None
 
+        # Unstick (DriverConfig.unstick_*): since when the car has been pinned,
+        # and until when it reverses off the wall; None when neither.
+        self._stuck_since = None
+        self._reverse_until = None
+
         self._load_reference_path()
 
     # ------------------------------------------------------------------
@@ -944,7 +973,15 @@ class DriverCore:
                 reset_tracking()
             # Back on the grid: the out lap and warm-up come round again.
             self._restart_warmup()
+            self._reset_unstick()
         self._latch = self._predict_latch(t_pose)
+
+        unstick = self._unstick()
+        if unstick is not None:
+            self._solved_arc = None
+            self._cond_steer = unstick.steering_angle
+            self._last_planned = unstick
+            return unstick
 
         ranges, angles = self.preprocess()
         planned = self.plan(ranges, angles)
@@ -956,6 +993,38 @@ class DriverCore:
                                                  speed_cap=planned.speed_cap,
                                                  profile_speed=planned.profile_speed)
         return self._last_planned
+
+    def _reset_unstick(self) -> None:
+        self._stuck_since = None
+        self._reverse_until = None
+
+    def _unstick(self) -> Optional[DriveCommand]:
+        """Reverse straight off a wall the car is pinned against, or None to drive on.
+
+        Pinned: slower than UNSTICK_SPEED while the last command asked to move,
+        for `unstick_after` of plant time. The launch from the grid passes
+        UNSTICK_SPEED within ~0.05 s, and a corner is never under 4 m/s.
+        """
+        cfg = self.cfg
+        if cfg.unstick_after <= 0.0 or self.t_odom is None:
+            return None
+        t = self.t_odom
+        reverse = DriveCommand(0.0, -cfg.unstick_speed, 0.0)
+        if self._reverse_until is not None:
+            if t < self._reverse_until:
+                return reverse
+            self._reset_unstick()
+        if abs(self.speed) >= UNSTICK_SPEED or self._last_cmd.speed <= UNSTICK_PUSH:
+            self._stuck_since = None
+            return None
+        if self._stuck_since is None:
+            self._stuck_since = t
+        if t - self._stuck_since < cfg.unstick_after:
+            return None
+        self._reverse_until = t + cfg.unstick_reverse_s
+        self.log.warn(f'Pinned at {self.position}: reversing {cfg.unstick_reverse_s:.1f} s '
+                      f'at {cfg.unstick_speed:.1f} m/s')
+        return reverse
 
     def _measured_state(self):
         """(x, y, yaw, v, beta, wheel, yaw_rate) as measured, made safe to replay.

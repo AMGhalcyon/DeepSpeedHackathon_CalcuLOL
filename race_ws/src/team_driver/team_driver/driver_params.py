@@ -28,12 +28,12 @@ _current_dir = os.path.dirname(os.path.abspath(__file__))
 if _current_dir not in sys.path:
     sys.path.insert(0, _current_dir)
 try:
-    from .driver_core import DriverConfig, REFERENCES, check_warmup   # ROS / package import
+    from .driver_core import DriverConfig, REFERENCES, check_unstick, check_warmup   # ROS / package import
     from .speed_profile import (check_curvature_smooth, check_gg_exponent, check_gg_floor,
                                 sector_triples)
     from .vehicle_model import MODEL_TYPES, ServoModel, VehicleModel
 except ImportError:
-    from driver_core import DriverConfig, REFERENCES, check_warmup    # standalone / tests
+    from driver_core import DriverConfig, REFERENCES, check_unstick, check_warmup    # standalone / tests
     from speed_profile import (check_curvature_smooth, check_gg_exponent, check_gg_floor,
                                sector_triples)
     from vehicle_model import MODEL_TYPES, ServoModel, VehicleModel
@@ -161,6 +161,7 @@ def validate(values: Mapping[str, Any]) -> None:
     check_curvature_smooth(values['curvature_smooth'])
     check_warmup(values['warmup_crossings'], values['warmup_end_s'],
                  values['warmup_sector_scale'], values['warmup_accel_scale'])
+    check_unstick(values['unstick_after'], values['unstick_reverse_s'], values['unstick_speed'])
 
 
 def _validate_schedule(schedule: list, horizon: int, period: float) -> None:
