@@ -285,6 +285,13 @@ STEER_CORRECT_TAU = 0.5         # [s] time constant of the yaw-rate leash (~5 % 
 # Smaller backward steps are an out-of-order stamp and are ignored.
 SIM_RESET_BACKSTEP = 0.1
 RTF_SMOOTHING = 0.05            # EMA weight per control step for the live RTF
+# A clock pair implying more than this is the sim clock jumping, not the sim running
+# fast: the node's first /clock lands after the bridge has run 0.5-1 s (judged
+# 20261017T221022Z r4, 20261017T223940Z r3/r5: 990-1020 ms in 3 ms of wall, RTF
+# 340). Learnt, that put every latch time ~0.6 s late for the launch, the wheel
+# estimate 0.9-1.1 rad off, and the car into the first corner. Judged RTF is 1.8-2.4,
+# its highest live spike 6.85.
+LATCH_RTF_MAX = 10.0
 # [m/s] Slower than this, while asking to move, is pinned. A car scraping a wall at
 # full lock and full throttle still creeps at 0.37-0.5 m/s (judged 20261017T215601Z
 # r7-r9: 8-11 collisions each, unstick fired once at 0.3); racing, it is never under 4.
@@ -479,7 +486,7 @@ class LatchClock:
         if self._last is not None:
             d_sim = t_sim - self._last[0]
             d_wall = t_wall - self._last[1]
-            if d_sim > 0.0 and d_wall > 0.0:
+            if d_sim > 0.0 and d_wall > 0.0 and d_sim <= LATCH_RTF_MAX * d_wall:
                 ratio = d_sim / d_wall
                 self.rtf = (ratio if self.rtf is None
                             else self.rtf + RTF_SMOOTHING * (ratio - self.rtf))
