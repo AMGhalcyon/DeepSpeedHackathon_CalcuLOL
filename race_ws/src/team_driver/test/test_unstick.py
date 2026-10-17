@@ -85,6 +85,17 @@ class UnstickTest(unittest.TestCase):
         for k in range(80):
             self.assertIsNone(_at(core, 0.025 * k, 0.0))
 
+    def test_a_car_creeping_along_a_wall_is_pinned(self):
+        # Judged r7-r9: full lock, full throttle, 0.37-0.5 m/s along the wall.
+        core = _core()
+        self.assertIsNone(_at(core, 10.0, 0.45))
+        self.assertEqual(_at(core, 10.5, 0.45).speed, -1.0)
+
+    def test_an_unknown_speed_is_not_pinned(self):
+        core = _core()
+        for k in range(40):
+            self.assertIsNone(_at(core, 10.0 + 0.025 * k, float('nan')))
+
     def test_a_sim_reset_forgets_the_stuck_timer(self):
         core = _core()
         _at(core, 10.0, 0.01)

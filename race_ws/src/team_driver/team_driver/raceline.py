@@ -20,7 +20,7 @@ Pipeline (Heilmeier et al. 2019, docs/04 section 4.6):
    the rows by the previous round's curvature (`KAPPA_REF`), so that a tight apex
    is not left sharper than the steering can follow; if that solve fails, the
    plain two-or-three-round solve takes over.
-6. Offline only (`--refine`, ~60 s): refine that line for lap time. Lateral offsets at
+6. Offline only (`--refine`, ~4 min): refine that line for lap time. Lateral offsets at
    `REFINE_CONTROL_POINTS` points, spline-interpolated, minimise the ideal lap of the
    speed profile (`REFINE_PROFILE`) inside the same clearance bounds. Minimum
    curvature is only a proxy for lap time; this trades it where the profile says
@@ -80,13 +80,17 @@ REFINE_FD_STEP = 1e-3         # [m] finite-difference step of the lap-time gradi
 REFINE_BOUND_SLACK = 0.02     # [m] past `required` for the control points' box bounds
 REFINE_PENALTY = 1e3          # [s/m^2] on the squared clearance shortfall between them
 REFINE_PENALTY_SLACK = 0.005  # [m] past `required` where that penalty starts
-# The profile the shipped line is refined against: the sub-10 tune (a_lat 22 with the
-# g-g brake limit, and its one kink sector). Fixed here, not read from the driver's
-# config, so the CSV stays reproducible from the map when the driver's sectors are
-# later re-tuned to this line. The sub-9 driver (a27, v_max 12) runs this a22 line
-# as is; re-refining at its profile is untried.
-REFINE_PROFILE = dict(a_lat_max=22.0, lock_margin=0.95, a_accel_max=9.51, a_brake_max=6.0,
-                      v_max=10.0, sector_scale=((43.0, 47.0, 0.85),), gg_brake=True)
+# The profile the shipped line is refined against: the sub-9 phase-2 tune (a27,
+# v_max 12, shape U, the raised corners) with its sectors at the previous line's
+# arcs, as it was refined (QP 8.169 -> 8.009 s ideal, ~230 s; the driver's sectors are
+# those shifted 0.1-0.2 m to this line). Fixed here, not read from the driver's config, so
+# the CSV stays reproducible from the map when the driver is later re-tuned.
+REFINE_PROFILE = dict(a_lat_max=27.0, lock_margin=0.95, a_accel_max=9.51, a_brake_max=9.0,
+                      v_max=12.0, gg_brake=True, gg_floor=0.1, gg_exponent=5.0,
+                      curvature_smooth=21,
+                      sector_scale=((43.0, 47.0, 0.85), (3.0, 7.0, 0.95), (8.0, 21.0, 1.2),
+                                    (28.0, 43.0, 1.2), (49.0, 57.0, 1.11),
+                                    (57.0, 74.3, 1.2)))
 PROFILE_KEYS = frozenset(('a_lat_max', 'lock_margin', 'a_accel_max', 'a_brake_max', 'v_max',
                           'gg_exponent', 'curvature_smooth',
                           'sector_scale', 'gg_brake', 'gg_floor'))
@@ -508,7 +512,7 @@ def refine_min_time(xy: np.ndarray, sealed: OccupancyGrid, required: float, *,
 
     Every point stays at least `required` from the sealed walls, or RacelineError.
     `profile` is `speed_profile` keyword arguments, `REFINE_PROFILE` by default.
-    Offline: the shipped settings take ~60 s, too long for the 60 s startup budget.
+    Offline: the shipped settings take ~4 min, too long for the 60 s startup budget.
     """
     profile = REFINE_PROFILE if profile is None else profile
     clearance_map = _clearance_map(sealed)
@@ -585,7 +589,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument('--write', metavar='CSV',
                         help='write x,y to this CSV (config/icra26_raceline.csv for the driver)')
     parser.add_argument('--refine', action='store_true',
-                        help=f'refine the line for lap time at REFINE_PROFILE (~60 s); the '
+                        help=f'refine the line for lap time at REFINE_PROFILE (~4 min); the '
                              f'driver drives a {MIN_TIME_METHOD} CSV before its runtime build')
     parser.add_argument('--profile-json', metavar='JSON',
                         help='refine at this profile instead of REFINE_PROFILE: a JSON object '

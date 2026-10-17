@@ -1,11 +1,11 @@
 """Sub-9 phase 2 Step 1: a cautious out lap and warm-up lap, the race profile after.
 
 Neither the out lap nor the warm-up lap is timed, but a collision in either still
-counts toward the disqualification limit. Judged warm-ups hit at s~16 in 3 of 13
-runs (0 in 130 timed laps): the first lap from a standing start is the risky one.
+counts toward the disqualification limit. Judged warm-ups hit in 3 of 13 sub-9 runs
+(0 in 130 timed laps), at scattered spots after early host stalls.
 Until the car has crossed the start line `warmup_crossings` times and then reached
 `warmup_end_s`, the profile takes extra sectors and the acceleration is scaled.
-Off (the default) must be the sub-9 car exactly.
+Off (0 crossings) must be the race car exactly; the default is on (1 crossing).
 """
 
 import math
@@ -48,7 +48,7 @@ class OffIsTheSub9CarTest(unittest.TestCase):
     def test_the_pinned_default_is_the_whole_warm_up_lap_at_0p75(self):
         cfg = driver_core.DriverConfig()
         self.assertEqual((cfg.warmup_crossings, cfg.warmup_end_s, cfg.warmup_sector_scale,
-                          cfg.warmup_accel_scale), (1, 71.0, (0.0, 71.0, 0.75), 1.0))
+                          cfg.warmup_accel_scale), (1, 71.2, (0.0, 71.2, 0.75), 1.0))
 
     def test_off_tracks_the_race_profile_from_the_start(self):
         core = _core(**OFF)
@@ -57,7 +57,8 @@ class OffIsTheSub9CarTest(unittest.TestCase):
             core.reference_path, a_lat_max=cfg.a_lat_max, lock_margin=cfg.lock_margin,
             a_accel_max=cfg.a_accel_max, a_brake_max=cfg.a_brake_max, v_max=cfg.v_max,
             sector_scale=sp.sector_triples(cfg.sector_scale),
-            gg_brake=cfg.gg_brake, gg_floor=cfg.gg_floor)
+            gg_brake=cfg.gg_brake, gg_floor=cfg.gg_floor, gg_exponent=cfg.gg_exponent,
+            curvature_smooth=cfg.curvature_smooth)
         np.testing.assert_array_equal(core.reference_speeds, expected)
         np.testing.assert_array_equal(core.race_speeds, expected)
         self.assertFalse(core.warming_up)

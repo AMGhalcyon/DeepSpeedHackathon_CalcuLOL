@@ -92,7 +92,9 @@ class DriverConfig:
     a_accel_max: float = 9.51       # [m/s^2] acceleration the profile plans (plant: 9.51)
     # [m/s^2] Braking the profile plans, and the most the conditioner passes on
     # from the MPC (plant: 9.51). The profile and emergency caps may brake harder.
-    a_brake_max: float = 6.0
+    # Sub-9 phase 2: 9 with gg_exponent 5 and curvature_smooth 21 (shape U) is
+    # 8.295 s and clean on a27's line; 9.5 with 6 / 25 crashed at s 54. Old car: 6.
+    a_brake_max: float = 9.0
     # Let the MPC plan braking to a_brake_max, not its old -0.3 a_max floor. At
     # that floor every budget above 22 spun under braking: the MPC sat saturated
     # while the profile override braked -5 to -7.8 m/s^2 past it, a deceleration
@@ -109,28 +111,36 @@ class DriverConfig:
     # the old car; from a25 the car slides past it in a corner, the MPC loses its
     # slip state and the emergency cap ends a spin (s~16). 1.0 keeps it.
     beta_limit: float = 1.0
-    # Where the slip budget is lowered: flat (s_start [m], s_end [m], scale) triples,
-    # s the arc length from the reference's first waypoint, scale in (0, 1].
+    # Where the slip budget is scaled: flat (s_start [m], s_end [m], scale) triples,
+    # s the arc length from the reference's first waypoint, scale in (0, 1.5].
     # Flat because ROS parameters are flat lists (speed_profile.sector_triples);
     # never empty, or rclpy types it as a byte array: (0, 1, 1) turns it off.
-    # Sub-10 Step 4, on the re-refined min-time line: 43-47 @0.85 for the chicane-exit
-    # tracking transient (s~45.3 collides without it), 3-7 @0.95 for the first corner
-    # (s~4.8-5.2 collided on the new line). The older sectors are gone: the g-g brake
-    # limit covers the braking-yaw sites they patched. Off the raceline, see
-    # _slip_budget_for.
-    sector_scale: tuple[float, ...] = (43.0, 47.0, 0.85, 3.0, 7.0, 0.95)
+    # Scales above 1 raise the budget there (up to speed_profile.MAX_SECTOR_SCALE).
+    # Sub-10 Step 4: 43-47 @0.85 for the chicane-exit tracking transient (s~45.3
+    # collides without it), 3-7 @0.95 for the first corner (s~4.8-5.2). Sub-9 phase 2,
+    # on the line re-refined at this profile (raceline.REFINE_PROFILE; arcs shifted
+    # 0.1-0.2 m to its length): the corners raised one notch below each harness
+    # cliff -- 8-21 and 57-74 @1.2, 28-43 and 49-57 @1.11 (49-57 @1.15 hits s 54;
+    # 28-43 @1.3 hits s 35; 8-21 @1.35 hits; 21-28 above 1.0 hits s 23.2). 28-43 @1.2
+    # was clean on the full harness grid (7.92 s) but hit s 30-36 in 3 of 10 judged
+    # runs (judged batch 20261017T215601Z), so judged timing puts that cliff near 1.2.
+    # At 1.11: 7.97 s harness. Off the raceline, see _slip_budget_for.
+    sector_scale: tuple[float, ...] = (43.2, 47.2, 0.85, 3.1, 7.1, 0.95, 8.1, 21.3, 1.2,
+                                       28.3, 43.2, 1.11, 49.2, 57.2, 1.11, 57.2, 74.4, 1.2)
     # Combined-accel limit on the profile's braking (speed_profile.gg_decel): the
     # deceleration taken into a corner shrinks with the share of the slip budget the
     # corner already uses, because braking unloads the rear axle and the plant's yaw
     # goes unstable (sub-10 Step 1). Off reproduces the plain profile bit for bit.
     gg_brake: bool = True
-    gg_floor: float = 0.1           # braking never drops below a_brake_max*sqrt(gg_floor), in (0, 1]
+    gg_floor: float = 0.1           # braking never drops below a_brake_max*gg_floor^(1/p), in (0, 1]
     # Shape of that ellipse, 1 - r^p: 2 is the ellipse; higher keeps more braking at
-    # part of the budget (3: 8.929 -> 8.813 s ideal on the a27 profile).
-    gg_exponent: float = 2.0
+    # part of the budget (3: 8.929 -> 8.813 s ideal on the a27 profile). Pinned 5
+    # with curvature_smooth 21 and a_brake_max 9 (shape U, above). Old car: 2.
+    gg_exponent: float = 5.0
     # [points] The profile's curvature moving average (odd); the MPC's own is not
     # touched. Wider rounds the curvature peaks (13: 8.809 s ideal; 5: 9.201 s).
-    curvature_smooth: int = 9
+    # Pinned 21 (shape U). Old car: 9.
+    curvature_smooth: int = 21
     # Cautious out lap and warm-up lap. Neither is timed, but their collisions count
     # toward the disqualification (docs/06-rules.md, rule 18). Judged warm-ups hit
     # in 3 of 13 sub-9 runs (0 of 130 timed laps), at s 56 and 65 in one run, while
@@ -142,10 +152,11 @@ class DriverConfig:
     # every acceleration limit -- the profile's, the MPC's, the conditioner's -- is
     # scaled by `warmup_accel_scale`. 0 crossings is off: the race car from the grid.
     # Pinned: the whole warm-up lap at 0.75 of the budget up to the last straight
-    # (s 71): warm-up 9.81 s, timed laps 8.81 / 8.80 / 8.80 against 8.79 / 8.80.
+    # (s 71.2 on the phase-2 line; warm-up 9.29 s, timed 7.92 s). At a27 on the
+    # previous line (s 71) it was judged 10/10 clean, warm-ups included.
     warmup_crossings: int = 1
-    warmup_end_s: float = 71.0
-    warmup_sector_scale: tuple[float, ...] = (0.0, 71.0, 0.75)
+    warmup_end_s: float = 71.2
+    warmup_sector_scale: tuple[float, ...] = (0.0, 71.2, 0.75)
     warmup_accel_scale: float = 1.0
     # Back off a wall the car is pinned against. The judged sim pins a car that
     # pushes into a wall: phase-2 r1 sat at v ~0 at full lock and full throttle
@@ -274,7 +285,10 @@ STEER_CORRECT_TAU = 0.5         # [s] time constant of the yaw-rate leash (~5 % 
 # Smaller backward steps are an out-of-order stamp and are ignored.
 SIM_RESET_BACKSTEP = 0.1
 RTF_SMOOTHING = 0.05            # EMA weight per control step for the live RTF
-UNSTICK_SPEED = 0.3             # [m/s] slower than this, while asking to move, is pinned
+# [m/s] Slower than this, while asking to move, is pinned. A car scraping a wall at
+# full lock and full throttle still creeps at 0.37-0.5 m/s (judged 20261017T215601Z
+# r7-r9: 8-11 collisions each, unstick fired once at 0.3); racing, it is never under 4.
+UNSTICK_SPEED = 1.0
 UNSTICK_PUSH = 0.05             # [m/s] a /drive speed above this is asking to move
 # [m/s] Where the gap-follower heads when there is no reference to track: the
 # old v_max it was tuned at, not today's racing cap.
@@ -717,10 +731,11 @@ class DriverCore:
         return candidates
 
     def _raceline_reference(self, centerline_path, centerline_xy):
-        """The offline min-time line, else the runtime raceline, else the cached
-        one, else the centreline.
+        """(line, tuned): the offline min-time line, else the runtime raceline, else
+        the cached one, else the centreline; tuned only for the offline min-time line,
+        the one `sector_scale` was tuned on.
 
-        The min-time line (`raceline.py --refine --write`) takes ~60 s to compute,
+        The min-time line (`raceline.py --refine --write`) takes ~4 min to compute,
         past the startup budget, so it ships as the cached CSV and is driven first
         once it checks out against the map. Otherwise the minimum-curvature line is
         built from the map at startup, and the CSV is used only when that build
@@ -733,7 +748,7 @@ class DriverCore:
                 xy = _offline_min_time_line(
                     cached, centerline_path, raceline.HALF_WIDTH + float(self.cfg.raceline_margin))
                 self.log.info(f'raceline: offline min-time line {cached}, {len(xy)} points')
-                return xy.copy()
+                return xy.copy(), True
             except Exception as e:
                 rejected = e
                 self.log.warn(f'raceline: not driving the offline min-time line ({e}); '
@@ -742,32 +757,32 @@ class DriverCore:
         try:
             xy, seconds = _built_raceline(centerline_path, float(self.cfg.raceline_margin))
             self.log.info(f'raceline: {len(xy)} points, built in {seconds:.2f} s')
-            return xy.copy()
+            return xy.copy(), False
         except Exception as e:
             reason = f'build failed: {e}'
 
         if cached is None:
             self.log.error(f'raceline: {reason}; no cached raceline found, '
                            'using the centreline')
-            return centerline_xy
+            return centerline_xy, False
         try:
             xy, margin = raceline.read_cached(cached)
         except Exception as e:
             self.log.error(f'raceline: {reason}; cached raceline unusable ({e}), '
                            'using the centreline')
-            return centerline_xy
+            return centerline_xy, False
         if margin < self.cfg.raceline_margin:
             self.log.error(f'raceline: {reason}; the cached raceline keeps {margin} m of '
                            f'margin, less than the {self.cfg.raceline_margin} m asked for, '
                            'using the centreline')
-            return centerline_xy
+            return centerline_xy, False
         if rejected is not None and raceline.cached_method(cached) == raceline.MIN_TIME_METHOD:
             self.log.error(f'raceline: {reason}; the cached raceline failed its map check '
                            f'({rejected}), using the centreline')
-            return centerline_xy
+            return centerline_xy, False
         self.log.warn(f'raceline: {reason}; using the cached raceline {cached} '
                       f'(margin {margin} m)')
-        return xy
+        return xy, False
 
     def _load_reference_path(self):
         """Load centerline as reference path."""
@@ -792,32 +807,47 @@ class DriverCore:
                 f'Loaded {len(centerline_data)} centerline points from {centerline_path}')
 
             centerline_xy = centerline_data[:, :2]
-            path = centerline_xy
+            path, sectors = centerline_xy, tuple(self.cfg.sector_scale)
             if self.cfg.reference == 'raceline':
-                path = self._raceline_reference(centerline_path, centerline_xy)
+                path, tuned = self._raceline_reference(centerline_path, centerline_xy)
+                if not tuned and any(scale > 1.0 for scale in sectors[2::3]):
+                    # Raised corners were tuned on the min-time line only.
+                    sectors = tuple(min(x, 1.0) if k % 3 == 2 else x
+                                    for k, x in enumerate(sectors))
+                    self.log.warn('sector_scale: not the tuned min-time line, so no '
+                                  'sector raises the budget above a_lat_max')
             on_raceline = path is not centerline_xy
 
             # Curvature-limited speeds, not a flat 3 m/s. The track is ~0.5 m
             # wide and the centerline peaks well above a curvature that 3 m/s
             # can hold, so a constant reference drives straight into the
             # outside wall at the first real corner.
-            speeds = self._profile(path, on_raceline, self.cfg.sector_scale,
-                                   self.cfg.a_accel_max)
+            speeds = self._profile(path, on_raceline, sectors, self.cfg.a_accel_max)
             self.log.info(f'Speed profile: {speeds.min():.2f}-{speeds.max():.2f} m/s')
             self.set_reference(path, speeds)
-            if self.cfg.warmup_crossings > 0:
-                self._warm_speeds = self._profile(
-                    path, on_raceline, self.cfg.sector_scale + self.cfg.warmup_sector_scale,
-                    self.cfg.a_accel_max * self.cfg.warmup_accel_scale)
-                self.log.info(f'Warm-up profile: {self._warm_speeds.min():.2f}-'
-                              f'{self._warm_speeds.max():.2f} m/s until '
-                              f'{self.cfg.warmup_crossings} crossing(s) and s '
-                              f'{self.cfg.warmup_end_s:.1f} m')
-                self._restart_warmup()
-
         except Exception as e:
             self.log.error(f'Error loading reference path: {e}')
             self.reference_path = None
+            return
+        if self.cfg.warmup_crossings > 0:
+            self._load_warmup(path, on_raceline, sectors)
+
+    def _load_warmup(self, path, on_raceline, sectors) -> None:
+        """The warm-up profile on top of the race one; on failure, race from the grid."""
+        try:
+            self._warm_speeds = self._profile(
+                path, on_raceline, sectors + tuple(self.cfg.warmup_sector_scale),
+                self.cfg.a_accel_max * self.cfg.warmup_accel_scale)
+            self.log.info(f'Warm-up profile: {self._warm_speeds.min():.2f}-'
+                          f'{self._warm_speeds.max():.2f} m/s until '
+                          f'{self.cfg.warmup_crossings} crossing(s) and s '
+                          f'{self.cfg.warmup_end_s:.1f} m')
+            self._restart_warmup()
+        except Exception as e:
+            self.log.error(f'Warm-up profile failed ({e}); racing from the grid')
+            self._warm_speeds = None
+            if self._warm:
+                self._set_warm(False)
 
     def _profile(self, path, on_raceline, flat_sectors, a_accel_max):
         """The speed profile of `path` with these sectors and this acceleration."""
@@ -1003,7 +1033,7 @@ class DriverCore:
 
         Pinned: slower than UNSTICK_SPEED while the last command asked to move,
         for `unstick_after` of plant time. The launch from the grid passes
-        UNSTICK_SPEED within ~0.05 s, and a corner is never under 4 m/s.
+        UNSTICK_SPEED within ~0.1 s, and a corner is never under 4 m/s.
         """
         cfg = self.cfg
         if cfg.unstick_after <= 0.0 or self.t_odom is None:
@@ -1014,7 +1044,8 @@ class DriverCore:
             if t < self._reverse_until:
                 return reverse
             self._reset_unstick()
-        if abs(self.speed) >= UNSTICK_SPEED or self._last_cmd.speed <= UNSTICK_PUSH:
+        if (not math.isfinite(self.speed) or abs(self.speed) >= UNSTICK_SPEED
+                or self._last_cmd.speed <= UNSTICK_PUSH):
             self._stuck_since = None
             return None
         if self._stuck_since is None:

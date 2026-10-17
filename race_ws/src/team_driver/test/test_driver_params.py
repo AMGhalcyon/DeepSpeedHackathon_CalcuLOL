@@ -181,10 +181,9 @@ class Step9TunedWeightsTests(unittest.TestCase):
                 self.assertEqual(params[name], value)
 
 
-SUB10_TUNED = {'a_brake_max': 6.0, 'accel_limit': 9.51,
+SUB10_TUNED = {'accel_limit': 9.51,
                'lock_margin': 0.95, 'gg_brake': True, 'gg_floor': 0.1,
-               'cap_follows_reference': True,
-               'sector_scale': [43.0, 47.0, 0.85, 3.0, 7.0, 0.95]}
+               'cap_follows_reference': True}
 
 
 class Sub10TunedProfileTests(unittest.TestCase):
@@ -240,6 +239,34 @@ class Sub9TunedProfileTests(unittest.TestCase):
     def test_the_params_file_carries_the_sub9_pin(self):
         params = _node_params()
         for name, value in SUB9_TUNED.items():
+            with self.subTest(name=name):
+                self.assertEqual(params[name], value)
+
+
+PHASE2_TUNED = {'a_brake_max': 9.0, 'gg_exponent': 5.0, 'curvature_smooth': 21,
+                'sector_scale': [43.2, 47.2, 0.85, 3.1, 7.1, 0.95, 8.1, 21.3, 1.2,
+                                 28.3, 43.2, 1.11, 49.2, 57.2, 1.11, 57.2, 74.4, 1.2],
+                'warmup_crossings': 1, 'warmup_end_s': 71.2,
+                'warmup_sector_scale': [0.0, 71.2, 0.75]}
+
+
+class Phase2TunedProfileTests(unittest.TestCase):
+    """The sub-9 phase-2 pin: profile shape U, raised corners, the re-refined line.
+
+    a_brake_max 9 with gg_exponent 5 and curvature_smooth 21, the line re-refined at
+    that profile, and each corner's budget one notch below its cliff (s 23.2, 35, 54).
+    With 28-43 at 1.2 (7.92 s) the full harness grid was clean but judged runs hit
+    s 30-36 in 3 of 10; at 1.11 it is 7.97 s.
+    """
+
+    def test_the_code_defaults_carry_the_phase2_pin(self):
+        for name, value in PHASE2_TUNED.items():
+            with self.subTest(name=name):
+                self.assertEqual(driver_params.DEFAULTS[name], value)
+
+    def test_the_params_file_carries_the_phase2_pin(self):
+        params = _node_params()
+        for name, value in PHASE2_TUNED.items():
             with self.subTest(name=name):
                 self.assertEqual(params[name], value)
 

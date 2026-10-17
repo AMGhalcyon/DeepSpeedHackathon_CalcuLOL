@@ -390,8 +390,10 @@ class SpeedCapTest(unittest.TestCase):
     def test_the_condition_step_brakes_for_a_cap_past_the_comfort_clamp(self):
         core, _ = _core()
         core.speed = 2.0
-        cmd = core._condition(0.0, 3.0, DT, speed_cap=1.8)
-        self.assertAlmostEqual(cmd.speed, LOOP.command(2.0, (1.8 - 2.0) / DT, DT), places=12)
+        # A cap that needs braking between the comfort clamp and the plant's limit.
+        cap = 2.0 - 0.5 * (CFG.a_brake_max + VP.a_max) * DT
+        cmd = core._condition(0.0, 3.0, DT, speed_cap=cap)
+        self.assertAlmostEqual(cmd.speed, LOOP.command(2.0, (cap - 2.0) / DT, DT), places=12)
         self.assertLess(cmd.speed, LOOP.command(2.0, -CFG.a_brake_max, DT))
 
     def test_a_cap_the_car_will_not_reach_does_not_bind(self):

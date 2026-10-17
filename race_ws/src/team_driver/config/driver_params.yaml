@@ -53,34 +53,41 @@ driver:
     a_accel_max: 9.51         # [m/s^2] acceleration the profile plans (plant: 9.51)
     # Braking the profile plans, and the most the conditioner passes on from
     # the MPC (plant: 9.51). The profile and emergency caps may brake harder.
-    a_brake_max: 6.0          # [m/s^2]
+    # Sub-9 phase 2: 9, with gg_exponent 5 and curvature_smooth 21 (shape U). Old car: 6.
+    a_brake_max: 9.0          # [m/s^2]
     # Sub-9 Step 2 (driver_core.DriverConfig has the why). false/9.51/0.5 is the old car.
     mpc_full_brake: true      # the MPC plans braking to a_brake_max, not -0.3 a_max
     profile_brake_cap: 3.0    # [m/s^2] most the profile override brakes past the MPC
     beta_limit: 1.0           # [rad] measured sideslip past this reads 0 to the MPC
-    # Sectors where the slip budget is lowered: flat (s_start, s_end, scale)
-    # triples, s [m] along the raceline from its first point, scale in (0, 1].
-    # Sub-10 Step 4, on the re-refined min-time line (config/icra26_raceline.csv):
+    # Sectors where the slip budget is scaled: flat (s_start, s_end, scale)
+    # triples, s [m] along the raceline from its first point, scale in (0, 1.5]
+    # (above 1 raises it). Sub-10 Step 4, on that era's min-time line:
     # s 43-47 at 0.85 for the chicane-exit tracking transient (s~45.3 collides without
     # it), s 3-7 at 0.95 for the first corner (s~4.8-5.2 collided on the new line).
     # The g-g brake limit covers the braking-yaw sites the older sectors patched.
     # Never empty: ROS would type an empty list as bytes and refuse a list of
-    # doubles; to turn the sectors off, use [0.0, 1.0, 1.0]. Tuned on that line
-    # at raceline_margin 0.25; on the centreline the lap gets a uniform a_lat_max x
-    # the lowest scale (17.85 m/s^2: clean in lap_sim, 12.20 s).
+    # doubles; to turn the sectors off, use [0.0, 1.0, 1.0]. Tuned on the shipped
+    # line at raceline_margin 0.25; on the centreline the lap gets a uniform a_lat_max x
+    # the lowest scale (27 x 0.85 = 22.95 m/s^2: clean in lap_sim, 9.37 s).
     # Fallbacks: the sub-10 car (a21, v_max 10, mpc_full_brake false, profile_brake_cap
     # 9.51, beta_limit 0.5; 9.82 s harness, judged 9.87 s), or the previous line and
-    # profile (git 42cb78f, 10.81 s). Sub-9 runs a27 on these same sectors.
-    sector_scale: [43.0, 47.0, 0.85, 3.0, 7.0, 0.95]
+    # profile (git 42cb78f, 10.81 s). Sub-9 Step 2 ran a27 on those two sectors alone.
+    # Sub-9 phase 2, on the line re-refined at that profile (raceline.REFINE_PROFILE;
+    # arcs shifted 0.1-0.2 m to its length): scales above 1 raise the budget, one
+    # notch below each corner's harness cliff -- 8-21 and 57-74 at 1.2, 28-43 and
+    # 49-57 at 1.11 (28-43 at 1.2 hit s 30-36 in 3 of 10 judged runs). 7.97 s harness.
+    # driver_core.DriverConfig has the cliffs. Fallback: git aadb7ae (a27, 8.80 s).
+    sector_scale: [43.2, 47.2, 0.85, 3.1, 7.1, 0.95, 8.1, 21.3, 1.2,
+                   28.3, 43.2, 1.11, 49.2, 57.2, 1.11, 57.2, 74.4, 1.2]
     # Combined-accel limit on the profile's braking (speed_profile.gg_decel): the
     # deceleration into a corner shrinks with the share of a_lat_max the corner already
-    # uses, a_brake_max * max(gg_floor, 1 - r^2)^(1/2). Braking unloads the rear axle
+    # uses, a_brake_max * max(gg_floor, 1 - r^p)^(1/p), p = gg_exponent. Braking unloads the rear axle
     # and the plant's yaw goes unstable, which is what crashed every uniform budget
     # above 18 (sub-10 Step 1). Off reproduces the plain profile bit for bit.
     gg_brake: true
-    gg_floor: 0.1             # braking never drops below a_brake_max*sqrt(gg_floor), in (0, 1]
-    gg_exponent: 2.0          # shape of that ellipse, 1 - r^p; 2 is the ellipse
-    curvature_smooth: 9       # [points] the profile's curvature moving average (odd); not the MPC's
+    gg_floor: 0.1             # braking never drops below a_brake_max*gg_floor^(1/p), in (0, 1]
+    gg_exponent: 5.0          # shape of that ellipse, 1 - r^p; 2 is the ellipse (old car)
+    curvature_smooth: 21      # [points] the profile's curvature moving average (odd); not the MPC's; old car 9
     # Cautious out lap and warm-up lap (neither timed; their collisions still count
     # toward the DQ). Until warmup_crossings start-line crossings and then arc
     # warmup_end_s [m], the profile also takes warmup_sector_scale (scales in
@@ -89,11 +96,11 @@ driver:
     # Pinned: the whole warm-up lap at 0.75 up to the last straight (s 71), after
     # judged warm-up hits under an RTF spike; timed laps cost +0.01 s on lap 1 only.
     warmup_crossings: 1
-    warmup_end_s: 71.0
-    warmup_sector_scale: [0.0, 71.0, 0.75]
+    warmup_end_s: 71.2
+    warmup_sector_scale: [0.0, 71.2, 0.75]
     warmup_accel_scale: 1.0
     # Back off a wall the car is pinned against (phase-2 judged r1: pinned at full
-    # lock and full throttle after one hit, 11 collisions, DQ). Pinned = under 0.3 m/s
+    # lock and full throttle after one hit, 11 collisions, DQ). Pinned = under 1.0 m/s
     # while asking to move, for unstick_after [s]; then reverse straight at
     # unstick_speed [m/s] for unstick_reverse_s [s]. 0 is off.
     unstick_after: 0.5

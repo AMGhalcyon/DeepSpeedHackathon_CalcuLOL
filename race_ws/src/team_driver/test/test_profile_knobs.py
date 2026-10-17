@@ -1,7 +1,7 @@
 """Sub-9 phase 2 Step 1: the profile's g-g exponent and curvature smoothing as driver fields.
 
 Both passed the offline floor screen (exponent 3: 8.929 -> 8.813 s; smoothing 13:
--> 8.809 s). The defaults must stay the old module constants, the sub-9 car.
+-> 8.809 s). The module constants stay the old car; the phase-2 pin is 5 and 21.
 """
 
 import os
@@ -39,10 +39,10 @@ def _expected(core, **kw):
 
 
 class KnobTest(unittest.TestCase):
-    def test_the_defaults_are_the_old_constants(self):
+    def test_the_module_constants_are_the_old_car_and_the_defaults_the_pin(self):
+        self.assertEqual((sp.GG_EXPONENT, sp.CURVATURE_SMOOTH), (2.0, 9))
         cfg = driver_core.DriverConfig()
-        self.assertEqual(cfg.gg_exponent, sp.GG_EXPONENT)
-        self.assertEqual(cfg.curvature_smooth, sp.CURVATURE_SMOOTH)
+        self.assertEqual((cfg.gg_exponent, cfg.curvature_smooth), (5.0, 21))
 
     def test_the_driver_profiles_with_them(self):
         core = _core(gg_exponent=3.0, curvature_smooth=13)
