@@ -132,16 +132,20 @@ class DriverConfig:
     # touched. Wider rounds the curvature peaks (13: 8.809 s ideal; 5: 9.201 s).
     curvature_smooth: int = 9
     # Cautious out lap and warm-up lap. Neither is timed, but their collisions count
-    # toward the disqualification (docs/06-rules.md, rule 18), and the first lap
-    # from the standing start hit at s~16 in 3 of 13 judged warm-ups (0 of 130 timed
-    # laps). Until the car has crossed the start line `warmup_crossings` times and
+    # toward the disqualification (docs/06-rules.md, rule 18). Judged warm-ups hit
+    # in 3 of 13 sub-9 runs (0 of 130 timed laps), at s 56 and 65 in one run, while
+    # the driver logged an RTF spike (2.7 -> 6.85): host load early in a run. The
+    # harness, whose delays are constant, never hits (holds to 105 ms, state 500 ms
+    # stale). Until the car has crossed the start line `warmup_crossings` times and
     # then reached arc `warmup_end_s` [m], the profile also takes
     # `warmup_sector_scale` (scales in (0, 1]: the warm-up only backs off), and
     # every acceleration limit -- the profile's, the MPC's, the conditioner's -- is
     # scaled by `warmup_accel_scale`. 0 crossings is off: the race car from the grid.
-    warmup_crossings: int = 0
-    warmup_end_s: float = 0.0
-    warmup_sector_scale: tuple[float, ...] = (0.0, 1.0, 1.0)
+    # Pinned: the whole warm-up lap at 0.75 of the budget up to the last straight
+    # (s 71): warm-up 9.81 s, timed laps 8.81 / 8.80 / 8.80 against 8.79 / 8.80.
+    warmup_crossings: int = 1
+    warmup_end_s: float = 71.0
+    warmup_sector_scale: tuple[float, ...] = (0.0, 71.0, 0.75)
     warmup_accel_scale: float = 1.0
     # [m/s^2] Braking the emergency cap assumes, and the rate a coast sheds speed.
     a_emergency: float = 7.0
@@ -879,14 +883,18 @@ class DriverCore:
     def _note_arc(self, arc) -> None:
         """Count start-line crossings from the MPC's arc; end the warm-up when due.
 
-        The arc wraps from the lap length to 0 at the line, so a jump of more than
-        half a lap is a crossing. A backward one (jitter on the line, a reverse)
-        must be undone by a forward one before a crossing counts, as f110_env does.
+        The MPC's arc is unwrapped (it counts on past the lap length), so it is
+        taken within the lap: that wraps from the lap length to 0 at the line,
+        and a jump of more than half a lap is a crossing. A backward one (jitter
+        on the line, a reverse) must be undone by a forward one before a crossing
+        counts, as f110_env does.
         """
         if not self._warm or arc is None or not math.isfinite(arc):
             return
+        lap = self._reference.length
+        arc = arc % lap
         prev, self._prev_arc = self._prev_arc, arc
-        half_lap = 0.5 * self._reference.length
+        half_lap = 0.5 * lap
         if prev is not None and prev - arc > half_lap:
             if self._wrap_debt:
                 self._wrap_debt -= 1

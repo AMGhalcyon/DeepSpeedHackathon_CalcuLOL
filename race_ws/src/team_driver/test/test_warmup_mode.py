@@ -41,12 +41,17 @@ def _arc(path):
     return np.concatenate([[0.0], np.cumsum(seg)])
 
 
+OFF = dict(warmup_crossings=0)
+
+
 class OffIsTheSub9CarTest(unittest.TestCase):
-    def test_the_default_is_off(self):
-        self.assertEqual(driver_core.DriverConfig().warmup_crossings, 0)
+    def test_the_pinned_default_is_the_whole_warm_up_lap_at_0p75(self):
+        cfg = driver_core.DriverConfig()
+        self.assertEqual((cfg.warmup_crossings, cfg.warmup_end_s, cfg.warmup_sector_scale,
+                          cfg.warmup_accel_scale), (1, 71.0, (0.0, 71.0, 0.75), 1.0))
 
     def test_off_tracks_the_race_profile_from_the_start(self):
-        core = _core()
+        core = _core(**OFF)
         cfg = core.cfg
         expected = sp.speed_profile(
             core.reference_path, a_lat_max=cfg.a_lat_max, lock_margin=cfg.lock_margin,
@@ -58,7 +63,7 @@ class OffIsTheSub9CarTest(unittest.TestCase):
         self.assertFalse(core.warming_up)
 
     def test_off_leaves_the_acceleration_bounds_alone(self):
-        core = _core()
+        core = _core(**OFF)
         self.assertEqual(core.accel_limit, core.cfg.accel_limit)
         p = core.mpc_controller.vehicle_model.params
         self.assertEqual(core.mpc_controller.control_max[1], p.a_max)
@@ -136,8 +141,20 @@ class CrossingTest(unittest.TestCase):
         self.assertTrue(np.all(core.reference_speeds <= core.race_speeds))
         self.assertLess(core.accel_limit, core.cfg.accel_limit)
 
+    def test_the_mpcs_unwrapped_arc_counts_its_crossings(self):
+        # MPCController.arc_position keeps counting past the lap length (71 -> 148 m
+        # over the out lap and warm-up lap); only its position within the lap wraps.
+        core = _core(**{**WARM, 'warmup_crossings': 2})
+        L = core._reference.length
+        self._feed(core, [71.0, L - 0.2, L + 0.1, L + 30.0, L + 60.5])
+        self.assertTrue(core.warming_up)        # one crossing so far
+        self._feed(core, [2 * L - 0.1, 2 * L + 0.2, 2 * L + 30.0, 2 * L + 59.9])
+        self.assertTrue(core.warming_up)        # two crossings, not yet at s 60
+        core._note_arc(2 * L + 60.1)
+        self.assertFalse(core.warming_up)
+
     def test_off_ignores_the_arc(self):
-        core = _core()
+        core = _core(**OFF)
         self._feed(core, [71.0, 74.0, 0.2, 30.0, 60.1])
         self.assertFalse(core.warming_up)
 
