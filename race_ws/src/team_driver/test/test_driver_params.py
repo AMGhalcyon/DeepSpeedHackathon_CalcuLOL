@@ -246,8 +246,8 @@ class Sub9TunedProfileTests(unittest.TestCase):
 PHASE2_TUNED = {'a_brake_max': 9.0, 'gg_exponent': 5.0, 'curvature_smooth': 21,
                 'sector_scale': [43.2, 47.2, 0.85, 3.1, 7.1, 0.95, 8.1, 21.3, 1.2,
                                  28.3, 43.2, 1.11, 49.2, 57.2, 1.11, 57.2, 74.4, 1.2],
-                'warmup_crossings': 1, 'warmup_end_s': 71.2,
-                'warmup_sector_scale': [0.0, 71.2, 0.75]}
+                'warmup_crossings': 1, 'warmup_end_s': 56.0,
+                'warmup_sector_scale': [0.0, 56.0, 0.35], 'warmup_accel_scale': 0.5}
 
 
 class Phase2TunedProfileTests(unittest.TestCase):

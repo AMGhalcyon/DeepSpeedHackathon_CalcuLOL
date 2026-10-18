@@ -93,12 +93,13 @@ driver:
     # warmup_end_s [m], the profile also takes warmup_sector_scale (scales in
     # (0, 1]) and every acceleration limit is scaled by warmup_accel_scale.
     # 0 crossings is off. Never-empty list: [0.0, 1.0, 1.0] is no sector.
-    # Pinned: the whole warm-up lap at 0.75 up to the last straight (s 71), after
-    # judged warm-up hits under an RTF spike; timed laps cost +0.01 s on lap 1 only.
+    # Pinned: the warm-up lap at 0.35 of the budget and half the acceleration up to
+    # the last corner's exit (s 56), against judged blind spells early in a run
+    # (driver_core.DriverConfig has the why). Warm-up 12.5 s; timed laps unchanged.
     warmup_crossings: 1
-    warmup_end_s: 71.2
-    warmup_sector_scale: [0.0, 71.2, 0.75]
-    warmup_accel_scale: 1.0
+    warmup_end_s: 56.0
+    warmup_sector_scale: [0.0, 56.0, 0.35]
+    warmup_accel_scale: 0.5
     # Back off a wall the car is pinned against (phase-2 judged r1: pinned at full
     # lock and full throttle after one hit, 11 collisions, DQ). Pinned = under 1.0 m/s
     # while asking to move, for unstick_after [s]; then reverse straight at

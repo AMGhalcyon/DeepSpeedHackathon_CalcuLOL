@@ -501,8 +501,11 @@ class TestDriverCoreReference(unittest.TestCase):
 
     def test_sector_scale_slows_the_profile_only_inside_its_sector(self):
         import speed_profile as sp
-        base, _ = self._core(a_lat_max=8.0, sector_scale=(0.0, 1.0, 1.0))  # sectors off
-        backed_off, _ = self._core(a_lat_max=8.0, sector_scale=(30.0, 36.0, 0.5))
+        # Warm-up off: its own sector would undercut these on the reference speeds.
+        base, _ = self._core(a_lat_max=8.0, sector_scale=(0.0, 1.0, 1.0),  # sectors off
+                             warmup_crossings=0)
+        backed_off, _ = self._core(a_lat_max=8.0, sector_scale=(30.0, 36.0, 0.5),
+                                   warmup_crossings=0)
         path = base.reference_path
         s = np.concatenate([[0.0], np.cumsum(sp.segment_lengths(path, True)[:-1])])
         corner = (s >= 32.0) & (s < 35.0)
@@ -517,7 +520,8 @@ class TestDriverCoreReference(unittest.TestCase):
         # land on the wrong corners, so the whole lap gets the most cautious budget.
         import speed_profile as sp
         core, log = self._core(reference='centerline', a_lat_max=10.0,
-                               sector_scale=(30.0, 36.0, 0.8, 38.0, 43.0, 0.5))
+                               sector_scale=(30.0, 36.0, 0.8, 38.0, 43.0, 0.5),
+                               warmup_crossings=0)
         cfg = core.cfg
         uniform = sp.speed_profile(core.reference_path, a_lat_max=5.0, lock_margin=0.95,
                                    a_accel_max=9.51, a_brake_max=cfg.a_brake_max,

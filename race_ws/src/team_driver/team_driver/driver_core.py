@@ -151,13 +151,16 @@ class DriverConfig:
     # `warmup_sector_scale` (scales in (0, 1]: the warm-up only backs off), and
     # every acceleration limit -- the profile's, the MPC's, the conditioner's -- is
     # scaled by `warmup_accel_scale`. 0 crossings is off: the race car from the grid.
-    # Pinned: the whole warm-up lap at 0.75 of the budget up to the last straight
-    # (s 71.2 on the phase-2 line; warm-up 9.29 s, timed 7.92 s). At a27 on the
-    # previous line (s 71) it was judged 10/10 clean, warm-ups included.
+    # Pinned: the warm-up lap at 0.35 of the budget and half the acceleration, up to
+    # the last corner's exit (s 56): the car is back at v_max well before the line.
+    # The judged blind spells -- the sim running ~1 s on one command -- come early in
+    # a run (judged batches C-F: at launch and ~3 s in; 0 in 290+ timed laps), and a
+    # slow car drifts less and hits softer when one lands. Harness: warm-up 12.5 s
+    # (was 9.3 s at 0.75 to s 71.2), timed laps unchanged.
     warmup_crossings: int = 1
-    warmup_end_s: float = 71.2
-    warmup_sector_scale: tuple[float, ...] = (0.0, 71.2, 0.75)
-    warmup_accel_scale: float = 1.0
+    warmup_end_s: float = 56.0
+    warmup_sector_scale: tuple[float, ...] = (0.0, 56.0, 0.35)
+    warmup_accel_scale: float = 0.5
     # Back off a wall the car is pinned against. The judged sim pins a car that
     # pushes into a wall: phase-2 r1 sat at v ~0 at full lock and full throttle
     # forward for 4 s after one hit (11 collisions, DQ), because nothing here ever
@@ -297,6 +300,18 @@ LATCH_RTF_MAX = 10.0
 # r7-r9: 8-11 collisions each, unstick fired once at 0.3); racing, it is never under 4.
 UNSTICK_SPEED = 1.0
 UNSTICK_PUSH = 0.05             # [m/s] a /drive speed above this is asking to move
+# Backing straight off left the nose at the wall, and the driver's full lock put it
+# back on (judged G-r1: 15 reverses, 11 collisions, DQ). So the reverse counter-steers
+# -- wheels opposite to the turn the driver asked for, which swings the nose that
+# way -- and a car pinned again within UNSTICK_REPEAT_S backs off longer each time.
+UNSTICK_COUNTER_MIN = 0.05      # [rad] a smaller last steer reverses straight
+UNSTICK_REPEAT_S = 3.0          # [s] plant time; a pin this soon after a reverse repeats it
+UNSTICK_ESCALATE = 0.5          # each repeat adds this fraction of unstick_reverse_s
+UNSTICK_REVERSE_MAX_S = 1.5     # [s] the longest reverse
+# Unstick arms once the car has driven past this since the grid: before the sim
+# applies the first commands the car sits still while asking to move, which read
+# as pinned and reversed it off the grid (judged 20261018T003118Z r7, no contact).
+UNSTICK_ARM_SPEED = 2.0         # [m/s]
 # [m/s] Where the gap-follower heads when there is no reference to track: the
 # old v_max it was tuned at, not today's racing cap.
 REACTIVE_SPEED = 3.0
@@ -651,6 +666,10 @@ class DriverCore:
         # and until when it reverses off the wall; None when neither.
         self._stuck_since = None
         self._reverse_until = None
+        self._reverse_cmd = None
+        self._pins = 0                  # reverses in a row, each within UNSTICK_REPEAT_S
+        self._reverse_ended = None      # plant time the last reverse ended
+        self._unstick_armed = False     # driven past UNSTICK_ARM_SPEED since the grid
 
         self._load_reference_path()
 
@@ -1032,26 +1051,36 @@ class DriverCore:
         return self._last_planned
 
     def _reset_unstick(self) -> None:
+        """Forget every pin and reverse (a sim reset: back on the grid)."""
         self._stuck_since = None
         self._reverse_until = None
+        self._reverse_cmd = None
+        self._pins = 0
+        self._reverse_ended = None
+        self._unstick_armed = False
 
     def _unstick(self) -> Optional[DriveCommand]:
-        """Reverse straight off a wall the car is pinned against, or None to drive on.
+        """Reverse off a wall the car is pinned against, or None to drive on.
 
         Pinned: slower than UNSTICK_SPEED while the last command asked to move,
         for `unstick_after` of plant time. The launch from the grid passes
-        UNSTICK_SPEED within ~0.1 s, and a corner is never under 4 m/s.
+        UNSTICK_SPEED within ~0.1 s, and a corner is never under 4 m/s. The
+        reverse counter-steers the last forward steer, and grows on repeats
+        (UNSTICK_* constants).
         """
         cfg = self.cfg
         if cfg.unstick_after <= 0.0 or self.t_odom is None:
             return None
         t = self.t_odom
-        reverse = DriveCommand(0.0, -cfg.unstick_speed, 0.0)
         if self._reverse_until is not None:
             if t < self._reverse_until:
-                return reverse
-            self._reset_unstick()
-        if (not math.isfinite(self.speed) or abs(self.speed) >= UNSTICK_SPEED
+                return self._reverse_cmd
+            self._reverse_until = None
+            self._reverse_ended = t
+        if math.isfinite(self.speed) and abs(self.speed) >= UNSTICK_ARM_SPEED:
+            self._unstick_armed = True
+        if (not self._unstick_armed or not math.isfinite(self.speed)
+                or abs(self.speed) >= UNSTICK_SPEED
                 or self._last_cmd.speed <= UNSTICK_PUSH):
             self._stuck_since = None
             return None
@@ -1059,10 +1088,19 @@ class DriverCore:
             self._stuck_since = t
         if t - self._stuck_since < cfg.unstick_after:
             return None
-        self._reverse_until = t + cfg.unstick_reverse_s
-        self.log.warn(f'Pinned at {self.position}: reversing {cfg.unstick_reverse_s:.1f} s '
-                      f'at {cfg.unstick_speed:.1f} m/s')
-        return reverse
+        self._stuck_since = None
+        repeat = self._reverse_ended is not None and t - self._reverse_ended < UNSTICK_REPEAT_S
+        self._pins = self._pins + 1 if repeat else 1
+        reverse_s = min(cfg.unstick_reverse_s * (1.0 + UNSTICK_ESCALATE * (self._pins - 1)),
+                        UNSTICK_REVERSE_MAX_S)
+        want = self._last_cmd.steering_angle
+        steer = (-math.copysign(self.steer_limit, want)
+                 if math.isfinite(want) and abs(want) >= UNSTICK_COUNTER_MIN else 0.0)
+        self._reverse_cmd = DriveCommand(steer, -cfg.unstick_speed, 0.0)
+        self._reverse_until = t + reverse_s
+        self.log.warn(f'Pinned at {self.position}: reversing {reverse_s:.1f} s at '
+                      f'{cfg.unstick_speed:.1f} m/s, steer {steer:+.2f} (pin {self._pins})')
+        return self._reverse_cmd
 
     def _measured_state(self):
         """(x, y, yaw, v, beta, wheel, yaw_rate) as measured, made safe to replay.

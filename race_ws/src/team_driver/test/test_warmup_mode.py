@@ -45,10 +45,10 @@ OFF = dict(warmup_crossings=0)
 
 
 class OffIsTheSub9CarTest(unittest.TestCase):
-    def test_the_pinned_default_is_the_whole_warm_up_lap_at_0p75(self):
+    def test_the_pinned_default_is_a_slow_warm_up_to_the_last_corner(self):
         cfg = driver_core.DriverConfig()
         self.assertEqual((cfg.warmup_crossings, cfg.warmup_end_s, cfg.warmup_sector_scale,
-                          cfg.warmup_accel_scale), (1, 71.2, (0.0, 71.2, 0.75), 1.0))
+                          cfg.warmup_accel_scale), (1, 56.0, (0.0, 56.0, 0.35), 0.5))
 
     def test_off_tracks_the_race_profile_from_the_start(self):
         core = _core(**OFF)
