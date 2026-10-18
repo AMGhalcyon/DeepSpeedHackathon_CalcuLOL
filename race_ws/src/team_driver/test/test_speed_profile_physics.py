@@ -133,12 +133,14 @@ class TestOffIsToday(unittest.TestCase):
                     sp.speed_profile(path, **JUDGED, a_lat_max=20.0))
 
     def test_the_shipped_floor_is_the_pinned_config(self):
-        # The driver's defaults (sub-10 Step 4) on the CSV they were tuned to.
+        # The driver's defaults (sub-9 phase 2) on the CSV they were tuned to.
         path = lap_floor.load_path(RACELINE_CSV)
         cfg = driver_core.DriverConfig()
         floor = _floor(path, cfg.a_lat_max, sp.sector_triples(cfg.sector_scale),
-                       gg_brake=cfg.gg_brake, gg_floor=cfg.gg_floor)
-        self.assertAlmostEqual(floor, 9.848, delta=FLOOR_TOLERANCE)
+                       gg_brake=cfg.gg_brake, gg_floor=cfg.gg_floor, v_max=cfg.v_max,
+                       a_brake_max=cfg.a_brake_max, gg_exponent=cfg.gg_exponent,
+                       curvature_smooth=cfg.curvature_smooth)
+        self.assertAlmostEqual(floor, 8.056, delta=FLOOR_TOLERANCE)
 
 
 class TestGgBrakePass(unittest.TestCase):
@@ -227,7 +229,8 @@ class TestStep1Floors(unittest.TestCase):
     """The floors on config/icra26_raceline.csv, brake 6, g-g on.
 
     Step 1 priced these on the a18-refined line (a22 9.771, a22 + kink 9.813, a21
-    9.908); Step 4 re-refined the line at the g-g a22 profile, which is these numbers.
+    9.908); sub-10 Step 4 re-refined it at the g-g a22 profile (9.613, 9.654, 9.780).
+    These are the sub-9 phase-2 line, refined at the a27 shape-U profile instead.
     """
 
     @classmethod
@@ -235,20 +238,16 @@ class TestStep1Floors(unittest.TestCase):
         cls.path = lap_floor.load_path(RACELINE_CSV)
 
     def test_a22_uniform(self):
-        self.assertAlmostEqual(_floor(self.path, 22.0, gg_brake=True), 9.613,
+        self.assertAlmostEqual(_floor(self.path, 22.0, gg_brake=True), 9.908,
                                delta=FLOOR_TOLERANCE)
 
     def test_a22_with_the_chicane_exit_sector(self):
-        self.assertAlmostEqual(_floor(self.path, 22.0, KINK, gg_brake=True), 9.654,
+        self.assertAlmostEqual(_floor(self.path, 22.0, KINK, gg_brake=True), 9.937,
                                delta=FLOOR_TOLERANCE)
 
     def test_a21_uniform(self):
-        self.assertAlmostEqual(_floor(self.path, 21.0, gg_brake=True), 9.780,
+        self.assertAlmostEqual(_floor(self.path, 21.0, gg_brake=True), 10.060,
                                delta=FLOOR_TOLERANCE)
-
-    def test_a_sub_10_judged_floor_is_within_reach(self):
-        # Judged adds ~0.06-0.10 s to the floor; sub-10 needs a floor <= ~9.85.
-        self.assertLessEqual(_floor(self.path, 22.0, KINK, gg_brake=True), 9.85)
 
 
 class TestLapFloorOption(unittest.TestCase):
@@ -258,8 +257,8 @@ class TestLapFloorOption(unittest.TestCase):
         kw = dict(lock_margin=0.95, v_max=10.0, a_accel_max=9.51, a_brake_max=6.0)
         plain = lap_floor.floor_table(path, [22.0], **kw)[0].lap_time
         gg = lap_floor.floor_table(path, [22.0], gg_brake=True, **kw)[0].lap_time
-        self.assertAlmostEqual(plain, 9.366, delta=FLOOR_TOLERANCE)
-        self.assertAlmostEqual(gg, 9.613, delta=FLOOR_TOLERANCE)
+        self.assertAlmostEqual(plain, 9.632, delta=FLOOR_TOLERANCE)
+        self.assertAlmostEqual(gg, 9.908, delta=FLOOR_TOLERANCE)
 
     def test_the_cli_has_a_gg_flag(self):
         import contextlib
@@ -268,7 +267,7 @@ class TestLapFloorOption(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             lap_floor.main(['--path', RACELINE_CSV, '--a-lat', '22', '--v-max', '10',
                             '--a-brake', '6', '--gg'])
-        self.assertIn('9.61', out.getvalue())
+        self.assertIn('9.91', out.getvalue())
 
 
 class TestHarnessOverride(unittest.TestCase):

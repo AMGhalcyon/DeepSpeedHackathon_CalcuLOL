@@ -490,6 +490,25 @@ class LatchClockTest(unittest.TestCase):
         clock.update(0.025, 100.0)        # no wall time passed
         self.assertAlmostEqual(clock.rtf, 2.0, places=6)
 
+    def test_the_first_clock_sync_is_not_learnt_as_the_rtf(self):
+        # Judged launches: the node's clock jumps 1.02 s in 3 ms of wall when the
+        # first /clock lands. Learnt, that was RTF 340 and latches ~0.6 s late.
+        clock = driver_core.LatchClock()
+        clock.update(0.0, 10.000)
+        clock.update(1.02, 10.003)
+        self.assertIsNone(clock.rtf)
+        for i in range(1, 6):
+            clock.update(1.02 + i * 0.055, 10.003 + i * 0.025)
+        self.assertAlmostEqual(clock.rtf, 2.2, places=6)
+        self.assertAlmostEqual(clock.latch_time(2.0, 0.003), 2.0066, places=6)
+
+    def test_a_jump_mid_run_leaves_the_learnt_rtf(self):
+        clock = driver_core.LatchClock()
+        for i in range(200):
+            clock.update(i * 0.025, i * 0.025 / 2.0)
+        clock.update(200 * 0.025 + 0.99, 200 * 0.025 / 2.0 + 0.003)
+        self.assertAlmostEqual(clock.rtf, 2.0, places=6)
+
 
 # ----------------------------------------------------------------------
 # The harness measures the estimator against the plant's own wheel

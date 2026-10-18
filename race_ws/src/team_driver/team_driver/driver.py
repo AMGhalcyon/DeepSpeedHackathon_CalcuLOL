@@ -36,6 +36,11 @@ from .driver_core import DriverCore, LatchClock
 from .mpc_controller import MPCController
 
 DT_REPORT_PERIOD = 5.0   # [s] how often to log dt_measured statistics
+# A control step this far (sim time) after the last, or this long (wall time)
+# itself, is logged with the age of the data it planned from. Judged runs hit a
+# 75 ms gap early in 4 of 10 runs, and both first-lap hits followed one.
+SLOW_GAP_S = 0.06
+SLOW_STEP_S = 0.02
 
 
 def _stamp_s(stamp):
@@ -94,6 +99,7 @@ class Driver(Node):
         self._marker_divisor = 0
         self._last_dt_report = self.get_clock().now()
         self._latch_clock = LatchClock()
+        self._last_step = None      # (sim, wall) of the last control step
 
         # A regular hold period is what mpc.dt assumes. With use_sim_time this
         # is 25 ms of plant time; on the wall clock it would drift with RTF.
@@ -149,7 +155,26 @@ class Driver(Node):
         self._marker_divisor = (self._marker_divisor + 1) % 10
         if self._marker_divisor == 0:
             self.publish_marker(cmd.steering_angle)
+        self._report_slow_step(now_s, wall0, t)
         self._report_dt()
+
+    def _report_slow_step(self, now_s, wall0, t_scan):
+        """One line for a step late (sim) or long (wall), with its data's ages."""
+        busy = time.perf_counter() - wall0
+        last, self._last_step = self._last_step, (now_s, wall0)
+        if last is None:
+            return
+        gap_sim, gap_wall = now_s - last[0], wall0 - last[1]
+        if gap_sim <= SLOW_GAP_S and busy <= SLOW_STEP_S:
+            return
+        t_odom = self.core.t_odom
+
+        def age(t):
+            return f'{(now_s - t) * 1e3:.0f}' if t is not None else 'none'
+        self.get_logger().warn(
+            f'slow step: gap {gap_sim * 1e3:.0f} ms sim / {gap_wall * 1e3:.0f} ms wall, '
+            f'step {busy * 1e3:.1f} ms wall, scan age {age(t_scan)} ms, '
+            f'odom age {age(t_odom)} ms, v {self.core.speed:.2f}')
 
     def _report_dt(self):
         now = self.get_clock().now()

@@ -371,7 +371,8 @@ class SpeedCapTest(unittest.TestCase):
 
     def test_the_cap_never_asks_for_less_than_crawl_or_more_than_v_max(self):
         self.assertEqual(self._cap(np.zeros(181)), CFG.crawl_speed)
-        self.assertEqual(self._cap(np.full(181, 8.0)), CFG.v_max)
+        # At the scan's 8 m reach the braking bound, not v_max, may be the lower one.
+        self.assertLessEqual(self._cap(np.full(181, 8.0)), CFG.v_max)
 
     def test_the_cap_is_continuous_in_clearance(self):
         caps = [self._cap(_wall(d)) for d in np.arange(0.0, 8.0, 0.01)]
@@ -389,8 +390,10 @@ class SpeedCapTest(unittest.TestCase):
     def test_the_condition_step_brakes_for_a_cap_past_the_comfort_clamp(self):
         core, _ = _core()
         core.speed = 2.0
-        cmd = core._condition(0.0, 3.0, DT, speed_cap=1.8)
-        self.assertAlmostEqual(cmd.speed, LOOP.command(2.0, (1.8 - 2.0) / DT, DT), places=12)
+        # A cap that needs braking between the comfort clamp and the plant's limit.
+        cap = 2.0 - 0.5 * (CFG.a_brake_max + VP.a_max) * DT
+        cmd = core._condition(0.0, 3.0, DT, speed_cap=cap)
+        self.assertAlmostEqual(cmd.speed, LOOP.command(2.0, (cap - 2.0) / DT, DT), places=12)
         self.assertLess(cmd.speed, LOOP.command(2.0, -CFG.a_brake_max, DT))
 
     def test_a_cap_the_car_will_not_reach_does_not_bind(self):

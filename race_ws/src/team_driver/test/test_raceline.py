@@ -325,7 +325,7 @@ class TestIcra26Reweighted(unittest.TestCase):
 
 @unittest.skipUnless(os.path.exists(MAP_YAML), 'maps/icra26.yaml not found')
 class TestIcra26MinTime(unittest.TestCase):
-    """The shipped line: the reweighted QP line, refined for lap time (~60 s)."""
+    """The shipped line: the reweighted QP line, refined for lap time (~4 min)."""
 
     CACHE = os.path.join(_HERE, os.pardir, 'config', 'icra26_raceline.csv')
     # [s] of ideal lap at the profile it was refined for. 0.3 at the old a18 profile; the
@@ -501,8 +501,11 @@ class TestDriverCoreReference(unittest.TestCase):
 
     def test_sector_scale_slows_the_profile_only_inside_its_sector(self):
         import speed_profile as sp
-        base, _ = self._core(a_lat_max=8.0, sector_scale=(0.0, 1.0, 1.0))  # sectors off
-        backed_off, _ = self._core(a_lat_max=8.0, sector_scale=(30.0, 36.0, 0.5))
+        # Warm-up off: its own sector would undercut these on the reference speeds.
+        base, _ = self._core(a_lat_max=8.0, sector_scale=(0.0, 1.0, 1.0),  # sectors off
+                             warmup_crossings=0)
+        backed_off, _ = self._core(a_lat_max=8.0, sector_scale=(30.0, 36.0, 0.5),
+                                   warmup_crossings=0)
         path = base.reference_path
         s = np.concatenate([[0.0], np.cumsum(sp.segment_lengths(path, True)[:-1])])
         corner = (s >= 32.0) & (s < 35.0)
@@ -517,10 +520,14 @@ class TestDriverCoreReference(unittest.TestCase):
         # land on the wrong corners, so the whole lap gets the most cautious budget.
         import speed_profile as sp
         core, log = self._core(reference='centerline', a_lat_max=10.0,
-                               sector_scale=(30.0, 36.0, 0.8, 38.0, 43.0, 0.5))
+                               sector_scale=(30.0, 36.0, 0.8, 38.0, 43.0, 0.5),
+                               warmup_crossings=0)
+        cfg = core.cfg
         uniform = sp.speed_profile(core.reference_path, a_lat_max=5.0, lock_margin=0.95,
-                                   a_accel_max=9.51, a_brake_max=6.0, v_max=10.0,
-                                   gg_brake=core.cfg.gg_brake, gg_floor=core.cfg.gg_floor)
+                                   a_accel_max=9.51, a_brake_max=cfg.a_brake_max,
+                                   v_max=cfg.v_max, gg_brake=cfg.gg_brake,
+                                   gg_floor=cfg.gg_floor, gg_exponent=cfg.gg_exponent,
+                                   curvature_smooth=cfg.curvature_smooth)
         np.testing.assert_allclose(core.reference_speeds, uniform)
         self.assertIn('sector', log.text('warn'))
 
@@ -533,6 +540,23 @@ class TestDriverCoreReference(unittest.TestCase):
         patcher = mock.patch.object(rl, 'cached_method', return_value=rl.MIN_CURVATURE_METHOD)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_raised_sectors_are_not_raised_off_the_tuned_line(self):
+        # A margin above the CSV's rejects the offline line; the runtime build has
+        # other corners at those arcs, so no sector may raise the budget there.
+        raised = (8.0, 21.0, 1.2, 43.0, 47.0, 0.85)
+        core, log = self._core(raceline_margin=0.3, sector_scale=raised,
+                               warmup_crossings=0)
+        capped, _ = self._core(raceline_margin=0.3, sector_scale=(8.0, 21.0, 1.0,
+                                                                  43.0, 47.0, 0.85),
+                               warmup_crossings=0)
+        self.assertIn('tuned min-time line', log.text('warn'))
+        np.testing.assert_array_equal(core.reference_speeds, capped.reference_speeds)
+
+    def test_raised_sectors_stay_raised_on_the_tuned_line(self):
+        core, log = self._core(warmup_crossings=0)
+        self.assertNotIn('tuned min-time line', log.text('warn'))
+        self.assertIn('min-time', log.text('info'))
 
     def test_failed_build_falls_back_to_the_cached_csv(self):
         import driver_core
@@ -652,6 +676,41 @@ class TestCachedRaceline(unittest.TestCase):
         for bad in (-0.01, float('nan')):
             with self.subTest(margin=bad), self.assertRaises(ValueError):
                 driver_params.validate({**driver_params.DEFAULTS, 'raceline_margin': bad})
+
+
+class TestProfileJson(unittest.TestCase):
+    """`--refine --profile-json`: refine a candidate line at any profile, not only REFINE_PROFILE."""
+
+    def _load(self, text):
+        import tempfile
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as handle:
+            handle.write(text)
+        self.addCleanup(os.remove, handle.name)
+        return rl.load_profile_json(handle.name)
+
+    def test_a_profile_json_becomes_speed_profile_kwargs(self):
+        kw = self._load('{"a_lat_max": 27.0, "lock_margin": 0.95, "a_accel_max": 9.51, '
+                        '"a_brake_max": 6.0, "v_max": 12.0, "gg_brake": true, '
+                        '"sector_scale": [[43.0, 47.0, 0.85], [12, 18, 1.1]]}')
+        self.assertEqual(kw['sector_scale'], ((43.0, 47.0, 0.85), (12.0, 18.0, 1.1)))
+        path = np.column_stack([np.cos(np.linspace(0, 2 * np.pi, 200, endpoint=False)),
+                                np.sin(np.linspace(0, 2 * np.pi, 200, endpoint=False))]) * 5
+        self.assertEqual(len(sp.speed_profile(path, **kw)), 200)
+
+    def test_the_refine_profile_is_the_drivers_profile(self):
+        # The shipped line was refined at the profile the driver runs (its sectors
+        # aside: they are at the previous line's arcs, the driver's at this line's).
+        import driver_core
+        cfg = driver_core.DriverConfig()
+        for key in rl.PROFILE_KEYS - {'sector_scale'}:
+            with self.subTest(key=key):
+                self.assertEqual(rl.REFINE_PROFILE[key], getattr(cfg, key))
+
+    def test_an_unknown_key_or_a_bad_sector_is_refused(self):
+        for text in ('{"a_lat": 27.0}', '{"a_lat_max": 27.0, "sector_scale": [[1, 2, 3.0]]}',
+                     '[27.0]'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self._load(text)
 
 
 if __name__ == '__main__':

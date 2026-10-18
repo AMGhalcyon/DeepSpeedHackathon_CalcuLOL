@@ -177,7 +177,7 @@ class HarnessFlagsTest(unittest.TestCase):
 
     def test_a_malformed_sector_scale_is_rejected(self):
         self.assertRejected(['--driver', 'sector_scale=29,37'])
-        self.assertRejected(['--driver', 'sector_scale=29,37,1.5'])
+        self.assertRejected(['--driver', 'sector_scale=29,37,1.6'])
         self.assertRejected(['--driver', 'sector_scale=29,37,fast'])
 
     def test_an_unknown_driver_field_is_rejected(self):
