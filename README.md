@@ -1,3 +1,37 @@
+# CalcuLOL: an MPC driver for autonomous racing
+
+This is our entry for Track 1 of the NTU DeepSpeed Recruitment Hackathon 26/27. The task was to write the software that drives a 1/10-scale car around a circuit as fast as possible without hitting anything. Our final driver does a lap in about **8.04 s with no collisions**.
+
+Team CalcuLOL: Anish Gangavaram, Davis Lee and Myra Dwivedi. I wrote most of the driver (the MPC, the offline test harness, the racing line and speed profile, and the debugging and tuning that got the lap time down). Davis and Myra handled the submission write-up and checks.
+
+## How we got there
+
+We started with the simple approaches. Follow-the-Gap managed 30.4 s and Pure Pursuit got to 17.8 s, but both only react to where the car is right now. On this car that's the wrong question: commands take effect about 0.1 s late, the steering takes time to turn, and the car slides in corners. So we switched to model predictive control.
+
+Our first MPC was actually slower than Pure Pursuit (around 50 s, with crashes). The model didn't match the simulator. Once we matched the simulator's vehicle parameters, steering servo and speed controller, and built an offline harness that reproduced the judged timing, the lap time came down step by step: 18.0, 12.6, 11.1, 10.9, 9.9, 8.8 and finally 8.04 s.
+
+Most of the gains came from finding out *why* the car crashed rather than just turning the speed up. For example, almost every high-speed crash turned out to be the rear end stepping out under braking. The fix was to let the MPC take over braking instead of following a fixed speed profile.
+
+## What the driver does
+
+- Every 25 ms it predicts where the car will be when the next command actually takes effect, and plans from there.
+- A nonlinear MPC plans 0.5 s ahead, solved with SLSQP inside a 15 ms budget.
+- It follows a minimum-time racing line that is optimised offline and shipped as data.
+- The speed profile limits braking when the car is already using a lot of grip in a corner.
+- LiDAR is used for safety checks, and there's a recovery move if the car ends up against a wall.
+
+The code is in [`race_ws/src/team_driver/team_driver/`](race_ws/src/team_driver/team_driver/). The main files are `mpc_controller.py`, `driver_core.py`, `latch_predictor.py` and `vehicle_model.py`.
+
+For the full story, [HOW_IT_WORKS.md](HOW_IT_WORKS.md) walks through the whole driver, and [SUBMISSION.md](SUBMISSION.md) has the results and the evidence for each change.
+
+This is a copy of our team repo, [davislee23/DeepSpeedHackathon_CalcuLOL](https://github.com/davislee23/DeepSpeedHackathon_CalcuLOL). It's built on the simulator and template that the NTU DeepSpeed / ASME-NTU organisers provided, which is why their names appear in the contributor list. Their original challenge brief is below.
+
+---
+
+<details>
+<summary><b>Original hackathon brief (from the organisers)</b></summary>
+
+
 # RoboRacer Autonomous Racing — Track 1
 
 **NTU DeepSpeed Recruitment Hackathon 26/27**
@@ -165,3 +199,5 @@ counts. The short version:
 - You may email `ntu-deepspeed@e.ntu.edu.sg` for further inquiries if you cannot solve the issues after troubleshooting.
 
 Good luck. Go fast.
+
+</details>
