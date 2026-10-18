@@ -49,6 +49,9 @@ PASS_LAPS = 2                     # a wrapped pass needs two laps to settle
 GG_EXPONENT = 2.0                 # shape of the braking/cornering ellipse
 GG_ITERATIONS = 3                 # fixed-point passes: the share depends on the entry speed
 GG_FLOOR = 0.1                    # default share of the ellipse braking may always use
+# A sector may raise the slip budget by half at most: a corner that holds more
+# than the lap's budget, so the lap need not wait on its weakest corner.
+MAX_SECTOR_SCALE = 1.5
 
 WHEELBASE = _VP.lf + _VP.lr
 UNDERSTEER_GRADIENT = (1.0 / (_VP.mu * GRAVITY)) * (1.0 / _VP.C_Sf - 1.0 / _VP.C_Sr)
@@ -125,28 +128,41 @@ def check_gg_floor(floor: float) -> None:
         raise ValueError(f'gg_floor {floor!r} must be in (0, 1]')
 
 
-def gg_decel(v, kappa, budget, a_brake: float, floor: float):
+def check_gg_exponent(exponent: float) -> None:
+    """Raise ValueError unless `exponent` is a finite number > 0."""
+    if not (isinstance(exponent, (int, float)) and math.isfinite(exponent) and exponent > 0.0):
+        raise ValueError(f'gg_exponent {exponent!r} must be a finite number > 0')
+
+
+def check_curvature_smooth(smooth: int) -> None:
+    """Raise ValueError unless `smooth` is an odd whole number of points >= 1."""
+    if isinstance(smooth, bool) or not isinstance(smooth, int) or smooth < 1 or smooth % 2 == 0:
+        raise ValueError(f'curvature_smooth {smooth!r} must be an odd whole number >= 1')
+
+
+def gg_decel(v, kappa, budget, a_brake: float, floor: float, exponent: float = GG_EXPONENT):
     """[m/s^2] Braking left at speed `v` where the corner already uses its slip budget.
 
     The judged plant's yaw dynamics go unstable under braking (load transfer
     unloads the rear axle), so deceleration and cornering share one ellipse:
 
-        a = a_brake * max(floor, 1 - r^2)^(1/2),   r = min(v^2 kappa / budget, 1)
+        a = a_brake * max(floor, 1 - r^p)^(1/p),   r = min(v^2 kappa / budget, 1)
 
-    A straight keeps all of `a_brake`; a corner held at its budget keeps only
-    `sqrt(floor)` of it. Works on scalars and arrays.
+    with p = `exponent` (2: an ellipse; higher: squarer, more braking kept at
+    part of the budget). A straight keeps all of `a_brake`; a corner held at its
+    budget keeps only `floor^(1/p)` of it. Works on scalars and arrays.
     """
     r = np.minimum(np.asarray(v) ** 2 * np.abs(kappa) / budget, 1.0)
-    return a_brake * np.maximum(floor, 1.0 - r ** GG_EXPONENT) ** (1.0 / GG_EXPONENT)
+    return a_brake * np.maximum(floor, 1.0 - r ** exponent) ** (1.0 / exponent)
 
 
 def _gg_rate(v_next: float, ds: float, a_brake: float, kappa: float, budget: float,
-             floor: float) -> float:
+             floor: float, exponent: float) -> float:
     """[m/s^2] Braking into a point, from the share of the ellipse its entry speed uses."""
     a = a_brake
     for _ in range(GG_ITERATIONS):
         v_here = math.sqrt(v_next ** 2 + 2.0 * a * ds)
-        a = float(gg_decel(v_here, kappa, budget, a_brake, floor))
+        a = float(gg_decel(v_here, kappa, budget, a_brake, floor, exponent))
     return a
 
 
@@ -154,15 +170,17 @@ def _brake_pass(v: np.ndarray, ds: np.ndarray, a_brake: float, closed: bool,
                 gg: Optional[tuple] = None) -> None:
     """Lower `v` in place so each point can be braked to from the one before it.
 
-    `gg` is (kappa, budget, floor) per point to brake inside the ellipse of
-    `gg_decel`; None brakes at `a_brake` everywhere.
+    `gg` is (kappa, budget, floor[, exponent]) per point to brake inside the
+    ellipse of `gg_decel`; None brakes at `a_brake` everywhere.
     """
     n = len(v)
     first = n - 1 if closed else n - 2
+    exponent = GG_EXPONENT if gg is None or len(gg) < 4 else gg[3]
     for step in range(PASS_LAPS * n if closed else n - 1):
         i = (first - step) % n
         j = (i + 1) % n
-        a = a_brake if gg is None else _gg_rate(v[j], ds[i], a_brake, gg[0][i], gg[1][i], gg[2])
+        a = a_brake if gg is None else _gg_rate(v[j], ds[i], a_brake, gg[0][i], gg[1][i],
+                                                gg[2], exponent)
         v[i] = min(v[i], np.sqrt(v[j] ** 2 + 2.0 * a * ds[i]))
 
 
@@ -176,45 +194,52 @@ def _accel_pass(v: np.ndarray, ds: np.ndarray, a_accel_max: float, closed: bool)
         v[j] = min(v[j], reach)
 
 
-def _check_sector(s_start: float, s_end: float, scale: float) -> None:
-    if not (np.isfinite(s_start) and np.isfinite(s_end) and 0.0 < scale <= 1.0):
+def _check_sector(s_start: float, s_end: float, scale: float,
+                  max_scale: float = MAX_SECTOR_SCALE) -> None:
+    if not (np.isfinite(s_start) and np.isfinite(s_end) and 0.0 < scale <= max_scale):
         raise ValueError(f'sector ({s_start}, {s_end}, {scale}): bounds must be '
-                         'finite and the scale in (0, 1]')
+                         f'finite and the scale in (0, {max_scale}]')
 
 
-def sector_triples(flat: Sequence[float]) -> tuple[tuple[float, float, float], ...]:
+def sector_triples(flat: Sequence[float], max_scale: float = MAX_SECTOR_SCALE
+                   ) -> tuple[tuple[float, float, float], ...]:
     """A flat parameter list [s_start, s_end, scale, ...] as validated sectors.
 
     ROS parameters are flat lists of doubles, so the node stores sectors that way.
+    `max_scale` 1 admits only sectors that back off.
     """
     if len(flat) % 3:
         raise ValueError(f'sector_scale has {len(flat)} numbers; it needs whole '
                          '(s_start, s_end, scale) sectors')
     sectors = tuple(tuple(float(x) for x in flat[i:i + 3]) for i in range(0, len(flat), 3))
     for sector in sectors:
-        _check_sector(*sector)
+        _check_sector(*sector, max_scale=max_scale)
     return sectors
 
 
 def slip_budget(path: np.ndarray, a_lat_max: float,
                 sectors: Sequence[Sequence[float]] = (), closed: bool = True) -> np.ndarray:
-    """[m/s^2] The slip budget per waypoint: `a_lat_max`, lowered in sectors.
+    """[m/s^2] The slip budget per waypoint: `a_lat_max`, scaled in sectors.
 
     Each sector is (s_start, s_end, scale): waypoints whose arc length from
     waypoint 0 lies in [s_start, s_end) get `scale * a_lat_max`. A sector with
     s_start > s_end wraps through the start line. Where sectors overlap, the
-    lower scale wins. A scale outside (0, 1] is refused: sectors only back off.
+    lower scale wins, even over a raised one. A scale outside
+    (0, MAX_SECTOR_SCALE] is refused.
     """
     pts = np.asarray(path, dtype=np.float64)[:, :2]
     scale = np.ones(len(pts))
     if len(sectors):
         # Open: n-1 segments, so the last point's arc is the whole length.
         s = np.concatenate([[0.0], np.cumsum(segment_lengths(pts, closed))])[:len(pts)]
+        # inf until a sector covers the point, so a raised sector is not capped at 1.
+        scale = np.full(len(pts), np.inf)
         for s_start, s_end, c in sectors:
             _check_sector(s_start, s_end, c)
             inside = ((s >= s_start) & (s < s_end) if s_start <= s_end
                       else (s >= s_start) | (s < s_end))
             scale = np.where(inside, np.minimum(scale, c), scale)
+        scale = np.where(np.isinf(scale), 1.0, scale)
     return float(a_lat_max) * scale
 
 
@@ -223,7 +248,9 @@ def speed_profile(path: np.ndarray, *, a_lat_max: float, lock_margin: float,
                   kappa: Optional[np.ndarray] = None, closed: bool = True,
                   v_start: float = 0.0,
                   sector_scale: Sequence[Sequence[float]] = (),
-                  gg_brake: bool = False, gg_floor: float = GG_FLOOR) -> np.ndarray:
+                  gg_brake: bool = False, gg_floor: float = GG_FLOOR,
+                  gg_exponent: float = GG_EXPONENT,
+                  curvature_smooth: int = CURVATURE_SMOOTH) -> np.ndarray:
     """Speed per waypoint, shape (N,).
 
     Args:
@@ -241,14 +268,21 @@ def speed_profile(path: np.ndarray, *, a_lat_max: float, lock_margin: float,
         gg_brake: brake inside the ellipse of `gg_decel`, so the deceleration
             into a corner shrinks with the slip budget the corner already uses.
             Off reproduces the plain profile bit for bit.
-        gg_floor: braking never drops below `a_brake_max` * sqrt(gg_floor), in (0, 1].
+        gg_floor: braking never drops below `a_brake_max` * gg_floor^(1/gg_exponent),
+            in (0, 1].
+        gg_exponent: the shape of the `gg_decel` ellipse; 2 is the ellipse.
+        curvature_smooth: points in the curvature's moving average (odd), when
+            `kappa` is not given. The MPC's own curvature is not affected.
     """
     check_gg_floor(gg_floor)
+    check_gg_exponent(gg_exponent)
+    check_curvature_smooth(curvature_smooth)
     pts = np.asarray(path, dtype=np.float64)[:, :2]
     n = len(pts)
     if n < 3:
         return np.zeros(n)
-    k = closed_curvature(pts, closed=closed) if kappa is None else np.asarray(kappa, float)
+    k = (closed_curvature(pts, smooth=curvature_smooth, closed=closed) if kappa is None
+         else np.asarray(kappa, float))
     k = np.maximum(np.abs(k), KAPPA_FLOOR)
 
     budget = slip_budget(pts, a_lat_max, sector_scale, closed)
@@ -258,7 +292,8 @@ def speed_profile(path: np.ndarray, *, a_lat_max: float, lock_margin: float,
         v[0] = min(v[0], v_start)
 
     ds = segment_lengths(pts, closed)
-    _brake_pass(v, ds, a_brake_max, closed, (k, budget, gg_floor) if gg_brake else None)
+    _brake_pass(v, ds, a_brake_max, closed,
+                (k, budget, gg_floor, gg_exponent) if gg_brake else None)
     _accel_pass(v, ds, a_accel_max, closed)
     return v
 

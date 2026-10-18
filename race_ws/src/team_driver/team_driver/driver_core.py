@@ -31,7 +31,8 @@ try:
     from .mpc_controller import MPCController   # ROS / package import
     from .vehicle_model import F1TENTH_VEHICLE_PARAMETERS, SpeedLoop, VehicleModel
     from . import raceline
-    from .speed_profile import check_gg_floor, sector_triples, slip_budget
+    from .speed_profile import (check_curvature_smooth, check_gg_exponent, check_gg_floor,
+                                sector_triples, slip_budget)
     from .latch_predictor import (LATCH_TIME_TOL, LatchPredictor, Prediction,
                                   plant_servo_rate, servo_kp)
     from .longitudinal import (LIDAR_FORWARD, ClosedPath, bearing_lookahead,
@@ -41,7 +42,8 @@ except ImportError:
     from mpc_controller import MPCController    # standalone `python3 lap_sim.py`
     from vehicle_model import F1TENTH_VEHICLE_PARAMETERS, SpeedLoop, VehicleModel
     import raceline
-    from speed_profile import check_gg_floor, sector_triples, slip_budget
+    from speed_profile import (check_curvature_smooth, check_gg_exponent, check_gg_floor,
+                               sector_triples, slip_budget)
     from latch_predictor import (LATCH_TIME_TOL, LatchPredictor, Prediction,
                                  plant_servo_rate, servo_kp)
     from longitudinal import (LIDAR_FORWARD, ClosedPath, bearing_lookahead,
@@ -73,38 +75,103 @@ class DriverConfig:
 
     crawl_speed: float = 1.0        # [m/s] the emergency cap never asks for less
     max_range: float = 8.0          # [m] clip the scan here
-    v_max: float = 10.0             # [m/s] caps the profile and emergency bound; should not bind
+    # [m/s] Caps the profile and emergency bound. 12 binds only at the end of the
+    # longest straight (the plant's power limit tops out near 12.1); it is worth
+    # 0.14 s/lap at a_lat 25 over 10 (lap_floor), and nothing above 12.
+    v_max: float = 12.0
     # Speed profile (speed_profile.py). `a_lat_max` is a slip budget, not a grip
     # limit: the plant's tyres are linear, so rear slip is a_y / 56.1 rad.
-    # [m/s^2] Cornering budget: ~21 deg of rear slip, held lower in `sector_scale`.
-    # Sub-10 Step 4, on the min-time line refined at the g-g a22 profile with the
-    # g-g brake limit and the capped emergency corridor on: 21, one step under the
-    # fastest clean budget. 16/16 clean (fixed 5/7/12 ms x stale 5/9/14, 10 laps,
-    # 5 measured runs, centreline), best 9.82 s; 0 collisions in 24 runs under
-    # 12-job host load. a22 is clean on the same grid (9.71 s) but hit s 54 in 2 of
-    # 18 loaded runs, a23 on 15 of 16 grid runs.
-    a_lat_max: float = 21.0
+    # [m/s^2] Cornering budget: ~27 deg of rear slip, held lower in `sector_scale`.
+    # Sub-9 Step 2, with the MPC owning the braking (mpc_full_brake, profile_brake_cap
+    # 3, beta_limit 1.0), v_max 12, on the sub-10 min-time line: 27 is 8.79 s and clean
+    # on fixed 5/7/12 ms x stale 5/9/14, 10 laps, 5 measured runs, 24 runs under
+    # 12-job host load and the centreline (10.97 s). a28 at v_max 12 hit the chicane
+    # exit (s 45.4) on 1 of 3 cells; a30 on all. The old controller spun above 22.
+    a_lat_max: float = 27.0
     lock_margin: float = 0.95       # fraction of the steering lock the profile may use
     a_accel_max: float = 9.51       # [m/s^2] acceleration the profile plans (plant: 9.51)
     # [m/s^2] Braking the profile plans, and the most the conditioner passes on
     # from the MPC (plant: 9.51). The profile and emergency caps may brake harder.
-    a_brake_max: float = 6.0
-    # Where the slip budget is lowered: flat (s_start [m], s_end [m], scale) triples,
-    # s the arc length from the reference's first waypoint, scale in (0, 1].
+    # Sub-9 phase 2: 9 with gg_exponent 5 and curvature_smooth 21 (shape U) is
+    # 8.295 s and clean on a27's line; 9.5 with 6 / 25 crashed at s 54. Old car: 6.
+    a_brake_max: float = 9.0
+    # Let the MPC plan braking to a_brake_max, not its old -0.3 a_max floor. At
+    # that floor every budget above 22 spun under braking: the MPC sat saturated
+    # while the profile override braked -5 to -7.8 m/s^2 past it, a deceleration
+    # (and rear unloading) its prediction never saw (sub-9 Step 1). False is the old car.
+    mpc_full_brake: bool = True
+    # [m/s^2] Most braking the profile override may ask beyond the MPC's own. 9.51
+    # (the plant's limit) is no cap, the old car; 0 leaves the braking to the MPC,
+    # and the profile then only stops acceleration above it. The emergency cap is
+    # not held by this. With the MPC braking: 3 is clean to a27; 6 still spins a23;
+    # 0 and 1.5 are clean to a26 but 0 loses the chicane exit (s 45.4) from a27.
+    profile_brake_cap: float = 3.0
+    # [rad] Measured sideslip past this reads 0 to the MPC (reversing or a spin,
+    # not a slip the tyre model describes). 0.5 is the ST model's state bound and
+    # the old car; from a25 the car slides past it in a corner, the MPC loses its
+    # slip state and the emergency cap ends a spin (s~16). 1.0 keeps it.
+    beta_limit: float = 1.0
+    # Where the slip budget is scaled: flat (s_start [m], s_end [m], scale) triples,
+    # s the arc length from the reference's first waypoint, scale in (0, 1.5].
     # Flat because ROS parameters are flat lists (speed_profile.sector_triples);
     # never empty, or rclpy types it as a byte array: (0, 1, 1) turns it off.
-    # Sub-10 Step 4, on the re-refined min-time line: 43-47 @0.85 for the chicane-exit
-    # tracking transient (s~45.3 collides without it), 3-7 @0.95 for the first corner
-    # (s~4.8-5.2 collided on the new line). The older sectors are gone: the g-g brake
-    # limit covers the braking-yaw sites they patched. Off the raceline, see
-    # _slip_budget_for.
-    sector_scale: tuple[float, ...] = (43.0, 47.0, 0.85, 3.0, 7.0, 0.95)
+    # Scales above 1 raise the budget there (up to speed_profile.MAX_SECTOR_SCALE).
+    # Sub-10 Step 4: 43-47 @0.85 for the chicane-exit tracking transient (s~45.3
+    # collides without it), 3-7 @0.95 for the first corner (s~4.8-5.2). Sub-9 phase 2,
+    # on the line re-refined at this profile (raceline.REFINE_PROFILE; arcs shifted
+    # 0.1-0.2 m to its length): the corners raised one notch below each harness
+    # cliff -- 8-21 and 57-74 @1.2, 28-43 and 49-57 @1.11 (49-57 @1.15 hits s 54;
+    # 28-43 @1.3 hits s 35; 8-21 @1.35 hits; 21-28 above 1.0 hits s 23.2). 28-43 @1.2
+    # was clean on the full harness grid (7.92 s) but hit s 30-36 in 3 of 10 judged
+    # runs (judged batch 20261017T215601Z), so judged timing puts that cliff near 1.2.
+    # At 1.11: 7.97 s harness. Off the raceline, see _slip_budget_for.
+    sector_scale: tuple[float, ...] = (43.2, 47.2, 0.85, 3.1, 7.1, 0.95, 8.1, 21.3, 1.2,
+                                       28.3, 43.2, 1.11, 49.2, 57.2, 1.11, 57.2, 74.4, 1.2)
     # Combined-accel limit on the profile's braking (speed_profile.gg_decel): the
     # deceleration taken into a corner shrinks with the share of the slip budget the
     # corner already uses, because braking unloads the rear axle and the plant's yaw
     # goes unstable (sub-10 Step 1). Off reproduces the plain profile bit for bit.
     gg_brake: bool = True
-    gg_floor: float = 0.1           # braking never drops below a_brake_max*sqrt(gg_floor), in (0, 1]
+    gg_floor: float = 0.1           # braking never drops below a_brake_max*gg_floor^(1/p), in (0, 1]
+    # Shape of that ellipse, 1 - r^p: 2 is the ellipse; higher keeps more braking at
+    # part of the budget (3: 8.929 -> 8.813 s ideal on the a27 profile). Pinned 5
+    # with curvature_smooth 21 and a_brake_max 9 (shape U, above). Old car: 2.
+    gg_exponent: float = 5.0
+    # [points] The profile's curvature moving average (odd); the MPC's own is not
+    # touched. Wider rounds the curvature peaks (13: 8.809 s ideal; 5: 9.201 s).
+    # Pinned 21 (shape U). Old car: 9.
+    curvature_smooth: int = 21
+    # Cautious out lap and warm-up lap. Neither is timed, but their collisions count
+    # toward the disqualification (docs/06-rules.md, rule 18). Judged warm-ups hit
+    # in 2 of 13 sub-9 runs (3 hits; 0 of 130 timed laps), at s 56 and 65 in one run, while
+    # the driver logged an RTF spike (2.7 -> 6.85): host load early in a run. The
+    # harness, whose delays are constant, never hits (holds to 105 ms, state 500 ms
+    # stale). Until the car has crossed the start line `warmup_crossings` times and
+    # then reached arc `warmup_end_s` [m], the profile also takes
+    # `warmup_sector_scale` (scales in (0, 1]: the warm-up only backs off), and
+    # every acceleration limit -- the profile's, the MPC's, the conditioner's -- is
+    # scaled by `warmup_accel_scale`. 0 crossings is off: the race car from the grid.
+    # Pinned: the warm-up lap at 0.35 of the budget and half the acceleration, up to
+    # the last corner's exit (s 56): the car is back at v_max well before the line.
+    # The judged blind spells -- the sim running ~1 s on one command -- come early in
+    # a run (judged batches C-F: at launch and ~3 s in; 0 in 290+ timed laps), and a
+    # slow car drifts less and hits softer when one lands. Harness: warm-up 12.5 s
+    # (was 9.3 s at 0.75 to s 71.2), timed laps unchanged.
+    warmup_crossings: int = 1
+    warmup_end_s: float = 56.0
+    warmup_sector_scale: tuple[float, ...] = (0.0, 56.0, 0.35)
+    warmup_accel_scale: float = 0.5
+    # Back off a wall the car is pinned against. The judged sim pins a car that
+    # pushes into a wall: phase-2 r1 sat at v ~0 at full lock and full throttle
+    # forward for 4 s after one hit (11 collisions, DQ), because nothing here ever
+    # asks for reverse. Stuck = under UNSTICK_SPEED while the last command asked to
+    # move, for `unstick_after` [s], once the car has driven past UNSTICK_ARM_SPEED;
+    # then reverse at `unstick_speed` [m/s] for `unstick_reverse_s` [s], counter-
+    # steered (full lock against the last forward steer), longer on each repeat
+    # (UNSTICK_* constants), and drive again. 0 is off.
+    unstick_after: float = 0.5
+    unstick_reverse_s: float = 0.6
+    unstick_speed: float = 1.0
     # [m/s^2] Braking the emergency cap assumes, and the rate a coast sheds speed.
     a_emergency: float = 7.0
     # Continue the emergency cap's corridor past the MPC's 0.5 s plan along the
@@ -139,6 +206,34 @@ class DriverConfig:
         # the reference loader, would quietly drop the car to the reactive controller.
         sector_triples(self.sector_scale)
         check_gg_floor(self.gg_floor)
+        check_gg_exponent(self.gg_exponent)
+        check_curvature_smooth(self.curvature_smooth)
+        check_warmup(self.warmup_crossings, self.warmup_end_s, self.warmup_sector_scale,
+                     self.warmup_accel_scale)
+        check_unstick(self.unstick_after, self.unstick_reverse_s, self.unstick_speed)
+
+
+def check_unstick(after, reverse_s, speed) -> None:
+    """Raise ValueError unless the unstick settings make sense (see DriverConfig)."""
+    def number(x):
+        return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    if not (number(after) and after >= 0.0):
+        raise ValueError(f'unstick_after {after!r} must be a time >= 0 s (0 is off)')
+    if not (number(reverse_s) and reverse_s > 0.0):
+        raise ValueError(f'unstick_reverse_s {reverse_s!r} must be a time > 0 s')
+    if not (number(speed) and speed > 0.0):
+        raise ValueError(f'unstick_speed {speed!r} must be a speed > 0 m/s')
+
+
+def check_warmup(crossings, end_s, sector_scale, accel_scale) -> None:
+    """Raise ValueError unless the warm-up settings make sense (see DriverConfig)."""
+    if isinstance(crossings, bool) or not isinstance(crossings, int) or crossings < 0:
+        raise ValueError(f'warmup_crossings {crossings!r} must be a whole number >= 0')
+    if not (isinstance(end_s, (int, float)) and math.isfinite(end_s) and end_s >= 0.0):
+        raise ValueError(f'warmup_end_s {end_s!r} must be a finite arc >= 0 m')
+    if not (isinstance(accel_scale, (int, float)) and 0.0 < accel_scale <= 1.0):
+        raise ValueError(f'warmup_accel_scale {accel_scale!r} must be in (0, 1]')
+    sector_triples(sector_scale, max_scale=1.0)
 
 
 class DriveCommand(NamedTuple):
@@ -195,8 +290,32 @@ STEER_CORRECT_TAU = 0.5         # [s] time constant of the yaw-rate leash (~5 % 
 # Smaller backward steps are an out-of-order stamp and are ignored.
 SIM_RESET_BACKSTEP = 0.1
 RTF_SMOOTHING = 0.05            # EMA weight per control step for the live RTF
+# A clock pair implying more than this is the sim clock jumping, not the sim running
+# fast: the node's first /clock lands after the bridge has run 0.5-1 s (judged
+# 20261017T221022Z r4, 20261017T223940Z r3/r5: 990-1020 ms in 3 ms of wall, RTF
+# 340). Learnt, that put every latch time ~0.6 s late for the launch, the wheel
+# estimate 0.9-1.1 rad off, and the car into the first corner. Judged RTF is 1.8-2.4,
+# its highest live spike 6.85.
+LATCH_RTF_MAX = 10.0
+# [m/s] Slower than this, while asking to move, is pinned. A car scraping a wall at
+# full lock and full throttle still creeps at 0.37-0.5 m/s (judged 20261017T215601Z
+# r7-r9: 8-11 collisions each, unstick fired once at 0.3); racing, it is never under 4.
+UNSTICK_SPEED = 1.0
+UNSTICK_PUSH = 0.05             # [m/s] a /drive speed above this is asking to move
+# Backing straight off left the nose at the wall, and the driver's full lock put it
+# back on (judged G-r1: 15 reverses, 11 collisions, DQ). So the reverse counter-steers
+# -- wheels opposite to the turn the driver asked for, which swings the nose that
+# way -- and a car pinned again within UNSTICK_REPEAT_S backs off longer each time.
+UNSTICK_COUNTER_MIN = 0.05      # [rad] a smaller last steer reverses straight
+UNSTICK_REPEAT_S = 3.0          # [s] plant time; a pin this soon after a reverse repeats it
+UNSTICK_ESCALATE = 0.5          # each repeat adds this fraction of unstick_reverse_s
+UNSTICK_REVERSE_MAX_S = 1.5     # [s] the longest reverse
+# Unstick arms once the car has driven past this since the grid: before the sim
+# applies the first commands the car sits still while asking to move, which read
+# as pinned and reversed it off the grid (judged 20261018T003118Z r7, no contact).
+UNSTICK_ARM_SPEED = 2.0         # [m/s]
 # [m/s] Where the gap-follower heads when there is no reference to track: the
-# old v_max it was tuned at, not today's cap, which should never bind.
+# old v_max it was tuned at, not today's racing cap.
 REACTIVE_SPEED = 3.0
 # [m] Corridor kept beyond the stopping distance along the plan, so a wall just
 # past it still shows as the clearance it is rather than as "nothing seen".
@@ -216,9 +335,6 @@ CAP_CONTINUATION_MAX_HEADING = 0.3    # [rad] car's velocity heading to the refe
 # timer stretches it, and the next command then lands later than one period on.
 PUBLISH_INTERVAL_SMOOTHING = 0.2    # EMA weight per published command
 PUBLISH_INTERVAL_MAX = 4.0          # x mpc.dt: a stall must not predict seconds ahead
-# [rad] Largest odometry sideslip handed to the ST model (its state bound,
-# VehicleModel.get_state_bounds); beyond it the car is reversing or spinning.
-MPC_BETA_LIMIT = 0.5
 
 
 class DtTracker:
@@ -387,7 +503,7 @@ class LatchClock:
         if self._last is not None:
             d_sim = t_sim - self._last[0]
             d_wall = t_wall - self._last[1]
-            if d_sim > 0.0 and d_wall > 0.0:
+            if d_sim > 0.0 and d_wall > 0.0 and d_sim <= LATCH_RTF_MAX * d_wall:
                 ratio = d_sim / d_wall
                 self.rtf = (ratio if self.rtf is None
                             else self.rtf + RTF_SMOOTHING * (ratio - self.rtf))
@@ -470,6 +586,15 @@ class DriverCore:
 
         self.mpc_controller = (mpc_controller if mpc_controller is not None
                                else MPCController(vehicle_model=VehicleModel()))
+        # Only a planner has bounds to lower; scripted test controllers have none.
+        if self.cfg.mpc_full_brake and hasattr(self.mpc_controller, 'control_min'):
+            # A new array: the bounds may be shared with the vehicle model.
+            low = np.array(self.mpc_controller.control_min, dtype=float)
+            low[1] = -self.a_brake_max
+            self.mpc_controller.control_min = low
+        # The MPC's acceleration bound, which the warm-up scales and then restores.
+        self._mpc_accel_max = (float(self.mpc_controller.control_max[1])
+                               if hasattr(self.mpc_controller, 'control_max') else None)
         self.mpc_dt = self.mpc_controller.dt
         self._dt = DtTracker(self.mpc_dt)
         self._planned_scan_t = None
@@ -529,6 +654,24 @@ class DriverCore:
         self._emergency_binds = 0
         self._coast_count = 0
         self._coasting = False
+
+        # Warm-up mode (DriverConfig.warmup_*): the race profile it hands over to,
+        # the profile it drives until then (None when off), and the crossing count.
+        self._race_speeds = None
+        self._warm_speeds = None
+        self._warm = False
+        self._warmup_left = 0       # start-line crossings still to come
+        self._wrap_debt = 0         # backward crossings a forward one must undo first
+        self._prev_arc = None
+
+        # Unstick (DriverConfig.unstick_*): since when the car has been pinned,
+        # and until when it reverses off the wall; None when neither.
+        self._stuck_since = None
+        self._reverse_until = None
+        self._reverse_cmd = None
+        self._pins = 0                  # reverses in a row, each within UNSTICK_REPEAT_S
+        self._reverse_ended = None      # plant time the last reverse ended
+        self._unstick_armed = False     # driven past UNSTICK_ARM_SPEED since the grid
 
         self._load_reference_path()
 
@@ -616,10 +759,11 @@ class DriverCore:
         return candidates
 
     def _raceline_reference(self, centerline_path, centerline_xy):
-        """The offline min-time line, else the runtime raceline, else the cached
-        one, else the centreline.
+        """(line, tuned): the offline min-time line, else the runtime raceline, else
+        the cached one, else the centreline; tuned only for the offline min-time line,
+        the one `sector_scale` was tuned on.
 
-        The min-time line (`raceline.py --refine --write`) takes ~60 s to compute,
+        The min-time line (`raceline.py --refine --write`) takes ~4 min to compute,
         past the startup budget, so it ships as the cached CSV and is driven first
         once it checks out against the map. Otherwise the minimum-curvature line is
         built from the map at startup, and the CSV is used only when that build
@@ -632,7 +776,7 @@ class DriverCore:
                 xy = _offline_min_time_line(
                     cached, centerline_path, raceline.HALF_WIDTH + float(self.cfg.raceline_margin))
                 self.log.info(f'raceline: offline min-time line {cached}, {len(xy)} points')
-                return xy.copy()
+                return xy.copy(), True
             except Exception as e:
                 rejected = e
                 self.log.warn(f'raceline: not driving the offline min-time line ({e}); '
@@ -641,32 +785,32 @@ class DriverCore:
         try:
             xy, seconds = _built_raceline(centerline_path, float(self.cfg.raceline_margin))
             self.log.info(f'raceline: {len(xy)} points, built in {seconds:.2f} s')
-            return xy.copy()
+            return xy.copy(), False
         except Exception as e:
             reason = f'build failed: {e}'
 
         if cached is None:
             self.log.error(f'raceline: {reason}; no cached raceline found, '
                            'using the centreline')
-            return centerline_xy
+            return centerline_xy, False
         try:
             xy, margin = raceline.read_cached(cached)
         except Exception as e:
             self.log.error(f'raceline: {reason}; cached raceline unusable ({e}), '
                            'using the centreline')
-            return centerline_xy
+            return centerline_xy, False
         if margin < self.cfg.raceline_margin:
             self.log.error(f'raceline: {reason}; the cached raceline keeps {margin} m of '
                            f'margin, less than the {self.cfg.raceline_margin} m asked for, '
                            'using the centreline')
-            return centerline_xy
+            return centerline_xy, False
         if rejected is not None and raceline.cached_method(cached) == raceline.MIN_TIME_METHOD:
             self.log.error(f'raceline: {reason}; the cached raceline failed its map check '
                            f'({rejected}), using the centreline')
-            return centerline_xy
+            return centerline_xy, False
         self.log.warn(f'raceline: {reason}; using the cached raceline {cached} '
                       f'(margin {margin} m)')
-        return xy
+        return xy, False
 
     def _load_reference_path(self):
         """Load centerline as reference path."""
@@ -691,48 +835,78 @@ class DriverCore:
                 f'Loaded {len(centerline_data)} centerline points from {centerline_path}')
 
             centerline_xy = centerline_data[:, :2]
-            path = centerline_xy
+            path, sectors = centerline_xy, tuple(self.cfg.sector_scale)
             if self.cfg.reference == 'raceline':
-                path = self._raceline_reference(centerline_path, centerline_xy)
+                path, tuned = self._raceline_reference(centerline_path, centerline_xy)
+                if not tuned and any(scale > 1.0 for scale in sectors[2::3]):
+                    # Raised corners were tuned on the min-time line only.
+                    sectors = tuple(min(x, 1.0) if k % 3 == 2 else x
+                                    for k, x in enumerate(sectors))
+                    self.log.warn('sector_scale: not the tuned min-time line, so no '
+                                  'sector raises the budget above a_lat_max')
             on_raceline = path is not centerline_xy
-            a_lat_max, sectors = self._slip_budget_for(path, on_raceline=on_raceline)
 
             # Curvature-limited speeds, not a flat 3 m/s. The track is ~0.5 m
             # wide and the centerline peaks well above a curvature that 3 m/s
             # can hold, so a constant reference drives straight into the
             # outside wall at the first real corner.
-            speeds = self.mpc_controller.speed_profile(
-                path=path, v_max=self.v_max,
-                a_lat_max=a_lat_max, lock_margin=self.cfg.lock_margin,
-                a_accel_max=self.cfg.a_accel_max, a_brake_max=self.cfg.a_brake_max,
-                sector_scale=sectors,
-                gg_brake=self.cfg.gg_brake, gg_floor=self.cfg.gg_floor)
+            speeds = self._profile(path, on_raceline, sectors, self.cfg.a_accel_max)
             self.log.info(f'Speed profile: {speeds.min():.2f}-{speeds.max():.2f} m/s')
             self.set_reference(path, speeds)
-
         except Exception as e:
             self.log.error(f'Error loading reference path: {e}')
             self.reference_path = None
+            return
+        if self.cfg.warmup_crossings > 0:
+            self._load_warmup(path, on_raceline, sectors)
 
-    def _slip_budget_for(self, path, on_raceline):
+    def _load_warmup(self, path, on_raceline, sectors) -> None:
+        """The warm-up profile on top of the race one; on failure, race from the grid."""
+        try:
+            self._warm_speeds = self._profile(
+                path, on_raceline, sectors + tuple(self.cfg.warmup_sector_scale),
+                self.cfg.a_accel_max * self.cfg.warmup_accel_scale)
+            self.log.info(f'Warm-up profile: {self._warm_speeds.min():.2f}-'
+                          f'{self._warm_speeds.max():.2f} m/s until '
+                          f'{self.cfg.warmup_crossings} crossing(s) and s '
+                          f'{self.cfg.warmup_end_s:.1f} m')
+            self._restart_warmup()
+        except Exception as e:
+            self.log.error(f'Warm-up profile failed ({e}); racing from the grid')
+            self._warm_speeds = None
+            if self._warm:
+                self._set_warm(False)
+
+    def _profile(self, path, on_raceline, flat_sectors, a_accel_max):
+        """The speed profile of `path` with these sectors and this acceleration."""
+        a_lat_max, sectors = self._slip_budget_for(path, on_raceline, flat_sectors)
+        return self.mpc_controller.speed_profile(
+            path=path, v_max=self.v_max,
+            a_lat_max=a_lat_max, lock_margin=self.cfg.lock_margin,
+            a_accel_max=a_accel_max, a_brake_max=self.cfg.a_brake_max,
+            sector_scale=sectors,
+            gg_brake=self.cfg.gg_brake, gg_floor=self.cfg.gg_floor,
+            gg_exponent=self.cfg.gg_exponent, curvature_smooth=self.cfg.curvature_smooth)
+
+    def _slip_budget_for(self, path, on_raceline, flat_sectors):
         """(a_lat_max, sectors) for the profile of `path`.
 
         The sectors are arc positions on the raceline. On the centreline they would
         land on the wrong corners, so there the whole lap gets the lowest budget
-        any sector allows instead.
+        any sector allows instead, and never more than `a_lat_max`.
         """
-        sectors = sector_triples(self.cfg.sector_scale)
+        sectors = sector_triples(flat_sectors)
         if not sectors:
             return self.cfg.a_lat_max, ()
         if not on_raceline:
-            a_lat = self.cfg.a_lat_max * min(scale for _, _, scale in sectors)
+            a_lat = self.cfg.a_lat_max * min(1.0, *(scale for _, _, scale in sectors))
             self.log.warn(f'sector_scale is tuned to the raceline; on the centreline the '
                           f'slip budget is a uniform {a_lat:.2f} m/s^2')
             return a_lat, ()
         for sector in sectors:
-            lowered = int(np.count_nonzero(slip_budget(path, 1.0, [sector]) < 1.0))
-            if lowered == 0:
-                self.log.warn(f'sector_scale {sector} lowers no waypoint of the '
+            changed = int(np.count_nonzero(slip_budget(path, 1.0, [sector]) != 1.0))
+            if changed == 0:
+                self.log.warn(f'sector_scale {sector} changes no waypoint of the '
                               f'{len(path)}-point raceline')
         return self.cfg.a_lat_max, sectors
 
@@ -749,6 +923,75 @@ class DriverCore:
         if not hasattr(self.mpc_controller, 'arc_position'):
             self.log.warn(f'{type(self.mpc_controller).__name__} reports no arc_position: '
                           'the profile cap is off and the emergency cap looks straight ahead')
+        # These are the race speeds now; any warm-up belonged to the old reference.
+        self._race_speeds = speeds
+        self._warm_speeds = None
+        if self._warm:
+            self._set_warm(False)
+
+    @property
+    def race_speeds(self) -> Optional[np.ndarray]:
+        """The race profile, which the warm-up profile hands over to."""
+        return self._race_speeds
+
+    @property
+    def warming_up(self) -> bool:
+        """True while the warm-up profile and acceleration are in force."""
+        return self._warm
+
+    def _set_warm(self, warm: bool) -> None:
+        """Drive the warm-up profile and acceleration, or hand over to the race ones.
+
+        The MPC reads its reference speeds and bounds afresh on every solve, so
+        swapping them keeps its arc tracking, where `set_reference` would reset it.
+        """
+        self._warm = warm
+        speeds = self._warm_speeds if warm else self._race_speeds
+        scale = self.cfg.warmup_accel_scale if warm else 1.0
+        self.reference_speeds = speeds
+        self._reference = ClosedPath(self.reference_path, speeds)
+        self.mpc_controller.reference_speeds = speeds
+        self.accel_limit = self.cfg.accel_limit * scale
+        if self._mpc_accel_max is not None:
+            # A new array: the bounds may be shared with the vehicle model.
+            high = np.array(self.mpc_controller.control_max, dtype=float)
+            high[1] = self._mpc_accel_max * scale
+            self.mpc_controller.control_max = high
+
+    def _restart_warmup(self) -> None:
+        """Drive the warm-up from the grid (again, after a sim reset), when it is on."""
+        if self._warm_speeds is None:
+            return
+        self._warmup_left = self.cfg.warmup_crossings
+        self._wrap_debt = 0
+        self._prev_arc = None
+        self._set_warm(True)
+
+    def _note_arc(self, arc) -> None:
+        """Count start-line crossings from the MPC's arc; end the warm-up when due.
+
+        The MPC's arc is unwrapped (it counts on past the lap length), so it is
+        taken within the lap: that wraps from the lap length to 0 at the line,
+        and a jump of more than half a lap is a crossing. A backward one (jitter
+        on the line, a reverse) must be undone by a forward one before a crossing
+        counts, as f110_env does.
+        """
+        if not self._warm or arc is None or not math.isfinite(arc):
+            return
+        lap = self._reference.length
+        arc = arc % lap
+        prev, self._prev_arc = self._prev_arc, arc
+        half_lap = 0.5 * lap
+        if prev is not None and prev - arc > half_lap:
+            if self._wrap_debt:
+                self._wrap_debt -= 1
+            else:
+                self._warmup_left = max(self._warmup_left - 1, 0)
+        elif prev is not None and arc - prev > half_lap:
+            self._wrap_debt += 1
+        if self._warmup_left == 0 and arc >= self.cfg.warmup_end_s:
+            self._set_warm(False)
+            self.log.info(f'Warm-up done at s {arc:.1f} m: race profile from here')
 
     # ------------------------------------------------------------------
     # One control cycle
@@ -786,7 +1029,17 @@ class DriverCore:
             reset_tracking = getattr(self.mpc_controller, 'reset_tracking', None)
             if callable(reset_tracking):
                 reset_tracking()
+            # Back on the grid: the out lap and warm-up come round again.
+            self._restart_warmup()
+            self._reset_unstick()
         self._latch = self._predict_latch(t_pose)
+
+        unstick = self._unstick()
+        if unstick is not None:
+            self._solved_arc = None
+            self._cond_steer = unstick.steering_angle
+            self._last_planned = unstick
+            return unstick
 
         ranges, angles = self.preprocess()
         planned = self.plan(ranges, angles)
@@ -799,6 +1052,58 @@ class DriverCore:
                                                  profile_speed=planned.profile_speed)
         return self._last_planned
 
+    def _reset_unstick(self) -> None:
+        """Forget every pin and reverse (a sim reset: back on the grid)."""
+        self._stuck_since = None
+        self._reverse_until = None
+        self._reverse_cmd = None
+        self._pins = 0
+        self._reverse_ended = None
+        self._unstick_armed = False
+
+    def _unstick(self) -> Optional[DriveCommand]:
+        """Reverse off a wall the car is pinned against, or None to drive on.
+
+        Pinned: slower than UNSTICK_SPEED while the last command asked to move,
+        for `unstick_after` of plant time. The launch from the grid passes
+        UNSTICK_SPEED within ~0.1 s, and a corner is never under 4 m/s. The
+        reverse counter-steers the last forward steer, and grows on repeats
+        (UNSTICK_* constants).
+        """
+        cfg = self.cfg
+        if cfg.unstick_after <= 0.0 or self.t_odom is None:
+            return None
+        t = self.t_odom
+        if self._reverse_until is not None:
+            if t < self._reverse_until:
+                return self._reverse_cmd
+            self._reverse_until = None
+            self._reverse_ended = t
+        if math.isfinite(self.speed) and abs(self.speed) >= UNSTICK_ARM_SPEED:
+            self._unstick_armed = True
+        if (not self._unstick_armed or not math.isfinite(self.speed)
+                or abs(self.speed) >= UNSTICK_SPEED
+                or self._last_cmd.speed <= UNSTICK_PUSH):
+            self._stuck_since = None
+            return None
+        if self._stuck_since is None:
+            self._stuck_since = t
+        if t - self._stuck_since < cfg.unstick_after:
+            return None
+        self._stuck_since = None
+        repeat = self._reverse_ended is not None and t - self._reverse_ended < UNSTICK_REPEAT_S
+        self._pins = self._pins + 1 if repeat else 1
+        reverse_s = min(cfg.unstick_reverse_s * (1.0 + UNSTICK_ESCALATE * (self._pins - 1)),
+                        UNSTICK_REVERSE_MAX_S)
+        want = self._last_cmd.steering_angle
+        steer = (-math.copysign(self.steer_limit, want)
+                 if math.isfinite(want) and abs(want) >= UNSTICK_COUNTER_MIN else 0.0)
+        self._reverse_cmd = DriveCommand(steer, -cfg.unstick_speed, 0.0)
+        self._reverse_until = t + reverse_s
+        self.log.warn(f'Pinned at {self.position}: reversing {reverse_s:.1f} s at '
+                      f'{cfg.unstick_speed:.1f} m/s, steer {steer:+.2f} (pin {self._pins})')
+        return self._reverse_cmd
+
     def _measured_state(self):
         """(x, y, yaw, v, beta, wheel, yaw_rate) as measured, made safe to replay.
 
@@ -810,7 +1115,7 @@ class DriverCore:
             return value if math.isfinite(value) else 0.0
         beta = finite(self.beta)
         return (self.position[0], self.position[1], self.yaw, finite(self.speed),
-                beta if abs(beta) <= MPC_BETA_LIMIT else 0.0,
+                beta if abs(beta) <= self.cfg.beta_limit else 0.0,
                 self.steering.delta_hat, finite(self.yaw_rate))
 
     def _predict_latch(self, t_pose) -> Optional[Prediction]:
@@ -875,9 +1180,10 @@ class DriverCore:
         plant's proportional loop, so the setpoint is inverted from that loop
         (`SpeedLoop.command`) from the speed the car will have when it latches.
         The MPC's demand is clamped to [-a_brake_max, accel_limit]; then the
-        hold may end no faster than `profile_speed`, then no faster than
-        `speed_cap`. Those two may brake past the clamp, to the plant's limit:
-        the emergency cap is a safety bound and must not be delayed by it.
+        hold may end no faster than `profile_speed`, braking at most
+        `profile_brake_cap` for it, then no faster than `speed_cap`. The
+        emergency cap may brake past everything, to the plant's limit: it is a
+        safety bound and must not be delayed.
         A NaN cap would be skipped by every comparison below -- failing open --
         so it coasts instead; +inf is "no cap".
         """
@@ -895,7 +1201,7 @@ class DriverCore:
 
         v = self._latch_speed()
         a = min(max(accel, -self.a_brake_max), self.accel_limit)
-        a = min(a, (profile_speed - v) / self.mpc_dt)
+        a = min(a, max((profile_speed - v) / self.mpc_dt, -self.cfg.profile_brake_cap))
         a_cap = (speed_cap - v) / self.mpc_dt
         if a_cap < a:
             a = a_cap
@@ -1192,6 +1498,7 @@ class DriverCore:
                 mpc_control, diagnostics = self.mpc_controller.get_control(
                     current_state)
                 self._solved_arc = getattr(self.mpc_controller, 'arc_position', None)
+                self._note_arc(self._solved_arc)
                 planner = getattr(self.mpc_controller, 'planned_path', None)
                 self._planned_path = planner() if callable(planner) else None
 

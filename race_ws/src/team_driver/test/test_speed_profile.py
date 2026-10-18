@@ -111,10 +111,26 @@ class TestSectorScale(unittest.TestCase):
         both = (self.s >= 4.0) & (self.s < 6.0)
         np.testing.assert_allclose(budget[both], 5.0)
 
-    def test_a_scale_outside_0_to_1_is_refused(self):
-        for scale in (0.0, -0.5, 1.5, float('nan')):
+    def test_a_scale_outside_0_to_the_max_is_refused(self):
+        for scale in (0.0, -0.5, sp.MAX_SECTOR_SCALE + 0.1, float('nan')):
             with self.subTest(scale=scale), self.assertRaises(ValueError):
                 sp.slip_budget(self.path, 10.0, [(2.0, 5.0, scale)])
+
+    def test_a_sector_above_one_raises_the_budget_only_inside_it(self):
+        budget = sp.slip_budget(self.path, 10.0, [(2.0, 5.0, 1.2)])
+        inside = (self.s >= 2.0) & (self.s < 5.0)
+        np.testing.assert_allclose(budget[inside], 12.0)
+        np.testing.assert_allclose(budget[~inside], 10.0)
+
+    def test_the_lower_scale_wins_over_a_raised_sector(self):
+        budget = sp.slip_budget(self.path, 10.0, [(2.0, 6.0, 1.3), (4.0, 8.0, 0.9)])
+        np.testing.assert_allclose(budget[(self.s >= 2.0) & (self.s < 4.0)], 13.0)
+        np.testing.assert_allclose(budget[(self.s >= 4.0) & (self.s < 8.0)], 9.0)
+
+    def test_the_max_scale_is_accepted(self):
+        sp.sector_triples([2.0, 5.0, sp.MAX_SECTOR_SCALE])
+        with self.assertRaises(ValueError):
+            sp.sector_triples([2.0, 5.0, 1.2], max_scale=1.0)
 
     def test_a_non_finite_bound_is_refused(self):
         with self.assertRaises(ValueError):
@@ -278,6 +294,41 @@ class TestLapFloorTable(unittest.TestCase):
         path = lap_floor.load_path(lap_floor.default_centerline_path())
         length = float(np.sum(sp.segment_lengths(path, True)))
         self.assertAlmostEqual(length, 78.49, delta=0.5)
+
+
+class TestShapeKnobs(unittest.TestCase):
+    """Sub-9 phase 2: the g-g exponent and the curvature smoothing, as profile arguments."""
+
+    GG = dict(SPEC, a_brake_max=6.0, gg_brake=True)
+
+    def setUp(self):
+        self.path = _stadium(10.0, 2.0)
+
+    def test_the_defaults_are_the_old_constants_bit_for_bit(self):
+        base = sp.speed_profile(self.path, **self.GG)
+        same = sp.speed_profile(self.path, **self.GG, gg_exponent=sp.GG_EXPONENT,
+                                curvature_smooth=sp.CURVATURE_SMOOTH)
+        np.testing.assert_array_equal(base, same)
+
+    def test_a_higher_exponent_leaves_more_braking_in_a_corner(self):
+        flat = sp.gg_decel(5.0, 0.5, 20.0, 6.0, 0.1)
+        squarer = sp.gg_decel(5.0, 0.5, 20.0, 6.0, 0.1, exponent=3.0)
+        self.assertGreater(squarer, flat)
+        v2 = sp.speed_profile(self.path, **self.GG)
+        v3 = sp.speed_profile(self.path, **self.GG, gg_exponent=3.0)
+        self.assertTrue(np.all(v3 >= v2 - 1e-12))
+        self.assertGreater(float(np.max(v3 - v2)), 1e-3)
+
+    def test_the_smoothing_reaches_the_curvature(self):
+        v9 = sp.speed_profile(self.path, **self.GG)
+        v13 = sp.speed_profile(self.path, **self.GG, curvature_smooth=13)
+        self.assertGreater(float(np.max(np.abs(v13 - v9))), 1e-3)
+
+    def test_bad_knobs_are_refused(self):
+        for kw in (dict(gg_exponent=0.0), dict(gg_exponent=float('nan')),
+                   dict(curvature_smooth=8), dict(curvature_smooth=0)):
+            with self.subTest(**kw), self.assertRaises(ValueError):
+                sp.speed_profile(self.path, **self.GG, **kw)
 
 
 if __name__ == '__main__':

@@ -28,12 +28,14 @@ _current_dir = os.path.dirname(os.path.abspath(__file__))
 if _current_dir not in sys.path:
     sys.path.insert(0, _current_dir)
 try:
-    from .driver_core import DriverConfig, REFERENCES   # ROS / package import
-    from .speed_profile import check_gg_floor, sector_triples
+    from .driver_core import DriverConfig, REFERENCES, check_unstick, check_warmup   # ROS / package import
+    from .speed_profile import (check_curvature_smooth, check_gg_exponent, check_gg_floor,
+                                sector_triples)
     from .vehicle_model import MODEL_TYPES, ServoModel, VehicleModel
 except ImportError:
-    from driver_core import DriverConfig, REFERENCES    # standalone / tests
-    from speed_profile import check_gg_floor, sector_triples
+    from driver_core import DriverConfig, REFERENCES, check_unstick, check_warmup    # standalone / tests
+    from speed_profile import (check_curvature_smooth, check_gg_exponent, check_gg_floor,
+                               sector_triples)
     from vehicle_model import MODEL_TYPES, ServoModel, VehicleModel
 
 PARAMS_SOURCE_DEFAULT = 'CODE_DEFAULTS'
@@ -42,7 +44,7 @@ MPC_PREFIX = 'mpc.'
 JUDGED_HORIZON = 8
 # The speed path divides by or takes roots of these; zero or less is a crash.
 POSITIVE_PARAMS = ('a_emergency', 'a_brake_max', 'a_accel_max', 'accel_limit', 'a_lat_max',
-                   'crawl_speed', 'v_max', 'max_range', 'steer_limit')
+                   'crawl_speed', 'v_max', 'max_range', 'steer_limit', 'beta_limit')
 
 
 @dataclass(frozen=True)
@@ -147,11 +149,19 @@ def validate(values: Mapping[str, Any]) -> None:
         value = values[name]
         if not (isinstance(value, (int, float)) and math.isfinite(value) and value > 0.0):
             raise ValueError(f'{name} {value!r} must be a positive number')
+    cap = values['profile_brake_cap']
+    if not (isinstance(cap, (int, float)) and math.isfinite(cap) and cap >= 0.0):
+        raise ValueError(f'profile_brake_cap {cap!r} must be a number >= 0')
     if values['crawl_speed'] > values['v_max']:
         raise ValueError(f"crawl_speed {values['crawl_speed']} must not exceed "
                          f"v_max {values['v_max']}")
     sector_triples(values['sector_scale'])   # raises ValueError naming the sector
     check_gg_floor(values['gg_floor'])
+    check_gg_exponent(values['gg_exponent'])
+    check_curvature_smooth(values['curvature_smooth'])
+    check_warmup(values['warmup_crossings'], values['warmup_end_s'],
+                 values['warmup_sector_scale'], values['warmup_accel_scale'])
+    check_unstick(values['unstick_after'], values['unstick_reverse_s'], values['unstick_speed'])
 
 
 def _validate_schedule(schedule: list, horizon: int, period: float) -> None:

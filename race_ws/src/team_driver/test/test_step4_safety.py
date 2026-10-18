@@ -491,7 +491,8 @@ class ReviewFixesTest(unittest.TestCase):
                 with self.subTest(name=name, value=bad), self.assertRaises(ValueError):
                     driver_params.validate({**driver_params.DEFAULTS, name: bad})
         with self.assertRaises(ValueError):
-            driver_params.validate({**driver_params.DEFAULTS, 'crawl_speed': 11.0})
+            driver_params.validate({**driver_params.DEFAULTS,
+                                    'crawl_speed': driver_params.DEFAULTS['v_max'] + 1.0})
         driver_params.validate(dict(driver_params.DEFAULTS))
 
 
@@ -557,7 +558,10 @@ class ProfileCapTest(unittest.TestCase):
     def _run(self, stale):
         path = _line()
         speeds = _braking_profile(path)
-        core, _ = _core_on(path, speeds, lambda s: s[0] - path[0, 0], accel=9.5)
+        # The profile as a hard ceiling is the old car's override (no cap); with the
+        # sub-9 cap the MPC owns the braking, and this scripted one never brakes.
+        cfg = driver_core.DriverConfig(profile_brake_cap=9.51)
+        core, _ = _core_on(path, speeds, lambda s: s[0] - path[0, 0], cfg=cfg, accel=9.5)
         plant = _plant_at(0.0, 2.0)
         excess = []
         top = []
@@ -588,8 +592,8 @@ class ProfileCapTest(unittest.TestCase):
 # ----------------------------------------------------------------------
 class DefaultsTest(unittest.TestCase):
 
-    def test_v_max_is_a_cap_that_should_not_bind(self):
-        self.assertEqual(CFG.v_max, 10.0)
+    def test_v_max_binds_only_near_the_plants_power_limited_top_speed(self):
+        self.assertEqual(CFG.v_max, 12.0)
 
     def test_the_steering_limit_is_the_real_lock(self):
         self.assertEqual(CFG.steer_limit, VP.s_max)

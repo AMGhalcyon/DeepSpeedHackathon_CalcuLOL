@@ -181,10 +181,9 @@ class Step9TunedWeightsTests(unittest.TestCase):
                 self.assertEqual(params[name], value)
 
 
-SUB10_TUNED = {'a_lat_max': 21.0, 'a_brake_max': 6.0, 'accel_limit': 9.51,
+SUB10_TUNED = {'accel_limit': 9.51,
                'lock_margin': 0.95, 'gg_brake': True, 'gg_floor': 0.1,
-               'cap_follows_reference': True,
-               'sector_scale': [43.0, 47.0, 0.85, 3.0, 7.0, 0.95]}
+               'cap_follows_reference': True}
 
 
 class Sub10TunedProfileTests(unittest.TestCase):
@@ -218,6 +217,60 @@ class Sub10TunedProfileTests(unittest.TestCase):
                 self.assertEqual(params[name], value)
 
 
+SUB9_TUNED = {'a_lat_max': 27.0, 'v_max': 12.0, 'mpc_full_brake': True,
+              'profile_brake_cap': 3.0, 'beta_limit': 1.0}
+
+
+class Sub9TunedProfileTests(unittest.TestCase):
+    """The sub-9 pin (Step 2): the MPC owns the braking, so the budget rises 21 -> 27.
+
+    Every crash above a_lat 22 was a braking-yaw spin with the MPC saturated at its
+    -0.3 a_max floor while the profile override braked past it. With the MPC braking
+    to a_brake_max, the override held to 3 m/s^2 and the slip state kept to 1 rad,
+    a27 at v_max 12 is 8.79 s and clean on fixed 5/7/12 ms x stale 5/9/14, 10 laps,
+    5 measured runs, 24 runs under 12-job host load, and the centreline.
+    """
+
+    def test_the_code_defaults_carry_the_sub9_pin(self):
+        for name, value in SUB9_TUNED.items():
+            with self.subTest(name=name):
+                self.assertEqual(driver_params.DEFAULTS[name], value)
+
+    def test_the_params_file_carries_the_sub9_pin(self):
+        params = _node_params()
+        for name, value in SUB9_TUNED.items():
+            with self.subTest(name=name):
+                self.assertEqual(params[name], value)
+
+
+PHASE2_TUNED = {'a_brake_max': 9.0, 'gg_exponent': 5.0, 'curvature_smooth': 21,
+                'sector_scale': [43.2, 47.2, 0.85, 3.1, 7.1, 0.95, 8.1, 21.3, 1.2,
+                                 28.3, 43.2, 1.11, 49.2, 57.2, 1.11, 57.2, 74.4, 1.2],
+                'warmup_crossings': 1, 'warmup_end_s': 56.0,
+                'warmup_sector_scale': [0.0, 56.0, 0.35], 'warmup_accel_scale': 0.5}
+
+
+class Phase2TunedProfileTests(unittest.TestCase):
+    """The sub-9 phase-2 pin: profile shape U, raised corners, the re-refined line.
+
+    a_brake_max 9 with gg_exponent 5 and curvature_smooth 21, the line re-refined at
+    that profile, and each corner's budget one notch below its cliff (s 23.2, 35, 54).
+    With 28-43 at 1.2 (7.92 s) the full harness grid was clean but judged runs hit
+    s 30-36 in 3 of 10; at 1.11 it is 7.97 s.
+    """
+
+    def test_the_code_defaults_carry_the_phase2_pin(self):
+        for name, value in PHASE2_TUNED.items():
+            with self.subTest(name=name):
+                self.assertEqual(driver_params.DEFAULTS[name], value)
+
+    def test_the_params_file_carries_the_phase2_pin(self):
+        params = _node_params()
+        for name, value in PHASE2_TUNED.items():
+            with self.subTest(name=name):
+                self.assertEqual(params[name], value)
+
+
 class ValidateTests(unittest.TestCase):
 
     def test_the_defaults_pass(self):
@@ -242,8 +295,8 @@ class ValidateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r'sector'):
             driver_params.validate(values)
 
-    def test_a_sector_scale_above_one_is_refused(self):
-        values = {**_defaults(), 'sector_scale': [29.0, 37.0, 1.5]}
+    def test_a_sector_scale_above_the_max_is_refused(self):
+        values = {**_defaults(), 'sector_scale': [29.0, 37.0, 1.6]}
         with self.assertRaisesRegex(ValueError, r'sector'):
             driver_params.validate(values)
 

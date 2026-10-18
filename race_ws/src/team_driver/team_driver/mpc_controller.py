@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Model Predictive Controller for F1TENTH autonomous racing.
 
-Implements a basic MPC that optimizes steering and acceleration over a prediction horizon
-using a kinematic bicycle model.
+Implements a nonlinear MPC that optimizes steering and acceleration over a prediction
+horizon. It predicts with `VehicleModel`: the judged dynamic single track ('ST', what the
+node runs) or the kinematic bicycle ('KS'), with the steering servo as a state.
 """
 
 import numpy as np
@@ -350,7 +351,9 @@ class MPCController:
                       closed: bool = True,
                       sector_scale: Sequence[Sequence[float]] = (),
                       gg_brake: bool = False,
-                      gg_floor: float = _speed_profile.GG_FLOOR) -> np.ndarray:
+                      gg_floor: float = _speed_profile.GG_FLOOR,
+                      gg_exponent: float = _speed_profile.GG_EXPONENT,
+                      curvature_smooth: int = _speed_profile.CURVATURE_SMOOTH) -> np.ndarray:
         """Closed-loop speed profile for the lap; see `speed_profile.py`.
 
         The reference used to demand an instant jump to corner speed, so the car
@@ -365,8 +368,9 @@ class MPCController:
             closed: The path is a lap (last point joins the first).
             sector_scale: (s_start, s_end, scale) sectors that lower the slip
                 budget (`speed_profile.slip_budget`).
-            gg_brake, gg_floor: brake inside the combined-accel ellipse
-                (`speed_profile.gg_decel`); off by default.
+            gg_brake, gg_floor, gg_exponent: brake inside the combined-accel
+                ellipse (`speed_profile.gg_decel`); off by default.
+            curvature_smooth: the profile's curvature smoothing (odd points).
         Returns:
             Speed per waypoint, shape (N,).
         """
@@ -378,7 +382,8 @@ class MPCController:
             path, a_lat_max=a_lat_max, lock_margin=lock_margin,
             a_accel_max=a_accel_max, a_brake_max=a_brake_max, v_max=v_max,
             closed=closed, sector_scale=sector_scale,
-            gg_brake=gg_brake, gg_floor=gg_floor)
+            gg_brake=gg_brake, gg_floor=gg_floor, gg_exponent=gg_exponent,
+            curvature_smooth=curvature_smooth)
 
     @property
     def arc_position(self) -> Optional[float]:
