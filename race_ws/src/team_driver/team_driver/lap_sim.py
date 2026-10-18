@@ -8,19 +8,21 @@
 
 WHY THE TIMING MODEL
     The judged run sets `use_sim_time_bridge`, which zeroes both bridge timers:
-    the bridge steps physics and publishes scan+odom as fast as the CPU allows
-    (RTF ~1.4). The driver solves one scan in ~30-40 ms of wall time, so its
-    depth-10 subscription queues are always full and every scan it takes is ~10
-    physics steps old. While it solves, the sim keeps running -- so each command
-    reaches the plant `solve_wall * rtf` of sim time after its tick. Together
-    that is ~150 ms of dead time, against an MPC that plans 200 ms ahead and a
-    steering servo that needs 290 ms for a full reversal. A harness that applies
-    commands instantly to the current state -- the old `lap_sim.py` -- cannot see
-    any of it.
+    the bridge steps physics and publishes scan+odom as fast as the CPU allows.
+    As measured on 2026-09-30, before Step 3 (RTF ~1.4): the driver solved one
+    scan in ~30-40 ms of wall time, so its depth-10 subscription queues were
+    always full and every scan it took was ~10 physics steps old. While it
+    solves, the sim keeps running -- so each command reaches the plant
+    `solve_wall * rtf` of sim time after its tick. Together that was ~150 ms of
+    dead time, against an MPC that then planned 200 ms ahead and a steering servo
+    that needs 262 ms for a full reversal. A harness that applies commands
+    instantly to the current state -- the old `lap_sim.py` -- cannot see any of it.
 
     Since Step 3 the node plans on a fixed timer, so ticks are `--control-period`
     (25 ms) apart: 3 and 2 physics steps alternately on the 10 ms grid. A solve
     that outlasts the period stretches it, as a real overrunning timer would.
+    The node now takes depth-1 queues; the harness keeps the measured 9-step
+    staleness as its default and is gridded at 5 and 14 either side.
 
 WHAT IS EXACT, WHAT IS NOT
     Plant, servo, LiDAR, collision detection and the referee's 1 Hz collision
@@ -53,9 +55,10 @@ from speed_profile import sector_triples  # noqa: E402
 from vehicle_model import MODEL_TYPES, VehicleModel  # noqa: E402
 
 PHYSICS_DT = 0.01               # s, gym_bridge.py sim_timestep
-# Scan and odom are both 9 physics steps old when the driver reads them: the
-# depth-10 queue stays full, and its oldest entry is 9 behind the newest.
-# Measured live with a /clock probe (run 20260930T091032Z, mode 9 of 1536).
+# Scan and odom were both 9 physics steps old when the driver read them: the
+# depth-10 queue stayed full, and its oldest entry was 9 behind the newest.
+# Measured live with a /clock probe (run 20260930T091032Z, mode 9 of 1536), before
+# the node moved to depth-1 queues; kept as the default, gridded at 5 and 14.
 DEFAULT_STALE_STEPS = 9
 DEFAULT_RTF = 1.4               # sim seconds per wall second, measured live
 # The node plans on a fixed timer (driver.py create_timer, mpc.dt). 0 restores

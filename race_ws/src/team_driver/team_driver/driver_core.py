@@ -143,7 +143,7 @@ class DriverConfig:
     curvature_smooth: int = 21
     # Cautious out lap and warm-up lap. Neither is timed, but their collisions count
     # toward the disqualification (docs/06-rules.md, rule 18). Judged warm-ups hit
-    # in 3 of 13 sub-9 runs (0 of 130 timed laps), at s 56 and 65 in one run, while
+    # in 2 of 13 sub-9 runs (3 hits; 0 of 130 timed laps), at s 56 and 65 in one run, while
     # the driver logged an RTF spike (2.7 -> 6.85): host load early in a run. The
     # harness, whose delays are constant, never hits (holds to 105 ms, state 500 ms
     # stale). Until the car has crossed the start line `warmup_crossings` times and
@@ -165,8 +165,10 @@ class DriverConfig:
     # pushes into a wall: phase-2 r1 sat at v ~0 at full lock and full throttle
     # forward for 4 s after one hit (11 collisions, DQ), because nothing here ever
     # asks for reverse. Stuck = under UNSTICK_SPEED while the last command asked to
-    # move, for `unstick_after` [s]; then reverse straight at `unstick_speed` [m/s]
-    # for `unstick_reverse_s` [s], and drive again. 0 is off.
+    # move, for `unstick_after` [s], once the car has driven past UNSTICK_ARM_SPEED;
+    # then reverse at `unstick_speed` [m/s] for `unstick_reverse_s` [s], counter-
+    # steered (full lock against the last forward steer), longer on each repeat
+    # (UNSTICK_* constants), and drive again. 0 is off.
     unstick_after: float = 0.5
     unstick_reverse_s: float = 0.6
     unstick_speed: float = 1.0

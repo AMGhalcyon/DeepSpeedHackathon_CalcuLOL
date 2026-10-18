@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Model Predictive Controller for F1TENTH autonomous racing.
 
-Implements a basic MPC that optimizes steering and acceleration over a prediction horizon
-using a kinematic bicycle model.
+Implements a nonlinear MPC that optimizes steering and acceleration over a prediction
+horizon. It predicts with `VehicleModel`: the judged dynamic single track ('ST', what the
+node runs) or the kinematic bicycle ('KS'), with the steering servo as a state.
 """
 
 import numpy as np

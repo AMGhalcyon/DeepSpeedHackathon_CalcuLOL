@@ -68,7 +68,8 @@ driver:
     # Never empty: ROS would type an empty list as bytes and refuse a list of
     # doubles; to turn the sectors off, use [0.0, 1.0, 1.0]. Tuned on the shipped
     # line at raceline_margin 0.25; on the centreline the lap gets a uniform a_lat_max x
-    # the lowest scale (27 x 0.85 = 22.95 m/s^2: clean in lap_sim, 9.37 s).
+    # the lowest scale (27 x 0.85 = 22.95 m/s^2: clean in lap_sim, 9.37 s at the
+    # phase-2 profile; 10.97 s at the sub-9 Step 2 one).
     # Fallbacks: the sub-10 car (a21, v_max 10, mpc_full_brake false, profile_brake_cap
     # 9.51, beta_limit 0.5; 9.82 s harness, judged 9.87 s), or the previous line and
     # profile (git 42cb78f, 10.81 s). Sub-9 Step 2 ran a27 on those two sectors alone.
@@ -102,8 +103,10 @@ driver:
     warmup_accel_scale: 0.5
     # Back off a wall the car is pinned against (phase-2 judged r1: pinned at full
     # lock and full throttle after one hit, 11 collisions, DQ). Pinned = under 1.0 m/s
-    # while asking to move, for unstick_after [s]; then reverse straight at
-    # unstick_speed [m/s] for unstick_reverse_s [s]. 0 is off.
+    # while asking to move, for unstick_after [s], once the car has passed 2 m/s;
+    # then reverse at unstick_speed [m/s] for unstick_reverse_s [s], counter-steered
+    # (full lock against the last forward steer), longer on each repeat (up to
+    # 1.5 s). 0 is off.
     unstick_after: 0.5
     unstick_reverse_s: 0.6
     unstick_speed: 1.0

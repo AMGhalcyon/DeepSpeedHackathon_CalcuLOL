@@ -46,7 +46,7 @@ is a bank of likely interview questions with answers.
 13. [Interview question bank](#13-interview-question-bank)
 14. [Every file, and why it exists](#14-every-file-and-why-it-exists)
 15. [Reproducing everything](#15-reproducing-everything)
-16. [Small inaccuracies in code comments](#16-small-inaccuracies-in-code-comments)
+16. [Things in the code an interviewer might question](#16-things-in-the-code-an-interviewer-might-question)
 17. [Glossary](#17-glossary)
 
 ---
@@ -179,8 +179,9 @@ that is only 5.8 m/s².
 bit" does almost nothing. You have to send the exact speed that makes this
 controller produce 9 m/s² over the next 25 ms. Our code inverts the formula: it
 sends **9.45 m/s** for that case (`SpeedLoop.command` in `vehicle_model.py`).
-Before we did this, the car got only about 12% of the acceleration the planner
-asked for.
+Before we did this, the code sent `current speed + acceleration × 0.025 s`.
+With the simulator's gain of 4.755 /s, that delivered only 4.755 × 0.025 ≈ 12%
+of the acceleration the planner asked for when speeding up.
 
 ### 2.4 Fact 3: the tyres never "lose grip"
 
@@ -210,8 +211,10 @@ When the car brakes, weight shifts forward. In the simulator's equations this
 Under hard braking above a certain speed, the car's rotation becomes
 **unstable**: a small yaw (rotation) grows by itself and the rear steps out.
 
-We measured the critical speeds: about **6.2 m/s while braking at 6 m/s²**,
-and **4.95 m/s at 8 m/s²**. The car spends most of the lap above these speeds.
+The critical speeds, from the eigenvalues of the simulator's slip and yaw
+equations, are about **6.2 m/s while braking at 6 m/s²**, **4.95 m/s at
+8 m/s²** and **4.5 m/s at 9 m/s²** (our maximum braking). The car spends most
+of the lap above these speeds.
 So braking hard *while turning* spins the car, the way a real car spins if you
 slam the brakes mid-corner. This one fact caused most of our crashes on the way
 from 11 s to 8 s. Our fixes are the g-g braking limit (section 4.4) and letting
@@ -224,7 +227,8 @@ the planner own the braking (section 4.6).
 - In judged runs the simulator runs **as fast as the computer allows**. On our
   laptop that is 2.3× real time. It does not wait for us.
 - The pose and scan we receive are **already old**. We measured about 9
-  physics steps (90 ms) early on.
+  physics steps (90 ms) on 30 Sep, when the node still used depth-10 message
+  queues. The node now uses depth 1, and the harness tests 5, 9 and 14 steps.
 - Our command also takes effect later than the moment we read the clock. While
   we compute it (a few ms of wall-clock time), the simulator keeps running, so
   the command lands about `solve time × real-time factor` later in simulated
@@ -331,8 +335,8 @@ it robust: a small error is corrected on the next cycle.
 
 | Approach | Why it was not enough |
 |---|---|
-| **Follow-the-gap** (steer at the widest open gap in the LiDAR; we started here) | Purely reactive: it cannot brake *before* a corner it cannot see yet, or pick a line. It topped out around 28–29 s. It is still in the code as a fallback. |
-| **Pure pursuit / Stanley** (steer towards a point some distance ahead on the line) | Simple and fast, but it knows nothing about the slow servo, the sideways slip, the dead time or braking instability. At 9–12 m/s those decide whether you hit a wall. Every corner would need hand-tuned look-ahead distances. |
+| **Follow-the-gap** (steer at the widest open gap in the LiDAR; we started here) | Purely reactive: it cannot brake *before* a corner it cannot see yet, or pick a line. It topped out around 28–30 s. It is still in the code as a fallback. |
+| **Pure pursuit / Stanley** (steer towards a point some distance ahead on the line) | We built Pure Pursuit: 17.83 s, also tried on a precomputed racing line. It is simple and fast, but it knows nothing about the slow servo, the sideways slip, the dead time or braking instability. At 9–12 m/s those decide whether you hit a wall. Every corner would need hand-tuned look-ahead distances, and its gains were shrinking. |
 | **Reinforcement learning / imitation learning** | Needs lots of training and a reward that does not learn to cheat. It is hard to guarantee zero collisions or explain a specific decision. |
 | **MPC (chosen)** | It uses everything the rules give us: the map, the exact pose and the known physics. It respects the car's real limits (steering lock, servo speed, braking) *while* planning. It looks 0.5 s ahead, so it brakes before corners. Every decision can be explained by its cost function. And because we can import the judge's physics, its model is unusually accurate. |
 
@@ -617,8 +621,10 @@ We started at 2 and moved to 5, once the planner itself handled braking safely
 **Curvature smoothing (`curvature_smooth` = 21).** Curvature from three
 neighbouring points is noisy at 0.1 m spacing, so it is averaged over 21 points
 (about 2 m). Wider smoothing rounds off the curvature peaks, which raises corner
-speeds; 21 was measured best together with the other settings. This smoothing
-is for the profile only. The MPC uses its own.
+speeds. On the earlier line, 5 points gave an ideal lap of 9.201 s and 13
+points gave 8.809 s. 21 was pinned together with `a_brake_max` 9 and exponent 5
+after harness runs (the stronger 25 / 9.5 / 6 combination crashed at s 54).
+This smoothing is for the profile only. The MPC uses its own.
 
 **Sectors (`sector_scale`).** These scale the slip budget on stretches of the
 lap, given as triples (start s, end s, scale). Below 1 means "be gentler here";
@@ -943,8 +949,8 @@ normal run it is computed but not used.
 The out lap and warm-up lap are not timed, but their collisions count towards
 disqualification.
 
-- At the sub-9 tune, warm-up laps had wall contacts in 2 of 13 judged runs,
-  while 130 timed laps had none.
+- At the sub-9 tune, warm-up laps had wall contacts in 2 of 13 judged runs
+  (3 hits in total), while 130 timed laps had none.
 - Later warm-up contacts were near-misses at the chicane exit (s 40–50), early
   in a run, when the host was busiest.
 - The harness showed the warm-up lap had the **thinnest** wall clearance of any
@@ -993,7 +999,8 @@ Now (`DriverCore._unstick`):
   off the grid.
 - When pinned, it **reverses at 1 m/s for 0.6 s with the wheels turned to full
   lock the opposite way** to the last forward steer (counter-steer), like the
-  first move of a three-point turn. That swings the nose away from the wall,
+  first move of a three-point turn. If the last steer was nearly straight
+  (under 0.05 rad), it reverses straight. That swings the nose away from the wall,
   towards where the driver wanted to go. Reversing straight left the nose at
   the wall, and full lock put it straight back on (one judged run: 15 reverses,
   disqualified).
@@ -1151,7 +1158,8 @@ Times are judged best laps from our own `evaluate.sh` runs (files in
 | Date | Change | Judged best lap | Collisions |
 |---|---|---|---|
 | 17 Sep | The organisers' template ships no driver | — | — |
-| 26–28 Sep | Follow-the-gap (reactive, LiDAR only) | ~28–29 s | 0 |
+| 26–28 Sep | Follow-the-gap (reactive, LiDAR only) | ~28–30 s | 0 |
+| 29–30 Sep | Pure Pursuit (built in parallel) | 17.83 s | 0 |
 | 29 Sep | First MPC, tracking the centreline | 51.66 s | **7** |
 | 30 Sep–1 Oct | **Phase 1:** faithful offline simulator, servo model, timing fixes, weight sweep | ~50 s | 0 |
 | 2 Oct | **Phase 2:** racing line, speed profile, ST model, output unlocked, latch predictor | ~18.0 s | 0 |
@@ -1165,19 +1173,33 @@ Times are judged best laps from our own `evaluate.sh` runs (files in
 | 17–18 Oct | **Phase 7:** profile shape, re-refined line, raised corners | 8.03–8.05 s | (see below) |
 | 18 Oct | **Phase 8:** clock fix, slow warm-up, counter-steer unstick | **8.038–8.047 s** | **0 in 10/10 runs** |
 
-### Phase 0: a reactive driver (~29 s)
+The collisions column describes the runs that closed each phase. The
+experiments in between had crashes and disqualifications too; every result
+file is kept in `results/`.
 
-The first working driver was follow-the-gap (section 4.9). It needs no map and
-no planning, so it was the quickest way round, and it completed clean laps at
-about 28–29 s. But it can only react to what it sees, so it cannot brake
-before a corner or choose a line. To go faster you must plan with the map,
-hence MPC.
+### Phase 0: the baselines (follow-the-gap ~28–30 s, Pure Pursuit 17.83 s)
+
+The team first built two standard drivers from the organisers' algorithm list:
+
+- **Follow-the-gap** (section 4.9). It needs no map and no planning, so it was
+  the quickest way round. It completed clean laps at about 28–30 s.
+- **Pure Pursuit**, which steers towards a point a fixed distance ahead on a
+  line. It reached **17.83 s**. We also tried it on a precomputed racing line.
+
+Both kept improving more and more slowly. They react to where the car is *now*,
+but what limits this car is what happens *next*: a command acts about 0.1 s
+late, the wheel takes up to 262 ms to turn, and the car slides in corners. An
+MPC can plan for all three. So we switched, knowing it would start slower.
+
+The first MPC (51.66 s) was far slower than Pure Pursuit. It took until 2 Oct
+(18.0 s) to match it, and every gain after that (down to 8.04 s) was beyond
+what the baselines had reached.
 
 ### Phase 1: making the MPC drive at all (51.7 s with 7 crashes → 50 s clean)
 
-The first MPC (29 Sep) finished laps but steered violently. The steering
-flipped direction 300 times in 700 steps, slamming between full left and full
-right lock, and the car hit walls 7 times. Tuning weights did nothing, because
+The first MPC (29 Sep) finished its judged laps but hit walls 7 times. When we
+reproduced it offline, the steering flipped direction 300 times in 700 steps,
+slamming between full left and full right lock. Tuning weights did nothing, because
 **our offline test harness was lying to us**: it tested the MPC against its own
 perfect model, which had no servo and no delay.
 
@@ -1200,8 +1222,9 @@ because every limit was still at a "safe" 0.8 m/s².
 
 ### Phase 2: from 50 s to 13 s by going faster on purpose (2–3 Oct)
 
-- **A racing line** (minimum curvature, section 4.3) and **a speed profile**
-  (section 4.4) replaced the centreline at constant speed.
+- **A racing line** (minimum curvature, section 4.3) and **a proper speed
+  profile** (section 4.4) replaced the centreline and its very cautious
+  0.8 m/s² profile.
 - **The dynamic ST model.** At speed the car slides sideways, and the kinematic
   model assumes it cannot. `model_error.py` measured the difference.
 - **Look-ahead for free:** the stretched 25–100 ms step schedule (0.5 s).
@@ -1327,6 +1350,19 @@ The remaining judged failures were all in the first seconds of a run:
 10 of 10 complete, 0 collisions, 0 wall contacts, best laps
 8.038–8.047 s, totals 80.49–80.55 s, RTF 2.28–2.35.** The batch before it,
 batch S (the same code without the arming fix), was also 10/10 with 0 contacts.
+
+**Which code batch T ran.** Batch T ran at 08:50–08:59 SGT, from the working
+tree, before its changes were committed. They were committed unchanged as
+`ac836d8` at 13:11. The evidence:
+- the batch log shows the slow warm-up (`0.35 to s 56`, acceleration 0.5) and
+  unstick active in all 10 runs;
+- batch S's log already shows the counter-steer (`steer +0.42`) and the longer
+  repeat reverse;
+- the full test suite, run at 08:47 just before batch T, had the same count as
+  today (738 passed, 1 deselected), arming tests included.
+
+A single run one minute after the commit (`20261018T051210Z`: 8.008 s, 0
+collisions, RTF 1.58) confirmed the committed version.
 
 ---
 
@@ -1549,8 +1585,9 @@ They are the part that looks most like hand-tuning. The honest framing:
 
 - **Rule 11 (cones):** the line builder seals cone gaps before planning
   (section 4.3).
-- **Rule 25 (judging environment):** we changed nothing outside
-  `race_ws/src/team_driver/` (and `results/submitted/`, `SUBMISSION.md`).
+- **Rule 25 (judging environment):** we changed nothing in the protected
+  paths. Our work is in `race_ws/src/team_driver/`, plus `SUBMISSION.md`,
+  `results/submitted/` and our own helper notes in `dev-scripts/`.
   `./scripts/verify_judging_env.sh` checks this. The offline harness *reads*
   the simulator code in `external/` but never modifies it.
 - **Rule 28:** we publish only `/drive` and `/driver/markers`.
@@ -1595,6 +1632,13 @@ emergency speed cap, a warm-up mode and a wall-unstick routine.
 **Q: Why MPC?** (3.4) It brakes before corners, respects the slow servo and the
 car's dynamics while planning, and uses the exact physics we could import. Pure
 pursuit cannot anticipate a 262 ms servo reversal or braking yaw.
+
+**Q: Your Pure Pursuit did 17.83 s and your first MPC 51.66 s. Why switch?**
+(7, Phase 0) Pure Pursuit's gains were shrinking, and it cannot account for
+the 0.1 s command delay, the slow steering or the sliding. Those are what limit
+this car at speed. The first MPC was slow because of fixable problems: the test
+harness had no servo or delay, and the target on the line jumped. Once fixed,
+the MPC matched Pure Pursuit (18.0 s on 2 Oct) and went on to 8.04 s.
 
 **Q: What does the MPC optimise?** (4.6) Six numbers: three blocks of
 (steering, acceleration) over 8 steps covering 0.5 s. The cost is tracking
@@ -1678,8 +1722,9 @@ unchanged.
 
 **Q: Why send a speed computed from an acceleration?** (2.3) `/drive` takes a
 speed, and the simulator converts it with a proportional controller. We invert
-that exactly, otherwise braking requests do not arrive (we once got only 12% of
-the asked acceleration).
+that exactly, otherwise the asked acceleration does not arrive. The old code
+sent `speed + acceleration × 0.025 s`, which delivered about 12% of it when
+speeding up (gain 4.755 /s) and about 48% when braking (gain 19.02 /s).
 
 ### What-ifs ("what happens if this parameter changes?")
 
@@ -1792,25 +1837,30 @@ CODE_DEFAULTS`, then `raceline: offline min-time line …, 744 points`.
 
 ---
 
-## 16. Small inaccuracies in code comments
+## 16. Things in the code an interviewer might question
 
 Worth knowing in case an interviewer reads the code. None changes behaviour.
 
-- **The `unstick` comments** in `DriverConfig` and `driver_params.yaml` still
-  say "reverse straight". The code counter-steers (section 4.11); the comments
-  next to the `UNSTICK_*` constants describe it correctly.
-- **The header of `mpc_controller.py`** says "a kinematic bicycle model". The
-  race car uses the ST model (`vehicle.model = 'ST'`).
-- **`VehicleModel` defaults to `'KS'`** and `MPCController` defaults to horizon
-  10 / `r_delta_steer` 0.8. These are library defaults; the node and the
-  harness always pass the race values from `driver_params.py`.
-- **The `driver_params.yaml` comment** that the centreline fallback runs
-  "9.37 s" in the harness conflicts with `DriverConfig`, which records 10.97 s
-  at the sub-9 Step 2 tune. Re-measure before quoting either.
-- **`lap_sim.py`'s header** describes depth-10 queues. The node now uses
-  depth 1; the harness still models a fixed data age (default 9 physics steps).
+- **Library defaults are not the race car.** `VehicleModel` defaults to the
+  kinematic model `'KS'`, and `MPCController` defaults to horizon 10 and
+  `r_delta_steer` 0.8. These are only the constructors' defaults. The node and
+  the harness always pass the race values from `driver_params.py` (`ST`,
+  horizon 8, `r_delta_steer` 3.0); `test_driver_params.py` and
+  `test_step3_wiring.py` hold them equal.
 - **`mpc_controller.py` prints** its configuration with `print` at startup
-  instead of the logger. This is harmless.
+  instead of the logger. This is harmless; it shows in the node's console.
+- **Two centreline-fallback lap times appear in the comments**: 10.97 s and
+  9.37 s. They are from different tunes, not a contradiction. 10.97 s is the
+  sub-9 Step 2 tune (older braking shape). 9.37 s is today's profile, whose
+  ideal centreline lap is 9.49 s; harness laps usually come in just under the
+  ideal. Both are at the same uniform 22.95 m/s² budget.
+- **Comments that were stale and fixed on 18 Oct** (comment-only; the code was
+  checked to be identical):
+  - the `unstick` comments said "reverse straight", but the code counter-steers;
+  - `mpc_controller.py`'s header said "kinematic bicycle model";
+  - `lap_sim.py`'s header described the old depth-10 queues as current;
+  - `DriverConfig` said warm-up hits came in "3 of 13" sub-9 runs. The result
+    files show 2 of 13 runs, with 3 hits in total.
 
 ---
 
