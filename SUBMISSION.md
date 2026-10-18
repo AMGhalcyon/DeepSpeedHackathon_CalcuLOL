@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | Anish Gangavaram | U2523701F | GANG0016@E.NTU.EDU.SG |
 | Davis Lee | U2523351H | DLEE067@E.NTU.EDU.SG |
-| Myra Dwivedi | U2523271G | myra.ofc@gmail.com |
+| Myra Dwivedi | U2523271G | MYRA004@E.NTU.EDU.SG |
 
 ## Approach
 
