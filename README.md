@@ -2,7 +2,7 @@
 
 This is our entry for Track 1 of the NTU DeepSpeed Recruitment Hackathon 26/27. The task was to write the software that drives a 1/10-scale car around a circuit as fast as possible without hitting anything. Our final driver does a lap in about **8.04 s with no collisions**.
 
-Team CalcuLOL: Anish Gangavaram, Davis Lee and Myra Dwivedi. I wrote most of the driver (the MPC, the offline test harness, the racing line and speed profile, and the debugging and tuning that got the lap time down). Davis and Myra handled the submission write-up and checks.
+Team CalcuLOL: Anish Gangavaram, Davis Lee and Myra Dwivedi.
 
 ## How we got there
 
