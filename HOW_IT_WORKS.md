@@ -21,6 +21,17 @@ end (section 17).
 That is about 9.25 m/s on average round a 74.4 m racing line, with a top
 speed of 12 m/s.
 
+**The whole record of the final car code** (`ac836d8`; later commits are
+comments and documentation only):
+
+| | |
+|---|---|
+| Runs on our machine | 30 |
+| `COMPLETE` | 30 of 30 |
+| Collisions in timed laps | 0 in 300 |
+| Runs with any collision | 1 of 30: `unnamed_team__20261018T082903Z_r6` had 4 collisions **before** the timed laps (no time penalty, but they count towards the 10-collision limit) |
+| Submitted runs | `results/submitted/CalcuLOL__20261018T102653Z_r1..r3`: 3/3 clean, 8.036–8.045 s, 80.50–80.51 s |
+
 **How to read this.** Sections 1–3 give the background: the challenge, the
 physics of the simulated car, and the big picture. Sections 4–6 go through the
 driver part by part, then trace one control cycle from start to finish.
@@ -1152,8 +1163,9 @@ value before the latest change, which is what the switch reproduces.
 
 ## 7. The journey: from a car that crashed to 8.04 s
 
-Times are judged best laps from our own `evaluate.sh` runs (files in
-`results/`). "Harness" means our offline simulator (section 8).
+Times are judged best laps from our own `evaluate.sh` runs (result files kept
+on our machine in `results/`; only `results/submitted/` is committed).
+"Harness" means our offline simulator (section 8).
 
 | Date | Change | Judged best lap | Collisions |
 |---|---|---|---|
@@ -1174,8 +1186,9 @@ Times are judged best laps from our own `evaluate.sh` runs (files in
 | 18 Oct | **Phase 8:** clock fix, slow warm-up, counter-steer unstick | **8.038–8.047 s** | **0 in 10/10 runs** |
 
 The collisions column describes the runs that closed each phase. The
-experiments in between had crashes and disqualifications too; every result
-file is kept in `results/`.
+experiments in between had crashes and disqualifications too. Every result
+file is kept on our machine in `results/` (about 350 of them). Only the
+submitted runs in `results/submitted/` are committed, as the rules ask.
 
 ### Phase 0: the baselines (follow-the-gap ~28–30 s, Pure Pursuit 17.83 s)
 
@@ -1364,6 +1377,22 @@ tree, before its changes were committed. They were committed unchanged as
 A single run one minute after the commit (`20261018T051210Z`: 8.008 s, 0
 collisions, RTF 1.58) confirmed the committed version.
 
+**Every run of the final code** (30 runs, all `COMPLETE`, 0 collisions in 300
+timed laps):
+
+| Runs | Best lap | Collisions |
+|---|---|---|
+| Batch T, `20261018T004950Z_r1..r10` | 8.038–8.047 s | 0 |
+| `20261018T051210Z`, `20261018T092833Z` | 8.008, 8.019 s | 0 |
+| `unnamed_team__20261018T074855Z_r1..r5` | 8.009–8.025 s | 0 |
+| `unnamed_team__20261018T082903Z_r1..r10` | 8.041–8.049 s | 0 in 9 runs; **r6: 4, all before the timed laps** |
+| `20261018T102653Z_r1..r3` (the submitted runs, on the final commit) | 8.036–8.045 s | 0 |
+
+The two `unnamed_team` batches ran the final code, just without `--team`. No
+driver logs were kept for them, so we cannot say where r6's contacts happened
+or why. **Contacts before the timed laps are reduced, not
+eliminated.**
+
 ---
 
 ## 8. How we test and measure
@@ -1492,6 +1521,10 @@ break?".
   assume. Runs like that were disqualified on our machine. The judging machine
   (i9-14900HX) is faster than ours, so we expect RTF at or above ours. Best of
   3 and the slow warm-up reduce this risk; they do not remove it.
+- **Contacts before the timed laps are not fully eliminated.** 1 of 30 runs
+  of the final car had 4 collisions before the timed laps (`082903Z_r6`, RTF
+  2.02). They cost no time but count towards disqualification. With no log,
+  the cause is unknown.
 - **RTF above about 2.4 is untested.** Above 10× real time our clock filter
   would ignore every sample and assume RTF 1, which would make latch times
   early. We have no data there.
@@ -1717,8 +1750,9 @@ at 1 m/s with opposite full lock for 0.6 s, longer on repeats (up to 1.5 s).
 
 **Q: Why a warm-up mode, if the warm-up is not scored?** (1.2, 4.10) Its
 collisions still count towards disqualification. Judged warm-ups had contacts
-at the chicane exit; a slow warm-up removed them, and the timed laps are
-unchanged.
+at the chicane exit. The slow warm-up cut them a lot, without changing the
+timed laps, but did not remove them entirely: 1 of 30 runs of the final car
+still had contacts before the timed laps.
 
 **Q: Why send a speed computed from an acceleration?** (2.3) `/drive` takes a
 speed, and the simulator converts it with a proportional controller. We invert
@@ -1749,8 +1783,9 @@ speeding up (gain 4.755 /s) and about 48% when braking (gain 19.02 /s).
 
 **Q: How do you know it is safe, not lucky?** (8.2) Grid testing across solve
 times, data ages, measured jitter, host load and the fallback line, then
-batches of 10 judged runs. The final batch: 10/10 clean, and the batch before
-it 10/10 too.
+batches of 10 judged runs. The final code: 30 runs, all complete, 0 collisions
+in 300 timed laps. One run had 4 contacts before the timed laps, which we
+report rather than hide.
 
 **Q: What surprised you most?** That the harness was lying (Phase 1). Also that
 the cause of most crashes was braking, not cornering (Phases 5–6), and that a
