@@ -5,7 +5,7 @@ Team CalcuLOL, Track 1 (`icra26`). This document explains the whole driver in
 what we tried that failed, where it can still break, and how we know. It is
 written for someone with no robotics or control background. Every technical
 word is explained the first time it appears, and there is a glossary at the
-end (section 17).
+end (section 15).
 
 **Where we ended up (final car, commit `ac836d8`):**
 
@@ -35,8 +35,9 @@ comments and documentation only):
 **How to read this.** Sections 1–3 give the background: the challenge, the
 physics of the simulated car, and the big picture. Sections 4–6 go through the
 driver part by part, then trace one control cycle from start to finish.
-Sections 7–12 cover the history, testing, failures, risks and rules. Section 13
-is a bank of likely interview questions with answers.
+Sections 7–11 cover the history, testing, failures, risks and rules. Sections
+12–15 list the files, how to reproduce everything, notes for readers of the
+code, and a glossary.
 
 ---
 
@@ -53,12 +54,10 @@ is a bank of likely interview questions with answers.
 9. [Things we tried that did not work](#9-things-we-tried-that-did-not-work)
 10. [Known limitations, risks and failure modes](#10-known-limitations-risks-and-failure-modes)
 11. [The rules: how we comply](#11-the-rules-how-we-comply)
-12. [Bonus marks: what we can honestly claim](#12-bonus-marks-what-we-can-honestly-claim)
-13. [Interview question bank](#13-interview-question-bank)
-14. [Every file, and why it exists](#14-every-file-and-why-it-exists)
-15. [Reproducing everything](#15-reproducing-everything)
-16. [Things in the code an interviewer might question](#16-things-in-the-code-an-interviewer-might-question)
-17. [Glossary](#17-glossary)
+12. [Every file, and why it exists](#12-every-file-and-why-it-exists)
+13. [Reproducing everything](#13-reproducing-everything)
+14. [Things in the code that may look wrong](#14-things-in-the-code-that-may-look-wrong)
+15. [Glossary](#15-glossary)
 
 ---
 
@@ -1482,8 +1481,7 @@ What the tests protect:
 
 ## 9. Things we tried that did not work
 
-Interviewers like asking "what did you try that failed?" These are all real,
-with the reason.
+Each row is a real attempt, with what happened and why.
 
 | Tried | What happened | Why |
 |---|---|---|
@@ -1511,8 +1509,7 @@ with the reason.
 
 ## 10. Known limitations, risks and failure modes
 
-Be honest about these at the interview; they are good answers to "where does it
-break?".
+Where the car can still break, and why.
 
 ### 10.1 Risks on judging day
 
@@ -1599,9 +1596,10 @@ break?".
 - The driver does not blindly trust the file: it checks every point against
   the map at startup.
 
-### 11.2 How to explain the sector scales honestly
+### 11.2 The sector scales: parameters, not waypoints
 
-They are the part that looks most like hand-tuning. The honest framing:
+They are the part that looks most like hand-tuning, so here is exactly what
+they are:
 
 - They are **parameters** (multipliers on a speed budget along stretches of
   the line), not waypoints. They do not move the line.
@@ -1637,170 +1635,7 @@ They are the part that looks most like hand-tuning. The honest framing:
 
 ---
 
-## 12. Bonus marks: what we can honestly claim
-
-| Bonus | Claim? | What to say |
-|---|---|---|
-| **Ambitious algorithm** | **Yes, strongly** | A nonlinear MPC on the judge's own dynamic single-track model, with the steering servo as a state, move blocking with a stretched horizon, dead-time compensation by replaying the plant, MPC-owned braking under a g-g limit, and known, measured failure modes (section 10). |
-| **Own racing line** | **Partly, precisely** | The minimum-curvature line *is* built from the map at runtime (implemented, tested, the automatic fallback). The faster minimum-time refinement is offline, because it takes about 4 min against a 60 s startup budget, but it is reproducible from the map with our code. Do not say the driven line is computed at runtime. |
-| **Clear engineering** | **Yes, strongly** | One control path; a harness that imports the judge; root-cause analysis before tuning; grid testing; switches whose "off" is the old car; validation and fallbacks at every layer; 739 tests; documented evidence for every number. |
-| **Own localisation** | **No** | We use ground-truth odometry. Say so plainly. |
-
----
-
-## 13. Interview question bank
-
-Short answers you should be able to give from memory. Section numbers point to
-the details.
-
-### The approach
-
-**Q: Describe your driver in 30 seconds.**
-An offline minimum-time racing line computed from the map, a speed profile
-that respects slip, the steering lock and braking stability, and a nonlinear
-MPC at 40 Hz that plans 0.5 s ahead with the simulator's own physics, starting
-from where the car will be when the command lands. Underneath it, a LiDAR
-emergency speed cap, a warm-up mode and a wall-unstick routine.
-
-**Q: Why MPC?** (3.4) It brakes before corners, respects the slow servo and the
-car's dynamics while planning, and uses the exact physics we could import. Pure
-pursuit cannot anticipate a 262 ms servo reversal or braking yaw.
-
-**Q: Your Pure Pursuit did 17.83 s and your first MPC 51.66 s. Why switch?**
-(7, Phase 0) Pure Pursuit's gains were shrinking, and it cannot account for
-the 0.1 s command delay, the slow steering or the sliding. Those are what limit
-this car at speed. The first MPC was slow because of fixable problems: the test
-harness had no servo or delay, and the target on the line jumped. Once fixed,
-the MPC matched Pure Pursuit (18.0 s on 2 Oct) and went on to 8.04 s.
-
-**Q: What does the MPC optimise?** (4.6) Six numbers: three blocks of
-(steering, acceleration) over 8 steps covering 0.5 s. The cost is tracking
-error (position, heading, speed) plus steering/throttle effort plus changes.
-It is solved by SLSQP, warm-started from the last plan, within a 15 ms budget.
-
-**Q: Why is the wheel angle a state?** (2.2, 4.6) The real wheel moves at most
-0.08 rad per 25 ms. If the MPC assumed instant steering, it would ask for
-impossible moves and chatter. With the servo in the model, every predicted
-path is physically followable.
-
-**Q: Why the ST model and not kinematic?** (2.4) At speed the car slides
-sideways (27° of rear slip at our budget). The kinematic model assumes no
-slide and drifts from reality; we measured it with `model_error.py`.
-
-**Q: How does the MPC avoid walls?** It does not know about walls. The line
-keeps 0.405 m from every wall (cone gaps sealed), the MPC tracks the line, and
-the LiDAR emergency cap slows the car if anything is in the path corridor.
-
-**Q: What happens if a solve takes too long?** (4.6) At 15 ms it is abandoned
-and the car follows the previous plan, advanced one step. Typical solves are
-about 4–5 ms.
-
-### The line and profile
-
-**Q: How is the racing line built?** (4.3) Seal the cones; find the sideways
-limits along the normals; solve a minimum-curvature least-squares QP
-(Heilmeier 2019); re-weight the tight corners; then offline, refine 50 spline
-control points with L-BFGS-B to minimise the ideal lap time.
-
-**Q: Is it hand-tuned / does it violate rule 32?** (11.1) No: it is computed by
-`raceline.py` from the map alone, reproducible with one command, and checked
-against the map at startup.
-
-**Q: Why ship the line as a CSV?** The minimum-time refinement takes about
-4 min; startup has 60 s. The minimum-curvature line *is* built at runtime as
-the fallback.
-
-**Q: What is `a_lat_max`, and why is 27 m/s² possible?** (2.4) It is a slip
-budget, not grip: the simulator's tyres are linear and never saturate. 27 m/s²
-means about 27.6° of rear slip; the limit is controllability, not grip.
-
-**Q: What limits the speed in the tightest corner?** (4.4) The steering lock:
-5.47 m/s, slightly below the slip limit of 5.58 m/s.
-
-**Q: What is the g-g limit?** (4.4) Braking and cornering share one budget. The
-more a corner uses its budget, the less braking is allowed there, because
-braking unloads the rear tyres and the simulated car's yaw goes unstable.
-
-**Q: What are the sectors? Aren't they hand-tuned?** (11.2) Measured
-multipliers on the speed budget, each one notch below the value that collided
-in testing. They are tied to this line and clamped on any other.
-
-### Dead time
-
-**Q: What is dead time, and how do you handle it?** (2.6, 4.5) The pose is
-about 0.1 s old, and our command lands a solve later. We replay our own
-published commands through the simulator's servo, speed loop and dynamics, from
-the measured state up to the moment the next command latches, and plan from
-there.
-
-**Q: How do you know the wheel angle?** It is not measured. We replay the
-servo formula over our published commands, and leash the estimate to the
-yaw-rate-implied angle with a 0.5 s time constant.
-
-**Q: What was the launch crash?** (4.5) The node's first clock update jumped
-~1 s in 3 ms of wall time, which the latch clock learnt as RTF 340. Latch times
-were 0.6 s late, the wheel estimate 1 rad off, and the car steered into the
-first wall. Fix: ignore samples over 10×.
-
-### Safety
-
-**Q: What happens on a collision / when stuck?** (4.11) If slower than 1 m/s
-while asking to move for 0.5 s (armed only after once passing 2 m/s), reverse
-at 1 m/s with opposite full lock for 0.6 s, longer on repeats (up to 1.5 s).
-
-**Q: Why a warm-up mode, if the warm-up is not scored?** (1.2, 4.10) Its
-collisions still count towards disqualification. Judged warm-ups had contacts
-at the chicane exit. The slow warm-up cut them a lot, without changing the
-timed laps, but did not remove them entirely: 1 of 30 runs of the final car
-still had contacts before the timed laps.
-
-**Q: Why send a speed computed from an acceleration?** (2.3) `/drive` takes a
-speed, and the simulator converts it with a proportional controller. We invert
-that exactly, otherwise the asked acceleration does not arrive. The old code
-sent `speed + acceleration × 0.025 s`, which delivered about 12% of it when
-speeding up (gain 4.755 /s) and about 48% when braking (gain 19.02 /s).
-
-### What-ifs ("what happens if this parameter changes?")
-
-| Change | Effect (measured unless stated) |
-|---|---|
-| `a_lat_max` 27 → 28 | Hit at the chicane exit (s 45.4) in 1 of 3 harness cells |
-| `a_lat_max` 27 → 21 | Safe but slower (that was the 9.87 s car's value, with its other settings) |
-| `r_delta_steer` 3 → 0.1 | Chatter, +0.7 s/lap |
-| Horizon 8 → 12 | Solve 139 ms (before move blocking): far over budget, fallbacks every cycle |
-| `solve_budget_ms` much lower | More fallbacks to the previous plan (not measured at the current tune) |
-| `raceline_margin` 0.25 → 0.20 | Collision at s ≈ 65.5 |
-| `profile_brake_cap` 3 → 0 | Clean to 26; loses the chicane exit at 27 |
-| `profile_brake_cap` 3 → 6 | Spins at 23 |
-| `mpc_full_brake` off | MPC limited to −2.85 m/s²; every budget above 22 spun |
-| `beta_limit` 1.0 → 0.5 | Spin at s ≈ 16 from budget 25 |
-| Sector 28–43 1.11 → 1.2 | Judged hits at s 30–36 (3 of 10 runs) |
-| `warmup_crossings` 1 → 0 | Race from the grid. That was the sub-9 car, whose judged warm-up laps had contacts in 2 of 13 runs |
-| `predict_latch` off | Plans from ~0.1 s old data (we have not measured the current car this way) |
-| `gg_brake` off | The old plain profile; at high budgets, braking-yaw spins |
-
-### Process
-
-**Q: How do you know it is safe, not lucky?** (8.2) Grid testing across solve
-times, data ages, measured jitter, host load and the fallback line, then
-batches of 10 judged runs. The final code: 30 runs, all complete, 0 collisions
-in 300 timed laps. One run had 4 contacts before the timed laps, which we
-report rather than hide.
-
-**Q: What surprised you most?** That the harness was lying (Phase 1). Also that
-the cause of most crashes was braking, not cornering (Phases 5–6), and that a
-clock jump caused the launch crashes (Phase 8).
-
-**Q: Name a change that did not work.** The launch hold, the yaw-rate cost, a
-longer horizon, braking harder with the old controller (section 9).
-
-**Q: Did you use AI?** Yes, Claude Code, extensively, for implementation, tests
-and analysis. We set the direction, chose between measured hypotheses, ran the
-judged evaluations and decided what shipped.
-
----
-
-## 14. Every file, and why it exists
+## 12. Every file, and why it exists
 
 The organisers' template gave `driver.py` (a stub), `setup.py`, `setup.cfg`,
 `package.xml`, `launch/driver.launch.py`, an empty `config/driver_params.yaml`,
@@ -1842,7 +1677,7 @@ The organisers' template gave `driver.py` (a stub), `setup.py`, `setup.cfg`,
 
 ---
 
-## 15. Reproducing everything
+## 13. Reproducing everything
 
 ```sh
 # Inside the container (/hackathon is the repo)
@@ -1872,9 +1707,9 @@ CODE_DEFAULTS`, then `raceline: offline min-time line …, 744 points`.
 
 ---
 
-## 16. Things in the code an interviewer might question
+## 14. Things in the code that may look wrong
 
-Worth knowing in case an interviewer reads the code. None changes behaviour.
+Worth knowing if you read the code. None changes behaviour.
 
 - **Library defaults are not the race car.** `VehicleModel` defaults to the
   kinematic model `'KS'`, and `MPCController` defaults to horizon 10 and
@@ -1899,7 +1734,7 @@ Worth knowing in case an interviewer reads the code. None changes behaviour.
 
 ---
 
-## 17. Glossary
+## 15. Glossary
 
 | Term | Meaning |
 |---|---|
