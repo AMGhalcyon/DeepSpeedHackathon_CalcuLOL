@@ -24,7 +24,7 @@ The code is in [`race_ws/src/team_driver/team_driver/`](race_ws/src/team_driver/
 
 For the full story, [HOW_IT_WORKS.md](HOW_IT_WORKS.md) walks through the whole driver, and [SUBMISSION.md](SUBMISSION.md) has the results and the evidence for each change.
 
-This is a copy of our team repo, [davislee23/DeepSpeedHackathon_CalcuLOL](https://github.com/davislee23/DeepSpeedHackathon_CalcuLOL). It's built on the simulator and template that the NTU DeepSpeed / ASME-NTU organisers provided, which is why their names appear in the contributor list. Their original challenge brief is below.
+This is a copy of our team repo, [davislee23/DeepSpeedHackathon_CalcuLOL](https://github.com/davislee23/DeepSpeedHackathon_CalcuLOL). It's built on the simulator and template that the NTU DeepSpeed. Their original challenge brief is below.
 
 ---
 
